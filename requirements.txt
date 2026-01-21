@@ -1,0 +1,14 @@
+# Angel One SmartAPI
+smartapi-python
+
+# Data handling
+pandas
+numpy
+
+# WebSocket
+websocket-client
+
+# Utilities
+python-dotenv
+pyotp
+requests

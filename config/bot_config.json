@@ -1,0 +1,150 @@
+{
+  "broker": {
+    "name": "angel_one",
+    "paper_trading": true,
+    "credentials_file": "config/credentials.json"
+  },
+  
+  "capital": {
+    "total_capital": 30000,
+    "currency": "INR",
+    "risk_per_trade_pct": 1.0,
+    "risk_per_trade_amount": 300,
+    "max_daily_loss_amount": 1000,
+    "kill_switch_loss_amount": 1800,
+    "daily_loss_alert_threshold": 700
+  },
+  
+  "trading": {
+    "symbol": "NIFTY",
+    "exchange": "NFO",
+    "option_type": "CE",
+    "strike_selection": "ATM",
+    "strike_offset": 0,
+    "lot_size": 25,
+    "quantity": 1,
+    "style": "scalping_intraday"
+  },
+  
+  "risk_management": {
+    "max_trades_per_hour": 3,
+    "max_trades_per_day": 12,
+    "ideal_trades_per_day": 8,
+    "max_daily_loss_pct": -5.0,
+    "max_daily_loss_amount": 1000,
+    "stop_loss_amount": 250,
+    "stop_loss_pct": 1.0,
+    "dynamic_sl_enabled": true,
+    "atr_multiplier_sl": 0.6,
+    "trail_sl_after_profit": 150,
+    "profit_target_1_amount": 150,
+    "profit_target_1_exit_pct": 50,
+    "profit_target_2_amount": 300,
+    "trailing_activation_amount": 180,
+    "trailing_atr_multiplier_normal": 0.4,
+    "trailing_atr_multiplier_expiry": 0.25,
+    "max_hold_time_normal_sec": 240,
+    "max_hold_time_expiry_sec": 90,
+    "consecutive_loss_limit": 3,
+    "pause_after_consecutive_loss_sec": 900,
+    "position_sizing_enabled": true,
+    "position_size_low_vix": 1.5,
+    "position_size_normal_vix": 1.0,
+    "position_size_high_vix": 0.5,
+    "vix_low_threshold": 12,
+    "vix_high_threshold": 18
+  },
+  
+  "data_hygiene": {
+    "latency_limit_ms": 150,
+    "spread_limit_pct": 0.5,
+    "tick_timeout_sec": 2,
+    "min_volume": 100,
+    "price_sanity_check": true,
+    "min_option_price": 10,
+    "max_option_price": 5000,
+    "min_spot_price": 15000,
+    "max_spot_price": 30000
+  },
+  
+  "entry_filters": {
+    "avoid_first_15min": true,
+    "require_consecutive_signals": 2,
+    "volume_confirmation_required": true,
+    "min_volume_ratio": 1.2
+  },
+  
+  "greeks_limits": {
+    "delta_min": 0.20,
+    "delta_max": 0.80,
+    "delta_kill_min": 0.10,
+    "gamma_normal_max": 0.15,
+    "gamma_expiry_max": 0.25,
+    "theta_sec_limit": 0.05,
+    "theta_sec_kill_limit": 0.10,
+    "vega_max": 0.30
+  },
+  
+  "cooldown": {
+    "normal_sec": 180,
+    "after_sl_sec": 300,
+    "after_consecutive_loss_sec": 900,
+    "after_kill_switch_sec": 1800,
+    "expiry_normal_sec": 90,
+    "expiry_after_sl_sec": 180
+  },
+  
+  "session_filter": {
+    "enabled": true,
+    "allowed_sessions": [
+      {"start_hour": 9, "start_minute": 20, "end_hour": 11, "end_minute": 0},
+      {"start_hour": 11, "start_minute": 15, "end_hour": 14, "end_minute": 15}
+    ],
+    "expiry_only_sessions": [
+      {"start_hour": 14, "start_minute": 15, "end_hour": 14, "end_minute": 55}
+    ],
+    "blackout_sessions": [
+      {"start_hour": 14, "start_minute": 55, "end_hour": 15, "end_minute": 30, "reason": "Expiry last 5 min"}
+    ]
+  },
+  
+  "day_type_detection": {
+    "expiry_weekday": 3,
+    "expiry_time_threshold_sec": 3600,
+    "theta_spike_multiplier": 2.0,
+    "gamma_expiry_threshold": 0.10
+  },
+  
+  "market_hours": {
+    "start_hour": 9,
+    "start_minute": 15,
+    "end_hour": 15,
+    "end_minute": 30,
+    "timezone": "Asia/Kolkata"
+  },
+  
+  "kill_switch": {
+    "daily_loss_amount": 900,
+    "spread_limit_pct": 0.5,
+    "latency_limit_ms": 150,
+    "feed_freeze_sec": 2,
+    "auto_exit_on_trigger": true
+  },
+  
+  "position_sizing": {
+    "method": "fixed",
+    "no_scaling": true,
+    "no_doubling": true,
+    "no_revenge_trading": true,
+    "quantity_per_trade": 1
+  },
+  
+  "logging": {
+    "enabled": true,
+    "console_output": true,
+    "log_directory": "logs",
+    "verbose": false,
+    "track_pnl": true,
+    "track_greeks": true
+  }
+}
