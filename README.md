@@ -1,114 +1,254 @@
-# PTQ Scalping Bot
+# 🚀 PTQ Scalping Bot
 
-A professional NIFTY options scalping bot integrated with Angel One broker.
+**Professional NIFTY Options Scalping Bot** with Angel One Broker Integration
 
-## Features
+[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-- **Paper Trading Mode**: Test strategies without real money
-- **Live Data**: Real-time NIFTY spot prices via Yahoo Finance
-- **PTQ Strategy**: Price + Time + Quantity validated entries
-- **Greeks-based Exit**: Delta, Gamma, Theta monitoring
-- **Risk Management**: Stop loss, take profit, trailing stop
-- **Kill Switch**: Automatic shutdown on excessive losses
-- **State Persistence**: Resumes from last state after restart
+---
 
-## Project Structure
+## ✨ Features
+
+| Feature | Description |
+|---------|-------------|
+| 📊 **PTQ Strategy** | Price + Time + Quantity validated entries |
+| 💰 **Paper Trading** | Test strategies without real money |
+| 📈 **Live Data** | Real-time NIFTY spot via Yahoo Finance |
+| 🎯 **Multi-Level TP** | 3-tier profit targets with partial exits |
+| 🛡️ **Risk Management** | Dynamic SL, trailing stop, kill switch |
+| 📉 **Greeks Monitoring** | Delta, Gamma, Theta based exits |
+| 📋 **Trade Analytics** | Comprehensive performance analysis |
+| 💾 **State Persistence** | Resume from last state after restart |
+
+---
+
+## 📁 Project Structure
 
 ```
 PTQ-scalping bot/
-├── app.py                  # Entry point
-├── core/
-│   └── main.py             # Main trading logic
+├── app.py                    # Entry point
+├── analyze.py                # Trade analyzer CLI
+├── run.sh                    # Quick start script
+│
 ├── config/
-│   ├── bot_config.json     # Bot configuration
-│   ├── config_loader.py    # Config loading utility
-│   └── credentials.json    # API credentials (not in git)
-├── state/
-│   └── state_persistence.py # State save/load
-├── brokers/
-│   └── angel_one/          # Angel One broker integration
+│   ├── constants.py          # All trading parameters
+│   ├── bot_config.json       # JSON configuration
+│   └── credentials.json      # API credentials (git ignored)
+│
+├── core/
+│   ├── main.py               # Main trading loop
+│   ├── broker.py             # Broker I/O operations
+│   ├── validators.py         # Data & PTQ validation
+│   ├── entry_engine.py       # Entry signal logic
+│   ├── exit_engine.py        # Exit logic (SL/TP/Trailing)
+│   ├── state_machine.py      # Trading state management
+│   ├── kill_switch.py        # Emergency safety checks
+│   └── greeks_calc.py        # Greeks calculator
+│
 ├── utils/
-│   ├── greeks.py           # Options Greeks calculator
-│   ├── logger.py           # Logging utility
-│   └── utility.py          # Helper functions
-├── tests/                  # Unit tests
-├── logs/                   # Trading logs
-└── requirements.txt        # Dependencies
+│   ├── greeks.py             # BSM model calculator
+│   ├── logger.py             # Enhanced logging
+│   ├── analytics.py          # Trade analysis
+│   └── helpers.py            # Utility functions
+│
+├── brokers/
+│   └── angel_one/            # Angel One API client
+│
+├── logs/                     # Trading logs by date
+│   └── YYYY-MM-DD/
+│       ├── trades.json       # Raw trade data
+│       ├── trades.csv        # Excel compatible
+│       ├── analytics.json    # Performance metrics
+│       └── report.txt        # Human readable report
+│
+└── tests/                    # Unit tests
 ```
 
-## Quick Start
+---
 
-### 1. Clone & Setup
+## 🚀 Quick Start
+
+### 1. Setup Environment
 
 ```bash
-git clone <repo-url>
-cd PTQ-scalping\ bot
+git clone https://github.com/Habibbiswas460/ptq-scalping-bot.git
+cd ptq-scalping-bot
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure
+### 2. Configure Credentials
 
-Copy credentials example:
 ```bash
 cp config/credentials.json.example config/credentials.json
+# Edit with your Angel One API keys
 ```
 
-Edit `config/credentials.json` with your Angel One API credentials.
-
-### 3. Run
+### 3. Run Bot
 
 ```bash
+# Using run script (recommended)
+./run.sh
+
+# Or directly
 python app.py
 ```
 
-Or use the run script:
+---
+
+## ⚙️ Configuration (₹30K Setup)
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Capital | ₹30,000 | Total trading capital |
+| Risk/Trade | ₹300 (1%) | Max risk per trade |
+| Stop Loss | ₹250 | Fixed stop loss amount |
+| TP-1 | ₹100 | First target (30% exit) |
+| TP-2 | ₹200 | Second target (40% exit) |
+| TP-3 | ₹350 | Final target (30% exit) |
+| Kill Switch | ₹1,800 (6%) | Auto shutdown limit |
+| Max Trades | 25/day, 8/hour | Trading limits |
+
+---
+
+## 📊 Trade Analysis
+
+### Run Analyzer
+
 ```bash
-./run.sh
+# Interactive mode
+python analyze.py
+
+# Analyze today
+python analyze.py today
+
+# Analyze specific date
+python analyze.py 2026-01-22
+
+# List available dates
+python analyze.py --list
 ```
 
-## Configuration
+### Sample Output
 
-Edit `config/bot_config.json` to customize:
+```
+📊 PTQ SCALPING BOT - TRADING REPORT
+======================================================================
+📈 PERFORMANCE SUMMARY
+----------------------------------------
+Total Trades:      11
+Winners:           1 (9.09%)
+Profit Factor:     1.62
+Expectancy:        ₹23.82/trade
 
-- **Capital**: `total_capital`, `risk_per_trade_amount`
-- **Trading**: `symbol`, `lot_size`, `quantity`
-- **Risk**: `stop_loss_amount`, `max_trades_per_day`
-- **Session**: Trading hours, blackout periods
+💰 PROFIT & LOSS
+----------------------------------------
+Total PnL:         ₹+262.00
+Best Trade:        ₹687.00
+Max Drawdown:      ₹421.50
+```
 
-## Risk Parameters (₹30K Config)
+---
 
-| Parameter | Value |
-|-----------|-------|
-| Capital | ₹30,000 |
-| Risk/Trade | ₹300 (1%) |
-| Stop Loss | ₹250 |
-| Kill Switch | ₹900 (3%) |
-| Max Trades | 8/day |
+## 🔧 PTQ Strategy
 
-## Testing
+The bot uses **P-T-Q validation** for entries:
+
+### P - Price
+- VWAP breakout/rejection
+- Candle body analysis
+- Chop filter (min range)
+
+### T - Time
+- Session filters (avoid first 15 min)
+- Theta decay threshold
+- Market close protection
+
+### Q - Quantity
+- Volume expansion (>1.02x avg)
+- Spread check (<0.2%)
+- Liquidity confirmation
+
+---
+
+## 🛡️ Risk Management
+
+```
+┌─────────────────────────────────────┐
+│ 🎯 MULTI-TIER EXIT SYSTEM           │
+├─────────────────────────────────────┤
+│ TP-1 (₹100)  → Exit 30%             │
+│ TP-2 (₹200)  → Exit 40% + BE SL     │
+│ TP-3 (₹350)  → Exit remaining 30%   │
+├─────────────────────────────────────┤
+│ 📉 TRAILING STOPS                   │
+├─────────────────────────────────────┤
+│ @ ₹75   → Lock 30% profit           │
+│ @ ₹150  → Lock 50% profit           │
+│ @ ₹250  → Lock 60% profit           │
+├─────────────────────────────────────┤
+│ 🛑 KILL SWITCHES                    │
+├─────────────────────────────────────┤
+│ Daily Loss > ₹1,800 → Stop trading  │
+│ Spread > 0.5%       → Exit & pause  │
+│ Latency > 150ms     → Exit & pause  │
+└─────────────────────────────────────┘
+```
+
+---
+
+## 📈 Greeks-Based Exits
+
+| Greek | Limit | Action |
+|-------|-------|--------|
+| Delta | < 0.02 | Kill trade immediately |
+| Gamma | > 0.15 (expiry) | Exit position |
+| Theta/sec | > 0.001 | Exit position |
+
+---
+
+## 🧪 Testing
 
 ```bash
+# Run all tests
 pytest tests/ -v
+
+# Run specific test
+pytest tests/test_greeks.py -v
 ```
 
-## Logs
+---
 
-Logs are saved in `logs/` directory:
-- `bot_state.json` - Current state
-- `YYYY-MM-DD/` - Daily logs
+## 📝 Log Files
 
-## Safety
+Each trading day creates:
 
-- **Paper Trading**: Set `PAPER_TRADING = True` in `core/main.py`
-- **Test Mode**: Set `TEST_MODE = True` to bypass market hours
-- **Kill Switch**: Automatic stop on 3% daily loss
+| File | Format | Use |
+|------|--------|-----|
+| `trades.json` | JSON | Raw data for analysis |
+| `trades.csv` | CSV | Open in Excel |
+| `analytics.json` | JSON | Metrics & stats |
+| `report.txt` | Text | Human readable report |
+| `events.json` | JSON | All bot events |
+| `bot.log` | Text | Full activity log |
 
-## License
+---
 
-Private - Not for distribution
+## ⚠️ Disclaimer
 
-## Disclaimer
+This bot is for **educational purposes only**. Trading in options involves significant risk. Past performance does not guarantee future results. Use at your own risk.
 
-This software is for educational purposes only. Trading involves risk. Use at your own risk.
+---
+
+## 📄 License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+---
+
+## 🤝 Author
+
+**Habib Biswas**
+
+- GitHub: [@Habibbiswas460](https://github.com/Habibbiswas460)
