@@ -1,93 +1,114 @@
-# PTQ Scalping Bot - Lightweight
+# PTQ Scalping Bot
 
-## ✅ Current Status
+A professional NIFTY options scalping bot integrated with Angel One broker.
 
-- **API**: Connected & Tested ✓
-- **Live Data**: Enabled (NIFTY @ ₹25,232.50)
-- **Mode**: Paper Trading with Live Market Data
-- **Credentials**: Configured ✓
+## Features
 
-## 🚀 Quick Start
+- **Paper Trading Mode**: Test strategies without real money
+- **Live Data**: Real-time NIFTY spot prices via Yahoo Finance
+- **PTQ Strategy**: Price + Time + Quantity validated entries
+- **Greeks-based Exit**: Delta, Gamma, Theta monitoring
+- **Risk Management**: Stop loss, take profit, trailing stop
+- **Kill Switch**: Automatic shutdown on excessive losses
+- **State Persistence**: Resumes from last state after restart
 
+## Project Structure
+
+```
+PTQ-scalping bot/
+├── app.py                  # Entry point
+├── core/
+│   └── main.py             # Main trading logic
+├── config/
+│   ├── bot_config.json     # Bot configuration
+│   ├── config_loader.py    # Config loading utility
+│   └── credentials.json    # API credentials (not in git)
+├── state/
+│   └── state_persistence.py # State save/load
+├── brokers/
+│   └── angel_one/          # Angel One broker integration
+├── utils/
+│   ├── greeks.py           # Options Greeks calculator
+│   ├── logger.py           # Logging utility
+│   └── utility.py          # Helper functions
+├── tests/                  # Unit tests
+├── logs/                   # Trading logs
+└── requirements.txt        # Dependencies
+```
+
+## Quick Start
+
+### 1. Clone & Setup
+
+```bash
+git clone <repo-url>
+cd PTQ-scalping\ bot
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 2. Configure
+
+Copy credentials example:
+```bash
+cp config/credentials.json.example config/credentials.json
+```
+
+Edit `config/credentials.json` with your Angel One API credentials.
+
+### 3. Run
+
+```bash
+python app.py
+```
+
+Or use the run script:
 ```bash
 ./run.sh
 ```
 
-## 🧪 Test API Connection
+## Configuration
+
+Edit `config/bot_config.json` to customize:
+
+- **Capital**: `total_capital`, `risk_per_trade_amount`
+- **Trading**: `symbol`, `lot_size`, `quantity`
+- **Risk**: `stop_loss_amount`, `max_trades_per_day`
+- **Session**: Trading hours, blackout periods
+
+## Risk Parameters (₹30K Config)
+
+| Parameter | Value |
+|-----------|-------|
+| Capital | ₹30,000 |
+| Risk/Trade | ₹300 (1%) |
+| Stop Loss | ₹250 |
+| Kill Switch | ₹900 (3%) |
+| Max Trades | 8/day |
+
+## Testing
 
 ```bash
-python quick_api_test.py
+pytest tests/ -v
 ```
 
-This will verify:
-- Angel One login ✓
-- Live data fetch ✓
-- Current NIFTY price
+## Logs
 
-## �📊 Bot Configuration
+Logs are saved in `logs/` directory:
+- `bot_state.json` - Current state
+- `YYYY-MM-DD/` - Daily logs
 
-**Mode**: Paper Trading (Safe Testing)  
-**Capital**: ₹30,000  
-**Strategy**: Multi-Level PTQ Exit
+## Safety
 
-### Exit Strategy
-- **TP-1**: ₹100 → Exit 30%
-- **TP-2**: ₹200 → Exit 40% + SL to BE
-- **TP-3**: ₹350 → Exit final 30%
-- **SL**: ₹250
+- **Paper Trading**: Set `PAPER_TRADING = True` in `core/main.py`
+- **Test Mode**: Set `TEST_MODE = True` to bypass market hours
+- **Kill Switch**: Automatic stop on 3% daily loss
 
-### Trailing Stop
-- **Tier 1** (₹75+): Lock 30%
-- **Tier 2** (₹150+): Lock 50%
-- **Tier 3** (₹250+): Lock 60%
+## License
 
-### Risk Limits
-- Risk/Trade: ₹300 (1%)
-- Max Trades: 8/hour, 25/day
-- Max Daily Loss: ₹1,200 (4%)
-- Kill Switch: ₹1,800 (6%)
+Private - Not for distribution
 
-## 📁 Structure
+## Disclaimer
 
-```
-├── main.py              (46KB) - Main bot
-├── run.sh               (1KB)  - Quick start
-├── quick_api_test.py    (2KB)  - API connection test
-├── config/
-│   ├── bot_config.json        - Bot settings
-│   └── credentials.json       - Angel One credentials ✓
-├── brokers/
-│   └── angel_one/             - Angel One integration ✓
-└── utils/
-    ├── greeks.py              - Greeks calculator
-    └── logger.py              - Logging
-```
-
-## 🎯 To Go Live
-
-**Current**: Paper Trading with Live Data ✓
-
-To enable real orders:
-1. Test thoroughly in paper mode first (recommended: 2-3 days)
-2. Edit `main.py` line 30-31:
-   ```python
-   PAPER_TRADING = False  # Enable live trading
-   TEST_MODE = False       # Use real market hours
-   ```
-3. Start with small capital
-4. Monitor closely
-
----
-
-## 🔧 Recent Updates
-
-- ✅ API integration tested & working
-- ✅ Live market data enabled (NIFTY @ ₹25,232.50)
-- ✅ PTQ filters optimized for real data
-- ✅ Multi-level exit strategy active
-- ✅ 3-tier trailing stops configured
-- ✅ Angel One credentials configured
-
----
-
-**Status**: ✅ Live Data Mode - Ready for Trading
+This software is for educational purposes only. Trading involves risk. Use at your own risk.

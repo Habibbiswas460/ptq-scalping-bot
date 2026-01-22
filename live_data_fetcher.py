@@ -19,12 +19,57 @@ class LiveDataFetcher:
         self.price_cache = []  # Cache last 10 valid prices
         self.max_cache_size = 10
         
+        # Circuit breaker state (Fix #9)
+        self.consecutive_failures = 0
+        self.circuit_open = False
+        self.circuit_open_time = None
+        self.circuit_break_threshold = 5  # Open circuit after 5 consecutive failures
+        self.circuit_reset_seconds = 30  # Reset circuit after 30 seconds
+        
+    def _check_circuit_breaker(self) -> bool:
+        """Check if circuit breaker allows requests. Returns True if OK to proceed."""
+        if not self.circuit_open:
+            return True
+            
+        # Check if enough time has passed to try again
+        if self.circuit_open_time and (time.time() - self.circuit_open_time) > self.circuit_reset_seconds:
+            print("🔄 Circuit breaker reset - attempting to reconnect...")
+            self.circuit_open = False
+            self.consecutive_failures = 0
+            return True
+            
+        return False
+        
+    def _record_success(self):
+        """Record a successful API call - reset failure count"""
+        self.consecutive_failures = 0
+        if self.circuit_open:
+            print("✅ Circuit breaker closed - API connection restored")
+            self.circuit_open = False
+            
+    def _record_failure(self):
+        """Record a failed API call - potentially open circuit"""
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.circuit_break_threshold and not self.circuit_open:
+            print(f"🔴 Circuit breaker OPEN - {self.consecutive_failures} consecutive failures")
+            self.circuit_open = True
+            self.circuit_open_time = time.time()
+        
     def get_nifty_spot(self) -> Optional[float]:
-        """Get live NIFTY spot price from Yahoo Finance with retry logic"""
+        """Get live NIFTY spot price from Yahoo Finance with retry logic and circuit breaker"""
         # Cache for 1 second to avoid too many requests
         now = time.time()
         if self.last_spot and self.last_fetch_time and (now - self.last_fetch_time) < 1:
             return self.last_spot
+        
+        # Check circuit breaker before making API call
+        if not self._check_circuit_breaker():
+            # Circuit is open - use cached data
+            if self.price_cache:
+                fallback = sum(self.price_cache) / len(self.price_cache)
+                print(f"⚡ Circuit open - using cached: ₹{fallback:.2f}")
+                return fallback
+            return self.last_spot if self.last_spot else 25000.0
         
         # Retry logic with exponential backoff
         max_retries = 3
@@ -40,6 +85,7 @@ class LiveDataFetcher:
                     if 15000 <= ltp <= 30000:
                         self.last_spot = ltp
                         self.last_fetch_time = now
+                        self._record_success()  # Circuit breaker success
                         
                         # Update price cache
                         self.price_cache.append(ltp)
@@ -56,6 +102,7 @@ class LiveDataFetcher:
                     time.sleep(wait_time)
                 else:
                     print(f"Error fetching NIFTY spot after {max_retries} attempts: {e}")
+                    self._record_failure()  # Circuit breaker failure
         
         # Fallback: Use average of cached prices or last known price
         if self.price_cache:
@@ -87,54 +134,76 @@ class LiveDataFetcher:
                 print(f"⚠️ Invalid spot price: {spot}")
                 return None
             
-            # Calculate approximate option price based on spot
-            # This is simplified Black-Scholes approximation
-            moneyness = (spot - strike) / strike
+            # Calculate approximate option price using simplified BS approximation
+            # Weekly option with ~5 days to expiry assumption
+            import math
+            
+            moneyness = spot - strike  # Absolute difference
+            moneyness_pct = abs(moneyness) / strike  # Percentage moneyness
+            
+            # Base time value for ATM weekly option (~0.4-0.6% of spot)
+            base_time_value = spot * 0.005  # ~125 for NIFTY 25000
             
             if option_type == "CE":
-                # Call option value increases when spot > strike
                 if spot > strike:
                     # ITM call
                     intrinsic = spot - strike
-                    time_value = abs(moneyness) * strike * 0.02  # ~2% of moneyness
+                    # Time value decreases as more ITM
+                    time_value = base_time_value * max(0.3, 1 - moneyness_pct * 5)
                     ltp = intrinsic + time_value
                 else:
                     # OTM call
-                    time_value = abs(moneyness) * strike * 0.015
-                    ltp = max(time_value, strike * 0.0005)  # Minimum 0.05%
+                    # Time value decreases as more OTM
+                    decay_factor = max(0.1, 1 - moneyness_pct * 5)
+                    ltp = base_time_value * decay_factor
             else:
-                # Put option value increases when spot < strike
                 if spot < strike:
                     # ITM put
                     intrinsic = strike - spot
-                    time_value = abs(moneyness) * strike * 0.02
+                    time_value = base_time_value * max(0.3, 1 - moneyness_pct * 5)
                     ltp = intrinsic + time_value
                 else:
                     # OTM put
-                    time_value = abs(moneyness) * strike * 0.015
-                    ltp = max(time_value, strike * 0.0005)
+                    decay_factor = max(0.1, 1 - moneyness_pct * 5)
+                    ltp = base_time_value * decay_factor
+            
+            # Minimum option price (weekly options can go low)
+            ltp = max(ltp, 5.0)
             
             # Add small random variation for realistic price action
-            ltp = ltp * (1 + random.uniform(-0.002, 0.002))
+            ltp = ltp * (1 + random.uniform(-0.005, 0.005))
             
-            # Validate option price range (₹10 - ₹5000)
-            if ltp < 10 or ltp > 5000:
-                print(f"⚠️ Invalid option LTP: ₹{ltp:.2f} for {strike}{option_type}")
-                return None
+            # Round to 0.05 (typical tick size)
+            ltp = round(ltp * 20) / 20
             
-            # Estimate bid/ask spread (0.1-0.2%)
-            spread = ltp * 0.0015
-            bid = ltp - spread / 2
-            ask = ltp + spread / 2
+            # Estimate bid/ask spread based on price level
+            # Lower priced options have wider spreads
+            if ltp < 20:
+                spread = 0.50  # 50 paise spread
+            elif ltp < 50:
+                spread = 0.75
+            elif ltp < 100:
+                spread = 1.00
+            else:
+                spread = ltp * 0.005  # 0.5% spread
             
-            # Estimated volume based on liquidity
-            volume = int(random.uniform(50000, 200000))
+            bid = round(ltp - spread / 2, 2)
+            ask = round(ltp + spread / 2, 2)
+            
+            # Estimated volume based on liquidity and moneyness
+            # ATM options have higher volume
+            if moneyness_pct < 0.01:  # ATM
+                volume = int(random.uniform(200000, 500000))
+            elif moneyness_pct < 0.02:  # Near ATM
+                volume = int(random.uniform(100000, 300000))
+            else:  # OTM/ITM
+                volume = int(random.uniform(50000, 150000))
             
             tick = {
                 'timestamp': int(time.time() * 1000),
-                'bid': round(bid, 2),
-                'ask': round(ask, 2),
-                'ltp': round(ltp, 2),
+                'bid': bid,
+                'ask': ask,
+                'ltp': ltp,
                 'volume': volume,
                 'symbol': f"NIFTY{strike}{option_type}",
                 'strike': strike,

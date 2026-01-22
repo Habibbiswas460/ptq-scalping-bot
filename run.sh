@@ -1,26 +1,38 @@
 #!/bin/bash
-# Quick Start - PTQ Bot (Paper Trading)
+# PTQ Scalping Bot - Run Script
 
-clear
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  🚀 PTQ SCALPING BOT - LIGHTWEIGHT VERSION"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "  📊 Mode: PAPER TRADING (Safe Testing)"
-echo "  💰 Capital: ₹30,000"
-echo "  🎯 Strategy: Multi-Level PTQ"
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
+set -e
 
-# Check venv
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo -e "${GREEN}PTQ Scalping Bot${NC}"
+echo "================================"
+
+# Check if venv exists
 if [ ! -d "venv" ]; then
-    echo "❌ Virtual environment not found!"
-    exit 1
+    echo -e "${YELLOW}Creating virtual environment...${NC}"
+    python3 -m venv venv
 fi
 
-# Activate and run
+# Activate venv
 source venv/bin/activate
-echo "▶ Starting bot..."
-echo ""
+
+# Install dependencies if needed
+if [ ! -f "venv/.installed" ]; then
+    echo -e "${YELLOW}Installing dependencies...${NC}"
+    pip install -r requirements.txt
+    touch venv/.installed
+fi
+
+# Check credentials
+if [ ! -f "config/credentials.json" ]; then
+    echo -e "${YELLOW}Warning: credentials.json not found${NC}"
+    echo "Running in paper trading mode..."
+fi
+
+# Run the bot
+echo -e "${GREEN}Starting bot...${NC}"
 python app.py

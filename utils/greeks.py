@@ -156,30 +156,28 @@ class GreeksCalculator:
                 'tte': 0.0
             }
         
-        # Estimate IV using Newton-Raphson (simplified)
-        # Start with a reasonable guess based on moneyness
-        moneyness = spot_price / strike_price
+        # Validate spot and strike are reasonable
+        if spot_price <= 0 or strike_price <= 0:
+            return {
+                'delta': 0.5,
+                'gamma': 0.001,
+                'theta': -50.0,
+                'vega': 5.0,
+                'theta_sec': 0.0005,
+                'tte': time_to_expiry_sec
+            }
         
-        if option_type == 'CE':
-            if moneyness > 1.05:  # ITM
-                iv_guess = 0.25
-            elif moneyness < 0.95:  # OTM
-                iv_guess = 0.35
-            else:  # ATM
-                iv_guess = 0.30
-        else:
-            if moneyness < 0.95:  # ITM
-                iv_guess = 0.25
-            elif moneyness > 1.05:  # OTM
-                iv_guess = 0.35
-            else:  # ATM
-                iv_guess = 0.30
+        # Fix #6: Implement proper Newton-Raphson IV solver
+        implied_vol = GreeksCalculator.solve_iv_newton(
+            market_price=ltp,
+            spot_price=spot_price,
+            strike_price=strike_price,
+            time_to_expiry=T,
+            option_type=option_type,
+            risk_free_rate=risk_free_rate
+        )
         
-        # For simplicity, use the guess directly
-        # In production, implement full IV solver
-        implied_vol = iv_guess
-        
-        # Calculate Greeks with estimated IV
+        # Calculate Greeks with solved IV
         return GreeksCalculator.calculate(
             spot_price=spot_price,
             strike_price=strike_price,
@@ -188,6 +186,77 @@ class GreeksCalculator:
             risk_free_rate=risk_free_rate,
             option_type=option_type
         )
+    
+    @staticmethod
+    def solve_iv_newton(
+        market_price: float,
+        spot_price: float,
+        strike_price: float,
+        time_to_expiry: float,
+        option_type: str = 'CE',
+        risk_free_rate: float = 0.05,
+        max_iterations: int = 50,
+        tolerance: float = 0.0001
+    ) -> float:
+        """
+        Fix #6: Newton-Raphson IV solver with convergence check
+        Solves for implied volatility given market price
+        """
+        # Initial guess based on moneyness
+        moneyness = spot_price / strike_price
+        
+        if option_type == 'CE':
+            if moneyness > 1.05:
+                iv = 0.20  # ITM call
+            elif moneyness < 0.95:
+                iv = 0.35  # OTM call
+            else:
+                iv = 0.25  # ATM
+        else:
+            if moneyness < 0.95:
+                iv = 0.20  # ITM put
+            elif moneyness > 1.05:
+                iv = 0.35  # OTM put
+            else:
+                iv = 0.25  # ATM
+        
+        S = spot_price
+        K = strike_price
+        T = max(time_to_expiry, 1/(365*24*60))  # Minimum 1 minute
+        r = risk_free_rate
+        
+        for _ in range(max_iterations):
+            try:
+                # Calculate d1, d2
+                d1 = (math.log(S / K) + (r + 0.5 * iv ** 2) * T) / (iv * math.sqrt(T))
+                d2 = d1 - iv * math.sqrt(T)
+                
+                # Option price
+                if option_type == 'CE':
+                    price = S * GreeksCalculator.norm_cdf(d1) - K * math.exp(-r * T) * GreeksCalculator.norm_cdf(d2)
+                else:
+                    price = K * math.exp(-r * T) * GreeksCalculator.norm_cdf(-d2) - S * GreeksCalculator.norm_cdf(-d1)
+                
+                # Vega (derivative of price w.r.t. IV)
+                vega = S * GreeksCalculator.norm_pdf(d1) * math.sqrt(T)
+                
+                # Check convergence
+                price_diff = market_price - price
+                if abs(price_diff) < tolerance:
+                    return max(0.05, min(1.5, iv))  # Clamp IV between 5% and 150%
+                
+                # Newton-Raphson update
+                if vega > 0.001:  # Avoid division by near-zero
+                    iv = iv + price_diff / vega
+                    iv = max(0.01, min(2.0, iv))  # Keep IV reasonable
+                else:
+                    break
+                    
+            except (ValueError, ZeroDivisionError):
+                break
+        
+        # Return best estimate (clamped)
+        return max(0.10, min(0.80, iv))
     
     @staticmethod
     def time_to_expiry_seconds(expiry_time: datetime) -> float:

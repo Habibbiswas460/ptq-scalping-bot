@@ -11,7 +11,6 @@
     "risk_per_trade_pct": 1.0,
     "risk_per_trade_amount": 300,
     "max_daily_loss_amount": 1000,
-    "kill_switch_loss_amount": 1800,
     "daily_loss_alert_threshold": 700
   },
   
@@ -21,68 +20,57 @@
     "option_type": "CE",
     "strike_selection": "ATM",
     "strike_offset": 0,
-    "lot_size": 25,
+    "lot_size": 65,
     "quantity": 1,
-    "style": "scalping_intraday"
+    "style": "scalping_discipline"
   },
   
   "risk_management": {
     "max_trades_per_hour": 3,
-    "max_trades_per_day": 12,
-    "ideal_trades_per_day": 8,
-    "max_daily_loss_pct": -5.0,
-    "max_daily_loss_amount": 1000,
+    "max_trades_per_day": 8,
+    "ideal_trades_per_day": 5,
+    "max_daily_loss_pct": -3.0,
+    "max_daily_loss_amount": 600,
     "stop_loss_amount": 250,
     "stop_loss_pct": 1.0,
-    "dynamic_sl_enabled": true,
-    "atr_multiplier_sl": 0.6,
-    "trail_sl_after_profit": 150,
-    "profit_target_1_amount": 150,
-    "profit_target_1_exit_pct": 50,
-    "profit_target_2_amount": 300,
-    "trailing_activation_amount": 180,
-    "trailing_atr_multiplier_normal": 0.4,
-    "trailing_atr_multiplier_expiry": 0.25,
+    "dynamic_sl_enabled": false,
+    "profit_target_amount": 120,
+    "trailing_activation_amount": 50,
+    "trailing_lock_pct": 40,
     "max_hold_time_normal_sec": 240,
     "max_hold_time_expiry_sec": 90,
-    "consecutive_loss_limit": 3,
+    "consecutive_loss_limit": 2,
     "pause_after_consecutive_loss_sec": 900,
-    "position_sizing_enabled": true,
-    "position_size_low_vix": 1.5,
-    "position_size_normal_vix": 1.0,
-    "position_size_high_vix": 0.5,
-    "vix_low_threshold": 12,
-    "vix_high_threshold": 18
+    "position_sizing_enabled": false
   },
   
   "data_hygiene": {
-    "latency_limit_ms": 150,
+    "latency_limit_ms": 100,
     "spread_limit_pct": 0.5,
     "tick_timeout_sec": 2,
     "min_volume": 100,
     "price_sanity_check": true,
-    "min_option_price": 10,
-    "max_option_price": 5000,
+    "min_option_price": 5,
+    "max_option_price": 500,
     "min_spot_price": 15000,
     "max_spot_price": 30000
   },
-  
+
   "entry_filters": {
     "avoid_first_15min": true,
-    "require_consecutive_signals": 2,
+    "require_consecutive_signals": 1,
     "volume_confirmation_required": true,
     "min_volume_ratio": 1.2
   },
-  
+
   "greeks_limits": {
-    "delta_min": 0.20,
-    "delta_max": 0.80,
-    "delta_kill_min": 0.10,
-    "gamma_normal_max": 0.15,
-    "gamma_expiry_max": 0.25,
-    "theta_sec_limit": 0.05,
-    "theta_sec_kill_limit": 0.10,
-    "vega_max": 0.30
+    "delta_min": 0.35,
+    "delta_max": 0.65,
+    "delta_kill_min": 0.25,
+    "gamma_normal_max": 0.07,
+    "gamma_expiry_max": 0.12,
+    "theta_sec_limit": 0.15,
+    "theta_sec_kill_limit": 0.25
   },
   
   "cooldown": {
@@ -125,20 +113,12 @@
   
   "kill_switch": {
     "daily_loss_amount": 900,
-    "spread_limit_pct": 0.5,
+    "spread_limit_pct": 0.8,
     "latency_limit_ms": 150,
-    "feed_freeze_sec": 2,
+    "feed_freeze_sec": 3,
     "auto_exit_on_trigger": true
   },
-  
-  "position_sizing": {
-    "method": "fixed",
-    "no_scaling": true,
-    "no_doubling": true,
-    "no_revenge_trading": true,
-    "quantity_per_trade": 1
-  },
-  
+
   "logging": {
     "enabled": true,
     "console_output": true,
