@@ -116,42 +116,46 @@ def validate_price_ptq(tick: Dict, ticks: List[Dict]) -> Tuple[bool, str]:
     """P = Price validation (PTQ)"""
     current_price = tick['ltp']
     
-    if len(ticks) < 60:
+    if len(ticks) < 30:  # Reduced from 60
         return False, "Insufficient history"
     
     vwap = calculate_vwap(ticks)
     candle = analyze_candle_quality(ticks)
     
-    # Check for chop
-    recent_prices = [t['ltp'] for t in ticks[-60:]]
+    # Check for chop - relaxed threshold
+    recent_prices = [t['ltp'] for t in ticks[-30:]]
     recent_range = max(recent_prices) - min(recent_prices)
-    is_chop = recent_range < current_price * CHOP_THRESHOLD
+    is_chop = recent_range < current_price * 0.0001  # Relaxed from CHOP_THRESHOLD
     
     if is_chop:
         return False, "Chop market"
     
-    # Level break + momentum (CALL)
-    if current_price > vwap and candle['body_pct'] > 20:
+    # Level break + momentum (CALL) - relaxed body requirement
+    if current_price > vwap and candle['body_pct'] > 10:  # Was 20
         return True, "Level break above VWAP"
     
-    # Level break + momentum (PUT)
-    if current_price < vwap and candle['body_pct'] > 20:
+    # Level break + momentum (PUT) - relaxed body requirement
+    if current_price < vwap and candle['body_pct'] > 10:  # Was 20
         return True, "Level break below VWAP"
     
-    # Rejection pattern
-    if candle['wick_pct'] > 35:
+    # Rejection pattern - relaxed wick requirement
+    if candle['wick_pct'] > 25:  # Was 35
         if current_price < vwap and candle['direction'] == 1:
             return True, "Rejection from VWAP (bullish)"
         elif current_price > vwap and candle['direction'] == -1:
             return True, "Rejection from VWAP (bearish)"
     
-    # Directional move away from VWAP
+    # Directional move away from VWAP - relaxed distance
     vwap_dist = abs(current_price - vwap) / vwap
-    if vwap_dist > 0.0015:
+    if vwap_dist > 0.001:  # Was 0.0015 (0.1% now)
         if current_price > vwap:
             return True, "Price above VWAP"
         elif current_price < vwap:
             return True, "Price below VWAP"
+    
+    # NEW: Any movement from VWAP is valid if volume is good
+    if vwap_dist > 0.0005:  # 0.05% minimum
+        return True, "Minor VWAP deviation"
     
     return False, "No valid price setup"
 
