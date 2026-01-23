@@ -69,8 +69,9 @@ def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str) -> Tuple[b
                     return False, f"Volume too low (ratio: {vol_ratio:.2f}, need: {min_ratio})"
     
     # 5. Greeks gate
-    if not greek_gate(greeks, day_type):
-        return False, "Greeks: Out of range"
+    greek_pass, greek_msg = greek_gate(greeks, day_type)
+    if not greek_pass:
+        return False, f"Greeks: {greek_msg}"
     
     # === ALL PASS - ENTRY ALLOWED ===
     return True, f"PTQ ✓ | P: {price_msg[:20]} | T: {time_msg} | Q: {quantity_msg[:20]}"

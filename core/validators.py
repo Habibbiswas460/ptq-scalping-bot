@@ -219,21 +219,30 @@ def validate_quantity_ptq(tick: Dict, ticks: List[Dict]) -> Tuple[bool, str]:
 # GREEKS FILTER
 # =========================================================
 
-def greek_gate(greeks: Dict, day_type: str) -> bool:
-    """Filter trades based on Greeks"""
-    if not (DELTA_MIN <= abs(greeks['delta']) <= DELTA_MAX):
-        return False
+def greek_gate(greeks: Dict, day_type: str) -> Tuple[bool, str]:
+    """Filter trades based on Greeks - returns (pass, reason)"""
+    delta = abs(greeks.get('delta', 0))
+    gamma = greeks.get('gamma', 0)
+    theta_sec = greeks.get('theta_sec', 0)
+    
+    # Delta check - relaxed range (0.20 to 0.85)
+    delta_min = CONFIG.get('greeks_limits', {}).get('delta_min', 0.20)
+    delta_max = CONFIG.get('greeks_limits', {}).get('delta_max', 0.85)
+    
+    if not (delta_min <= delta <= delta_max):
+        return False, f"Delta {delta:.3f} out of range ({delta_min}-{delta_max})"
 
-    if day_type == "NORMAL" and greeks['gamma'] > GAMMA_NORMAL_MAX:
-        return False
+    # Gamma check
+    gamma_max = GAMMA_EXPIRY_MAX if day_type == "EXPIRY" else GAMMA_NORMAL_MAX
+    if gamma > gamma_max:
+        return False, f"Gamma {gamma:.4f} > {gamma_max}"
 
-    if day_type == "EXPIRY" and greeks['gamma'] > GAMMA_EXPIRY_MAX:
-        return False
+    # Theta check - relaxed
+    theta_limit = CONFIG.get('greeks_limits', {}).get('theta_sec_limit', 0.25)
+    if theta_sec > theta_limit:
+        return False, f"Theta/sec {theta_sec:.5f} > {theta_limit}"
 
-    if greeks['theta_sec'] > THETA_SEC_LIMIT:
-        return False
-
-    return True
+    return True, "Greeks OK"
 
 
 def detect_day_type(greeks: Dict, time_to_expiry_sec: float) -> str:
