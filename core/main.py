@@ -24,7 +24,7 @@ from core.state_machine import (
     state_in_trade, state_cooldown
 )
 from core.kill_switch import emergency_check
-from core.greeks_calc import calculate_greeks
+from core.greeks_calc import calculate_greeks, init_greeks_fetcher
 from utils.helpers import now, market_open, estimate_vix_from_ticks
 
 
@@ -42,6 +42,11 @@ def main():
     
     logger = broker.logger
     state = trading_state
+    
+    # Initialize Greeks fetcher with broker client (for API Greeks)
+    if broker.broker_client:
+        init_greeks_fetcher(broker.broker_client)
+        logger.info("✓ Greeks API fetcher initialized")
     
     logger.info("")
     logger.info("=" * 60)
