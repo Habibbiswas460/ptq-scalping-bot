@@ -25,6 +25,10 @@ from core.state_machine import (
 )
 from core.kill_switch import emergency_check
 from core.greeks_calc import calculate_greeks, init_greeks_fetcher
+from core.mode_switch import (
+    update_trading_mode, get_current_mode, get_mode_emoji,
+    is_entries_allowed, record_trade_result, reset_mode
+)
 from utils.helpers import now, market_open, estimate_vix_from_ticks
 
 
@@ -58,6 +62,7 @@ def main():
     logger.info(f"💸 SL: ₹{STOP_LOSS_AMOUNT} | TP1: ₹{PROFIT_TARGET_1} | TP2: ₹{PROFIT_TARGET_2}")
     logger.info(f"⏱ Cooldown: {COOLDOWN_NORMAL_SEC}s / {COOLDOWN_AFTER_SL_SEC}s (after SL)")
     logger.info(f"📅 Day Type: {state.day_type}")
+    logger.info(f"🎛 Mode: {get_current_mode()} {get_mode_emoji()}")
     logger.info("-" * 60)
     
     state.last_hour_reset = datetime.now().replace(minute=0, second=0, microsecond=0)
@@ -123,11 +128,24 @@ def main():
             # Update VIX
             state.estimated_vix = estimate_vix_from_ticks(recent_ticks, state.estimated_vix)
             
+            # 🎛 UPDATE TRADING MODE (Aggressive ↔ Safe)
+            current_mode = update_trading_mode(
+                tick, greeks, state.day_type, 
+                state.daily_pnl_inr, recent_ticks
+            )
+            
+            # Check if entries allowed (not in LOCKDOWN)
+            entries_allowed = is_entries_allowed()
+            
             # State machine execution
             if state.state == "IDLE":
-                def entry_func(t):
-                    return entry_signal(t, recent_ticks, state.day_type)
-                state.state = state_idle(tick, greeks, state, entry_func, logger)
+                if entries_allowed:
+                    def entry_func(t):
+                        return entry_signal(t, recent_ticks, state.day_type)
+                    state.state = state_idle(tick, greeks, state, entry_func, logger)
+                else:
+                    # In lockdown - no new entries
+                    pass
             
             elif state.state == "ENTRY_READY":
                 state.state = state_entry_ready(tick, greeks, state, broker, logger)
@@ -143,8 +161,9 @@ def main():
             
             # Status update
             if state.loop_count % 200 == 0:
+                mode_info = f"{get_mode_emoji()} {get_current_mode()}"
                 logger.info(
-                    f"[{now().strftime('%H:%M:%S')}] {state.state} | {state.day_type} | "
+                    f"[{now().strftime('%H:%M:%S')}] {state.state} | {mode_info} | {state.day_type} | "
                     f"PnL: ₹{state.daily_pnl_inr:+.2f} ({state.daily_pnl_pct:+.2f}%) | "
                     f"Trades: {state.trades_this_hour}/{MAX_TRADES_PER_HOUR}h, {state.total_trades_today}/{MAX_TRADES_PER_DAY}d | "
                     f"W/L: {state.winning_trades}/{state.losing_trades}"

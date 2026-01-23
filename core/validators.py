@@ -13,6 +13,15 @@ from config.constants import (
 )
 from utils.helpers import current_time_ms, calc_latency_ms, spread_pct
 
+# Import mode switch for dynamic thresholds
+try:
+    from core.mode_switch import get_threshold, get_current_mode
+    HAS_MODE_SWITCH = True
+except ImportError:
+    HAS_MODE_SWITCH = False
+    def get_threshold(key): return None
+    def get_current_mode(): return "AGGRESSIVE"
+
 
 # =========================================================
 # DATA VALIDATION
@@ -186,7 +195,9 @@ def validate_time_ptq(greeks: Dict) -> Tuple[bool, str]:
 
 
 def validate_quantity_ptq(tick: Dict, ticks: List[Dict]) -> Tuple[bool, str]:
-    """Q = Quantity validation (PTQ)"""
+    """Q = Quantity validation (PTQ)
+    Uses dynamic thresholds based on current trading mode
+    """
     current_volume = tick.get('volume', 0)
     
     if len(ticks) < 60:
@@ -198,16 +209,17 @@ def validate_quantity_ptq(tick: Dict, ticks: List[Dict]) -> Tuple[bool, str]:
     if recent_avg == 0:
         return False, "No volume data"
     
-    # Volume expansion check - use config value
-    min_ratio = CONFIG.get('entry_filters', {}).get('min_volume_ratio', 0.8)
+    # Volume expansion check - use mode-specific threshold
+    min_ratio = get_threshold('min_volume_ratio') or CONFIG.get('entry_filters', {}).get('min_volume_ratio', 0.8)
     volume_ratio = current_volume / recent_avg
     if volume_ratio < min_ratio:
-        return False, f"Volume too low (ratio: {volume_ratio:.2f})"
+        mode = get_current_mode()
+        return False, f"Volume too low (ratio: {volume_ratio:.2f}, need: {min_ratio}) [{mode}]"
     
-    # Spread check - use config value (relaxed to 0.5% for normal liquidity)
+    # Spread check - use mode-specific threshold
     spread = tick['ask'] - tick['bid']
     spread_pct_val = (spread / tick['ltp']) * 100
-    max_spread = CONFIG.get('data_hygiene', {}).get('spread_limit_pct', 0.5)
+    max_spread = get_threshold('spread_limit_pct') or CONFIG.get('data_hygiene', {}).get('spread_limit_pct', 0.5)
     
     if spread_pct_val > max_spread:
         return False, f"Wide spread ({spread_pct_val:.2f}%)"
@@ -220,25 +232,32 @@ def validate_quantity_ptq(tick: Dict, ticks: List[Dict]) -> Tuple[bool, str]:
 # =========================================================
 
 def greek_gate(greeks: Dict, day_type: str) -> Tuple[bool, str]:
-    """Filter trades based on Greeks - returns (pass, reason)"""
+    """Filter trades based on Greeks - returns (pass, reason)
+    Uses dynamic thresholds based on current trading mode
+    """
     delta = abs(greeks.get('delta', 0))
     gamma = greeks.get('gamma', 0)
     theta_sec = greeks.get('theta_sec', 0)
     
-    # Delta check - relaxed range (0.20 to 0.85)
-    delta_min = CONFIG.get('greeks_limits', {}).get('delta_min', 0.20)
-    delta_max = CONFIG.get('greeks_limits', {}).get('delta_max', 0.85)
+    # Get thresholds (dynamic from mode_switch or static from config)
+    delta_min = get_threshold('delta_min') or CONFIG.get('greeks_limits', {}).get('delta_min', 0.20)
+    delta_max = get_threshold('delta_max') or CONFIG.get('greeks_limits', {}).get('delta_max', 0.85)
     
     if not (delta_min <= delta <= delta_max):
-        return False, f"Delta {delta:.3f} out of range ({delta_min}-{delta_max})"
+        mode = get_current_mode()
+        return False, f"Delta {delta:.3f} out of range ({delta_min}-{delta_max}) [{mode}]"
 
-    # Gamma check
-    gamma_max = GAMMA_EXPIRY_MAX if day_type == "EXPIRY" else GAMMA_NORMAL_MAX
+    # Gamma check - use mode-specific thresholds
+    if day_type == "EXPIRY":
+        gamma_max = get_threshold('gamma_expiry_max') or GAMMA_EXPIRY_MAX
+    else:
+        gamma_max = get_threshold('gamma_normal_max') or GAMMA_NORMAL_MAX
+    
     if gamma > gamma_max:
         return False, f"Gamma {gamma:.4f} > {gamma_max}"
 
-    # Theta check - relaxed
-    theta_limit = CONFIG.get('greeks_limits', {}).get('theta_sec_limit', 0.25)
+    # Theta check - use mode-specific threshold
+    theta_limit = get_threshold('theta_sec_limit') or CONFIG.get('greeks_limits', {}).get('theta_sec_limit', 0.25)
     if theta_sec > theta_limit:
         return False, f"Theta/sec {theta_sec:.5f} > {theta_limit}"
 

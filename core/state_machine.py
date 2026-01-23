@@ -76,6 +76,13 @@ class TradingState:
             self.winning_trades += 1
         
         self.total_trades_today += 1
+        
+        # Record trade result for mode switching
+        try:
+            from core.mode_switch import record_trade_result
+            record_trade_result(is_win=not is_loss)
+        except ImportError:
+            pass
 
 
 # Singleton state instance

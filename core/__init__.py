@@ -6,6 +6,11 @@ from core.exit_engine import check_exit_conditions
 from core.state_machine import trading_state
 from core.kill_switch import emergency_check
 from core.greeks_calc import calculate_greeks
+from core.mode_switch import (
+    update_trading_mode, get_current_mode, get_mode_emoji,
+    is_entries_allowed, record_trade_result, reset_mode,
+    MODE_AGGRESSIVE, MODE_SAFE, MODE_LOCKDOWN
+)
 
 __all__ = [
     'broker',
@@ -16,5 +21,14 @@ __all__ = [
     'check_exit_conditions',
     'trading_state',
     'emergency_check',
-    'calculate_greeks'
+    'calculate_greeks',
+    'update_trading_mode',
+    'get_current_mode',
+    'get_mode_emoji',
+    'is_entries_allowed',
+    'record_trade_result',
+    'reset_mode',
+    'MODE_AGGRESSIVE',
+    'MODE_SAFE',
+    'MODE_LOCKDOWN'
 ]
