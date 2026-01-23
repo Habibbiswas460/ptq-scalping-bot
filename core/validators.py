@@ -194,17 +194,19 @@ def validate_quantity_ptq(tick: Dict, ticks: List[Dict]) -> Tuple[bool, str]:
     if recent_avg == 0:
         return False, "No volume data"
     
-    # Volume expansion check
+    # Volume expansion check - use config value
+    min_ratio = CONFIG.get('entry_filters', {}).get('min_volume_ratio', 0.8)
     volume_ratio = current_volume / recent_avg
-    if volume_ratio < 1.02:
+    if volume_ratio < min_ratio:
         return False, f"Volume too low (ratio: {volume_ratio:.2f})"
     
-    # Spread check
+    # Spread check - use config value (relaxed to 0.5% for normal liquidity)
     spread = tick['ask'] - tick['bid']
-    spread_pct = (spread / tick['ltp']) * 100
+    spread_pct_val = (spread / tick['ltp']) * 100
+    max_spread = CONFIG.get('data_hygiene', {}).get('spread_limit_pct', 0.5)
     
-    if spread_pct > 0.2:
-        return False, "Wide spread - thin book"
+    if spread_pct_val > max_spread:
+        return False, f"Wide spread ({spread_pct_val:.2f}%)"
     
     return True, "Volume confirmed"
 

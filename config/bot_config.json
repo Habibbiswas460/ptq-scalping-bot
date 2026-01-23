@@ -60,7 +60,7 @@
     "avoid_first_15min": true,
     "require_consecutive_signals": 1,
     "volume_confirmation_required": true,
-    "min_volume_ratio": 1.2
+    "min_volume_ratio": 0.8
   },
 
   "greeks_limits": {
