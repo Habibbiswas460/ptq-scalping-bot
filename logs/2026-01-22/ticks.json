@@ -1,3 +1,0 @@
-{"timestamp": "2026-01-22 20:57:02.106", "tick_number": 1, "accepted": false, "reject_reason": "Wide spread (0.504%)", "ltp": 146.6, "bid": 146.23, "ask": 146.97, "volume": 340981, "spread": 0.7400000000000091, "spread_pct": 0.503504116486364}
-{"timestamp": "2026-01-22 20:57:12.632", "tick_number": 2, "accepted": false, "reject_reason": "Wide spread (0.504%)", "ltp": 146.55, "bid": 146.18, "ask": 146.92, "volume": 294216, "spread": 0.7399999999999807, "spread_pct": 0.5036754696433302}
-{"timestamp": "2026-01-22 20:57:22.990", "tick_number": 3, "accepted": false, "reject_reason": "Wide spread (0.502%)", "ltp": 146.95, "bid": 146.58, "ask": 147.32, "volume": 376431, "spread": 0.7399999999999807, "spread_pct": 0.5023079011675133}

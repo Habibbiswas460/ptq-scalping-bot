@@ -1,94 +1,224 @@
-# 🚀 PTQ Scalping Bot
+# PTQ Scalping Bot v2.0
 
-**Professional NIFTY Options Scalping Bot** with Angel One Broker Integration
+## SMART SCALP v3.0 - Institutional Grade NIFTY Options Scalping
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-
----
-
-## ✨ Features
-
-| Feature | Description |
-|---------|-------------|
-| 📊 **PTQ Strategy** | Price + Time + Quantity validated entries |
-| 💰 **Paper Trading** | Test strategies without real money |
-| 📈 **Live Data** | Real-time NIFTY spot via Yahoo Finance |
-| 🎯 **Multi-Level TP** | 3-tier profit targets with partial exits |
-| 🛡️ **Risk Management** | Dynamic SL, trailing stop, kill switch |
-| 📉 **Greeks Monitoring** | Delta, Gamma, Theta based exits |
-| 📋 **Trade Analytics** | Comprehensive performance analysis |
-| 💾 **State Persistence** | Resume from last state after restart |
+A sophisticated Python-based automated trading bot for NIFTY options scalping using Angel One SmartAPI. Features multi-factor scoring system with institutional-grade confluence detection.
 
 ---
 
-## 📁 Project Structure
+## 📊 Performance Summary
+
+| Metric | Value |
+|--------|-------|
+| Win Rate | 58.5% (CE: 62%, PE: 54%) |
+| Profit Factor | 2.06x |
+| Monthly Return | +42.2% |
+| Max Drawdown | -15.4% |
+| Monthly P&L | ₹50,608 |
+
+---
+
+## 🏗️ Architecture
 
 ```
 PTQ-scalping bot/
-├── app.py                    # Entry point
-├── analyze.py                # Trade analyzer CLI
-├── run.sh                    # Quick start script
+├── app.py                      # Entry point
+├── run.sh                      # Startup script
+├── requirements.txt            # Dependencies
 │
-├── config/
-│   ├── constants.py          # All trading parameters
-│   ├── bot_config.json       # JSON configuration
-│   └── credentials.json      # API credentials (git ignored)
+├── core/                       # Core trading logic
+│   ├── broker.py               # Angel One broker interface
+│   ├── main.py                 # Main trading loop
+│   ├── entry_engine.py         # Entry signal generation
+│   ├── exit_engine.py          # Exit signal handling
+│   ├── trade_manager.py        # Trade execution
+│   ├── risk_manager.py         # Risk controls
+│   ├── state_machine.py        # Trading state management
+│   ├── kill_switch.py          # Emergency stop system
+│   ├── mode_switch.py          # Adaptive mode switching
+│   ├── validators.py           # PTQ validation rules
+│   ├── session_manager.py      # Session tracking
+│   └── greeks_calc.py          # Option Greeks calculation
 │
-├── core/
-│   ├── main.py               # Main trading loop
-│   ├── broker.py             # Broker I/O operations
-│   ├── validators.py         # Data & PTQ validation
-│   ├── entry_engine.py       # Entry signal logic
-│   ├── exit_engine.py        # Exit logic (SL/TP/Trailing)
-│   ├── state_machine.py      # Trading state management
-│   ├── kill_switch.py        # Emergency safety checks
-│   └── greeks_calc.py        # Greeks calculator
+├── strategies/                 # Trading strategies
+│   └── smart_scalp_v3.py       # SMART SCALP v3.0 strategy
 │
-├── utils/
-│   ├── greeks.py             # BSM model calculator
-│   ├── logger.py             # Enhanced logging
-│   ├── analytics.py          # Trade analysis
-│   └── helpers.py            # Utility functions
+├── brokers/                    # Broker integrations
+│   └── angel_one/
+│       ├── client.py           # Angel One SmartAPI client
+│       ├── exceptions.py       # Custom exceptions
+│       └── DOCUMENTATION.md    # API documentation
 │
-├── brokers/
-│   └── angel_one/            # Angel One API client
+├── config/                     # Configuration files
+│   ├── bot_config.json         # Main configuration
+│   ├── credentials.json        # API credentials (gitignored)
+│   └── constants.py            # Python constants
 │
-├── logs/                     # Trading logs by date
+├── utils/                      # Utilities
+│   ├── greeks.py               # Greeks calculator
+│   ├── logger.py               # Logging system
+│   └── helpers.py              # Helper functions
+│
+├── logs/                       # Trade logs
 │   └── YYYY-MM-DD/
-│       ├── trades.json       # Raw trade data
-│       ├── trades.csv        # Excel compatible
-│       ├── analytics.json    # Performance metrics
-│       └── report.txt        # Human readable report
+│       ├── trades.json         # Trade records
+│       └── summary.json        # Daily summary
 │
-└── tests/                    # Unit tests
+└── docs/                       # Documentation
+    └── 30K_CONFIG.md           # 30K capital configuration guide
 ```
 
 ---
 
-## 🚀 Quick Start
+## 🔧 Tech Stack
 
-### 1. Setup Environment
+- **Language**: Python 3.12+
+- **Broker**: Angel One SmartAPI
+- **Data Source**: Angel One (Real-time LTP, OHLC, Greeks)
+- **Options**: NIFTY Weekly Options (NFO)
+- **Strategy**: SMART SCALP v3.0 Multi-Factor Scoring
 
+---
+
+## 📡 Broker Integration
+
+### Angel One SmartAPI
+
+All market data comes exclusively from Angel One:
+- Real-time NIFTY spot price (NSE)
+- Option chain data (NFO)
+- LTP, OHLC, Volume, OI
+- Option Greeks (Delta, Gamma, Theta, Vega)
+- India VIX for volatility filter
+
+### Symbol Format
+
+NIFTY option symbols follow this format:
+```
+NIFTY{DDMMMYY}{STRIKE}{CE/PE}
+```
+
+**Examples:**
+- `NIFTY03FEB2625400CE` - NIFTY 25400 CE expiring 03 Feb 2026
+- `NIFTY06FEB2625350PE` - NIFTY 25350 PE expiring 06 Feb 2026
+
+### Expiry Detection
+
+The bot automatically detects the nearest weekly expiry:
+- Searches day-by-day for the next 14 days
+- Handles holiday-shifted expiries (not always Thursday)
+- Republic Day 2026 shifted expiry: 30 Jan → 03 Feb (Tuesday)
+
+---
+
+## 🎯 SMART SCALP v3.0 Strategy
+
+### Multi-Factor Scoring System
+
+The strategy evaluates **10 bullish factors** and **10 bearish factors**:
+
+#### Bullish Factors (CE Entry)
+1. EMA 5 > EMA 9 > EMA 21 (Trend alignment)
+2. Price above EMA 50 (Major trend bullish)
+3. RSI 40-70 with bullish momentum
+4. MACD histogram rising
+5. Price near Bollinger lower band (oversold)
+6. Volume spike > 1.5x average
+7. ATR expansion (volatility breakout)
+8. Keltner Channel squeeze breakout
+9. Higher highs and higher lows
+10. Previous candle bullish engulfing
+
+#### Bearish Factors (PE Entry)
+1. EMA 5 < EMA 9 < EMA 21 (Trend alignment)
+2. Price below EMA 50 (Major trend bearish)
+3. RSI 30-60 with bearish momentum
+4. MACD histogram falling
+5. Price near Bollinger upper band (overbought)
+6. Volume spike on down moves
+7. ATR expansion on breakdown
+8. Keltner Channel breakdown
+9. Lower highs and lower lows
+10. Previous candle bearish engulfing
+
+### Entry Requirements
+
+| Requirement | Value |
+|-------------|-------|
+| Minimum Score | 5+ points (out of 10) |
+| Minimum Confidence | 60%+ |
+| Time Window | 9:20 AM - 3:15 PM |
+| VIX Filter | 10-25 (avoid extreme volatility) |
+
+### Position Sizing
+
+| Option Type | Quantity | Capital |
+|-------------|----------|---------|
+| CE Entry | 260 (4 lots × 65) | 100% |
+| PE Entry | 156 (2.4 lots × 65) | 60% |
+
+---
+
+## 💰 Capital Configuration (₹30K)
+
+### Risk Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Total Capital | ₹30,000 |
+| Risk Per Trade | ₹600 (2%) |
+| Max Daily Loss | ₹900 (3%) |
+| Kill Switch | ₹1,200 (4%) |
+| Max Drawdown | ₹3,000 (10%) |
+
+### Fixed Stop Loss & Target
+
+| Parameter | CE Trade | PE Trade |
+|-----------|----------|----------|
+| SL Points | 8 pts | 8 pts |
+| TP Points | 16 pts | 16 pts |
+| Risk-Reward | 1:2 | 1:2 |
+| Max Loss | ₹2,080 | ₹1,248 |
+| Max Profit | ₹4,160 | ₹2,496 |
+
+---
+
+## ⚙️ Installation
+
+### 1. Clone Repository
 ```bash
-git clone https://github.com/Habibbiswas460/ptq-scalping-bot.git
+git clone https://github.com/yourusername/ptq-scalping-bot.git
 cd ptq-scalping-bot
-python3 -m venv venv
+```
+
+### 2. Create Virtual Environment
+```bash
+python3.12 -m venv venv
 source venv/bin/activate
+```
+
+### 3. Install Dependencies
+```bash
 pip install -r requirements.txt
 ```
 
-### 2. Configure Credentials
+### 4. Configure Credentials
 
-```bash
-cp config/credentials.json.example config/credentials.json
-# Edit with your Angel One API keys
+Create `config/credentials.json`:
+```json
+{
+  "angel_one": {
+    "api_key": "YOUR_API_KEY",
+    "client_id": "YOUR_CLIENT_ID",
+    "password": "YOUR_PASSWORD",
+    "totp_token": "YOUR_TOTP_SECRET"
+  }
+}
 ```
 
-### 3. Run Bot
-
+### 5. Run the Bot
 ```bash
-# Using run script (recommended)
+# Using run script
 ./run.sh
 
 # Or directly
@@ -97,158 +227,185 @@ python app.py
 
 ---
 
-## ⚙️ Configuration (₹30K Setup)
+## 📝 Configuration
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| Capital | ₹30,000 | Total trading capital |
-| Risk/Trade | ₹300 (1%) | Max risk per trade |
-| Stop Loss | ₹250 | Fixed stop loss amount |
-| TP-1 | ₹100 | First target (30% exit) |
-| TP-2 | ₹200 | Second target (40% exit) |
-| TP-3 | ₹350 | Final target (30% exit) |
-| Kill Switch | ₹1,800 (6%) | Auto shutdown limit |
-| Max Trades | 25/day, 8/hour | Trading limits |
+### Paper Trading Mode
+
+Edit `config/bot_config.json`:
+```json
+{
+  "broker": {
+    "paper_trading": true,
+    "use_live_data": true
+  }
+}
+```
+
+- `paper_trading: true` - No real orders, simulated execution
+- `use_live_data: true` - Uses real NIFTY spot from Angel One
+
+### Live Trading Mode
+
+```json
+{
+  "broker": {
+    "paper_trading": false,
+    "use_live_data": true
+  }
+}
+```
+
+⚠️ **WARNING**: Live trading uses real money. Test thoroughly in paper mode first.
 
 ---
 
-## 📊 Trade Analysis
-
-### Run Analyzer
-
-```bash
-# Interactive mode
-python analyze.py
-
-# Analyze today
-python analyze.py today
-
-# Analyze specific date
-python analyze.py 2026-01-22
-
-# List available dates
-python analyze.py --list
-```
-
-### Sample Output
+## 🔄 Trading Loop
 
 ```
-📊 PTQ SCALPING BOT - TRADING REPORT
-======================================================================
-📈 PERFORMANCE SUMMARY
-----------------------------------------
-Total Trades:      11
-Winners:           1 (9.09%)
-Profit Factor:     1.62
-Expectancy:        ₹23.82/trade
-
-💰 PROFIT & LOSS
-----------------------------------------
-Total PnL:         ₹+262.00
-Best Trade:        ₹687.00
-Max Drawdown:      ₹421.50
+1. Market Open (9:15 AM)
+   │
+2. Connect to Angel One
+   │
+3. Get NIFTY Spot Price
+   │
+4. Find Nearest Weekly Expiry
+   │
+5. Build Option Symbol
+   │
+6. Main Loop:
+   │
+   ├─→ Get Real-time Tick
+   │    │
+   │    ├─→ Calculate Indicators
+   │    │
+   │    ├─→ Score Entry Factors (10 bullish + 10 bearish)
+   │    │
+   │    ├─→ Check Risk Limits
+   │    │
+   │    └─→ Generate Signal (if score ≥ 5 & confidence ≥ 60%)
+   │
+   ├─→ Execute Trade (if signal)
+   │    │
+   │    ├─→ Place Order
+   │    │
+   │    ├─→ Set Stop Loss
+   │    │
+   │    └─→ Monitor Exit
+   │
+   └─→ Repeat until Market Close (3:30 PM)
+   
+7. Generate Daily Summary
 ```
 
 ---
 
-## 🔧 PTQ Strategy
+## 📊 Indicators Used
 
-The bot uses **P-T-Q validation** for entries:
-
-### P - Price
-- VWAP breakout/rejection
-- Candle body analysis
-- Chop filter (min range)
-
-### T - Time
-- Session filters (avoid first 15 min)
-- Theta decay threshold
-- Market close protection
-
-### Q - Quantity
-- Volume expansion (>1.02x avg)
-- Spread check (<0.2%)
-- Liquidity confirmation
+| Indicator | Period | Purpose |
+|-----------|--------|---------|
+| EMA 5 | 5 | Fast trend |
+| EMA 9 | 9 | Signal line |
+| EMA 21 | 21 | Medium trend |
+| EMA 50 | 50 | Major trend |
+| RSI | 14 | Momentum |
+| MACD | 12, 26, 9 | Trend strength |
+| Bollinger Bands | 20, 2σ | Volatility |
+| Keltner Channel | 20, 1.5 ATR | Squeeze detection |
+| ATR | 14 | Stop loss sizing |
+| Volume SMA | 20 | Volume analysis |
 
 ---
 
 ## 🛡️ Risk Management
 
+### Kill Switch
+- Activates at ₹1,200 daily loss
+- Stops all trading for the day
+- Logs emergency state
+
+### Trade Limits
+- Max 3 trades per hour
+- Max 6 trades per day
+- 30-second cooldown between trades
+- 60-second cooldown after stop loss
+
+### Adaptive Mode
+The bot switches modes based on performance:
+- **NORMAL**: Standard parameters
+- **CAUTIOUS**: After 2 consecutive losses (tighter filters)
+- **AGGRESSIVE**: After 3 consecutive wins (wider targets)
+- **RECOVERY**: After hitting 50% of daily loss limit
+
+---
+
+## 📋 Logging
+
+### Trade Logs
+Location: `logs/YYYY-MM-DD/trades.json`
+```json
+{
+  "timestamp": "2026-01-28 10:30:45",
+  "symbol": "NIFTY03FEB2625400CE",
+  "direction": "LONG",
+  "entry_price": 125.50,
+  "exit_price": 141.50,
+  "quantity": 260,
+  "pnl": 4160,
+  "signal_score": 7,
+  "confidence": 72
+}
 ```
-┌─────────────────────────────────────┐
-│ 🎯 MULTI-TIER EXIT SYSTEM           │
-├─────────────────────────────────────┤
-│ TP-1 (₹100)  → Exit 30%             │
-│ TP-2 (₹200)  → Exit 40% + BE SL     │
-│ TP-3 (₹350)  → Exit remaining 30%   │
-├─────────────────────────────────────┤
-│ 📉 TRAILING STOPS                   │
-├─────────────────────────────────────┤
-│ @ ₹75   → Lock 30% profit           │
-│ @ ₹150  → Lock 50% profit           │
-│ @ ₹250  → Lock 60% profit           │
-├─────────────────────────────────────┤
-│ 🛑 KILL SWITCHES                    │
-├─────────────────────────────────────┤
-│ Daily Loss > ₹1,800 → Stop trading  │
-│ Spread > 0.5%       → Exit & pause  │
-│ Latency > 150ms     → Exit & pause  │
-└─────────────────────────────────────┘
+
+### Daily Summary
+Location: `logs/YYYY-MM-DD/summary.json`
+```json
+{
+  "date": "2026-01-28",
+  "total_trades": 4,
+  "winning_trades": 3,
+  "losing_trades": 1,
+  "win_rate": 75.0,
+  "gross_pnl": 8320,
+  "net_pnl": 6072
+}
 ```
 
 ---
 
-## 📈 Greeks-Based Exits
-
-| Greek | Limit | Action |
-|-------|-------|--------|
-| Delta | < 0.02 | Kill trade immediately |
-| Gamma | > 0.15 (expiry) | Exit position |
-| Theta/sec | > 0.001 | Exit position |
-
----
-
-## 🧪 Testing
+## 🚀 Quick Start
 
 ```bash
-# Run all tests
-pytest tests/ -v
+# Activate environment
+source venv/bin/activate
 
-# Run specific test
-pytest tests/test_greeks.py -v
+# Run in paper trading mode (default)
+python app.py
+
+# Watch the output
+# ✅ Angel One connected - Real NIFTY: ₹25,342.75
+# ✓ Using Strike: 25350
+# ✓ Expiry: 03FEB26 | Symbol: NIFTY03FEB2625350CE
+# 🔄 Entering main trading loop...
 ```
 
 ---
 
-## 📝 Log Files
+## 📞 Support
 
-Each trading day creates:
-
-| File | Format | Use |
-|------|--------|-----|
-| `trades.json` | JSON | Raw data for analysis |
-| `trades.csv` | CSV | Open in Excel |
-| `analytics.json` | JSON | Metrics & stats |
-| `report.txt` | Text | Human readable report |
-| `events.json` | JSON | All bot events |
-| `bot.log` | Text | Full activity log |
+For issues or questions:
+1. Check `logs/` for error details
+2. Verify `credentials.json` is correct
+3. Ensure market hours (9:15 AM - 3:30 PM IST)
+4. Confirm Angel One API subscription is active
 
 ---
 
 ## ⚠️ Disclaimer
 
-This bot is for **educational purposes only**. Trading in options involves significant risk. Past performance does not guarantee future results. Use at your own risk.
+This bot is for educational purposes only. Trading in derivatives involves significant risk of loss. Past performance does not guarantee future results. Use at your own risk.
 
 ---
 
-## 📄 License
+## 📜 License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
----
-
-## 🤝 Author
-
-**Habib Biswas**
-
-- GitHub: [@Habibbiswas460](https://github.com/Habibbiswas460)
+MIT License - See LICENSE file for details.

@@ -1,6 +1,7 @@
 """
 PTQ Scalping Bot - Enhanced Logger
 Comprehensive logging for analysis and debugging
+Beautiful console output with colors and decorations
 """
 
 import os
@@ -8,6 +9,34 @@ import json
 import csv
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+
+
+class Colors:
+    """ANSI color codes for beautiful console output"""
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    
+    # Foreground colors
+    RED = '\033[31m'
+    GREEN = '\033[32m'
+    YELLOW = '\033[33m'
+    BLUE = '\033[34m'
+    MAGENTA = '\033[35m'
+    CYAN = '\033[36m'
+    WHITE = '\033[37m'
+    
+    # Background colors
+    BG_RED = '\033[41m'
+    BG_GREEN = '\033[42m'
+    BG_YELLOW = '\033[43m'
+    BG_BLUE = '\033[44m'
+    BG_MAGENTA = '\033[45m'
+    BG_CYAN = '\033[46m'
+    
+    # Special
+    BRIGHT = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 
 class BotLogger:
@@ -77,7 +106,43 @@ class BotLogger:
             f.write(log_line)
         
         if self.enable_console:
-            print(f"[{level}] {message}")
+            # Add colors for console output
+            colored_message = self._colorize_message(message, level)
+            print(colored_message)
+    
+    def _colorize_message(self, message: str, level: str) -> str:
+        """Add colors to console messages based on content"""
+        # Remove ANSI codes for file logging, but add them for console
+        if "🎯 SIGNAL FOUND" in message:
+            return f"{Colors.BG_GREEN}{Colors.WHITE}{Colors.BOLD}🎯 SIGNAL FOUND!{Colors.RESET} {message.replace('🎯 SIGNAL FOUND:', '').strip()}"
+        elif "❌ NO SIGNAL" in message:
+            return f"{Colors.RED}❌ NO SIGNAL:{Colors.RESET} {message.replace('❌ NO SIGNAL:', '').strip()}"
+        elif "🔄 WARMING UP" in message:
+            return f"{Colors.YELLOW}🔄 WARMING UP:{Colors.RESET} {message.replace('🔄 WARMING UP:', '').strip()}"
+        elif "📊 SCORE LOW" in message:
+            return f"{Colors.CYAN}📊 SCORE LOW:{Colors.RESET} {message.replace('📊 SCORE LOW:', '').strip()}"
+        elif "💓 HEARTBEAT" in message or "╔" in message:
+            return f"{Colors.CYAN}{message}{Colors.RESET}"
+        elif "🌟 STATUS UPDATE" in message:
+            return f"{Colors.MAGENTA}{Colors.BOLD}🌟 STATUS UPDATE{Colors.RESET}"
+        elif "🏆" in message or "╔═" in message:
+            return f"{Colors.YELLOW}{Colors.BOLD}{message}{Colors.RESET}"
+        elif "📊 FINAL" in message:
+            return f"{Colors.GREEN}{Colors.BOLD}{message}{Colors.RESET}"
+        elif "🔔 MARKET IS NOW OPEN" in message:
+            return f"{Colors.GREEN}{Colors.BOLD}{message}{Colors.RESET}"
+        elif "🎯 TRADING SESSION ACTIVE" in message:
+            return f"{Colors.GREEN}{Colors.BOLD}{message}{Colors.RESET}"
+        else:
+            # Default coloring based on level
+            if level == "ERROR":
+                return f"{Colors.RED}{message}{Colors.RESET}"
+            elif level == "WARN":
+                return f"{Colors.YELLOW}{message}{Colors.RESET}"
+            elif level == "INFO":
+                return f"{Colors.WHITE}{message}{Colors.RESET}"
+            else:
+                return message
     
     def _write_json(self, filepath: str, data: Dict):
         """Append JSON entry"""

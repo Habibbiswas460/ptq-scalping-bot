@@ -1,34 +1,19 @@
-# Core trading modules
-from core.broker import broker
-from core.validators import is_data_valid, greek_gate, detect_day_type
-from core.entry_engine import entry_signal
-from core.exit_engine import check_exit_conditions
-from core.state_machine import trading_state
-from core.kill_switch import emergency_check
-from core.greeks_calc import calculate_greeks
-from core.mode_switch import (
-    update_trading_mode, get_current_mode, get_mode_emoji,
-    is_entries_allowed, record_trade_result, reset_mode,
-    MODE_AGGRESSIVE, MODE_SAFE, MODE_LOCKDOWN
-)
+"""
+PTQ Scalping Bot - Core Module
+SMART SCALP v3.0
 
-__all__ = [
-    'broker',
-    'is_data_valid',
-    'greek_gate',
-    'detect_day_type',
-    'entry_signal',
-    'check_exit_conditions',
-    'trading_state',
-    'emergency_check',
-    'calculate_greeks',
-    'update_trading_mode',
-    'get_current_mode',
-    'get_mode_emoji',
-    'is_entries_allowed',
-    'record_trade_result',
-    'reset_mode',
-    'MODE_AGGRESSIVE',
-    'MODE_SAFE',
-    'MODE_LOCKDOWN'
-]
+Organized into 4 sub-modules:
+├── trading/  : Broker connection & order execution
+├── engines/  : Entry/Exit signal engines & state machine  
+├── risk/     : Risk management, Greeks & validation
+└── services/ : Dashboard, Database, Telegram, Session
+"""
+
+# Main entry
+from core.main import main
+
+# Re-export from sub-modules for backwards compatibility
+from core.trading import *
+from core.engines import *
+from core.risk import *
+from core.services import *

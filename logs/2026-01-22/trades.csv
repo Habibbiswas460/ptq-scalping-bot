@@ -1,1 +1,0 @@
-trade_id,timestamp,event,symbol,side,qty,entry_price,exit_price,pnl,pnl_pct,hold_time_sec,entry_reason,exit_reason,delta,gamma,theta,vega,spot_price,strike,tte_sec

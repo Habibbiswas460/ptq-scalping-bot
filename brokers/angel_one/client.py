@@ -21,6 +21,18 @@ import pyotp
 from typing import Dict, Optional, Callable, List, Any
 from datetime import datetime
 
+# Suppress verbose SmartAPI SDK logging BEFORE importing
+import logging
+import sys
+import io
+
+# Create a null handler for all SmartAPI related logging
+_null_handler = logging.NullHandler()
+for _logger_name in ['SmartApi', 'smartConnect', 'smartapi', 'SmartApi.smartConnect']:
+    _sdk_logger = logging.getLogger(_logger_name)
+    _sdk_logger.handlers = [_null_handler]
+    _sdk_logger.setLevel(logging.ERROR)  # Only show errors
+
 try:
     from SmartApi import SmartConnect
 except ImportError:
@@ -144,9 +156,9 @@ class AngelOneClient:
         client = AngelOneClient(api_key, client_id, password, totp_secret)
         client.login()
         
-        # Place order
+        # Place order (symbol format: NIFTY{DDMMMYY}{STRIKE}{CE/PE})
         order = client.place_order(
-            symbol="NIFTY2612725200CE",
+            symbol="NIFTY03FEB2625400CE",
             exchange="NFO",
             transaction_type="BUY",
             quantity=25,
@@ -154,11 +166,11 @@ class AngelOneClient:
         )
         
         # Get LTP
-        ltp = client.get_ltp("NFO", "NIFTY2612725200CE", "12345")
+        ltp = client.get_ltp("NFO", "NIFTY03FEB2625400CE", "49801")
         
         # WebSocket streaming
         client.start_websocket(on_tick=my_callback)
-        client.subscribe([("NFO", "12345", WS_MODE_LTP)])
+        client.subscribe([("NFO", "49801", WS_MODE_LTP)])
     """
     
     def __init__(
@@ -390,7 +402,7 @@ class AngelOneClient:
         Place an order
         
         Args:
-            symbol: Trading symbol (e.g., NIFTY2612725200CE)
+            symbol: Trading symbol (e.g., NIFTY03FEB2625400CE)
             exchange: Exchange (NSE, BSE, NFO, MCX, CDS)
             transaction_type: BUY or SELL
             quantity: Order quantity
@@ -594,29 +606,48 @@ class AngelOneClient:
     # MARKET DATA
     # =========================================================================
     
-    def get_ltp(self, exchange: str, symbol: str, symbol_token: str) -> Optional[float]:
+    def get_ltp(self, exchange: str, symbol: str, symbol_token: str, max_retries: int = 3) -> Optional[float]:
         """
-        Get Last Traded Price
+        Get Last Traded Price with retry logic
         
         Args:
             exchange: Exchange code
             symbol: Trading symbol
             symbol_token: Symbol token
+            max_retries: Max retries on rate limit (default 3)
             
         Returns:
             LTP as float or None
         """
-        self._rate_limit('getLtpData')
-        self._ensure_logged_in()
+        for attempt in range(max_retries):
+            self._rate_limit('getLtpData')
+            self._ensure_logged_in()
+            
+            try:
+                response = self.smart_api.ltpData(exchange, symbol, symbol_token)
+                if response and response.get('status') and response.get('data'):
+                    return float(response['data'].get('ltp', 0))
+                
+                # Check for rate limit error in response
+                if response and 'Access denied' in str(response.get('message', '')):
+                    wait_time = (2 ** attempt) * 2  # Exponential backoff: 2, 4, 8 seconds
+                    self.logger.warning(f"⏳ Rate limited, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                    
+                return None
+            except Exception as e:
+                error_msg = str(e)
+                if 'Access denied' in error_msg or 'rate' in error_msg.lower():
+                    wait_time = (2 ** attempt) * 2
+                    self.logger.warning(f"⏳ Rate limited, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                self.logger.error(f"LTP error for {symbol}: {e}")
+                return None
         
-        try:
-            response = self.smart_api.ltpData(exchange, symbol, symbol_token)
-            if response and response.get('status') and response.get('data'):
-                return float(response['data'].get('ltp', 0))
-            return None
-        except Exception as e:
-            self.logger.error(f"LTP error for {symbol}: {e}")
-            return None
+        self.logger.error(f"LTP failed after {max_retries} retries for {symbol}")
+        return None
     
     def get_quote(
         self, 
@@ -638,12 +669,8 @@ class AngelOneClient:
         self._ensure_logged_in()
         
         try:
-            params = {
-                "mode": mode,
-                "exchangeTokens": exchange_tokens
-            }
-            
-            response = self.smart_api.getMarketData(params)
+            # SmartAPI expects mode and exchangeTokens as separate args
+            response = self.smart_api.getMarketData(mode, exchange_tokens)
             if response and response.get('status'):
                 return response.get('data', {})
             return {}
@@ -786,7 +813,8 @@ class AngelOneClient:
     def get_option_greeks(
         self, 
         underlying: str, 
-        expiry_date: str
+        expiry_date: str,
+        max_retries: int = 3
     ) -> List[Dict]:
         """
         Get option Greeks for all strikes of an underlying
@@ -794,26 +822,45 @@ class AngelOneClient:
         Args:
             underlying: Underlying name (e.g., "NIFTY", "BANKNIFTY")
             expiry_date: Expiry date in format "25JAN2024"
+            max_retries: Max retries on rate limit (default 3)
             
         Returns:
             List of Greeks data for each strike
         """
-        self._rate_limit('optionGreek')
-        self._ensure_logged_in()
-        
-        try:
-            params = {
-                "name": underlying,
-                "expirydate": expiry_date
-            }
+        for attempt in range(max_retries):
+            self._rate_limit('optionGreek')
+            self._ensure_logged_in()
             
-            response = self.smart_api.optionGreek(params)
-            if response and response.get('status'):
-                return response.get('data', []) or []
-            return []
-        except Exception as e:
-            self.logger.error(f"Option Greeks error: {e}")
-            return []
+            try:
+                params = {
+                    "name": underlying,
+                    "expirydate": expiry_date
+                }
+                
+                response = self.smart_api.optionGreek(params)
+                if response and response.get('status'):
+                    return response.get('data', []) or []
+                
+                # Check for rate limit error
+                if response and 'Access denied' in str(response.get('message', '')):
+                    wait_time = (2 ** attempt) * 2
+                    self.logger.warning(f"⏳ Greeks rate limited, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                    
+                return []
+            except Exception as e:
+                error_msg = str(e)
+                if 'Access denied' in error_msg or 'rate' in error_msg.lower():
+                    wait_time = (2 ** attempt) * 2
+                    self.logger.warning(f"⏳ Greeks rate limited, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                self.logger.error(f"Option Greeks error: {e}")
+                return []
+        
+        self.logger.warning(f"Greeks failed after {max_retries} retries")
+        return []
     
     # =========================================================================
     # HISTORICAL DATA
@@ -881,7 +928,17 @@ class AngelOneClient:
             return self.symbol_cache[cache_key]
         
         try:
-            result = self.smart_api.searchScrip(exchange=exchange, searchscrip=symbol)
+            # Suppress SmartAPI SDK's verbose print statements
+            import sys
+            import io
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()  # Capture stdout
+            
+            try:
+                result = self.smart_api.searchScrip(exchange=exchange, searchscrip=symbol)
+            finally:
+                sys.stdout = old_stdout  # Restore stdout
+                
             if result and result.get('status') and result.get('data'):
                 for item in result['data']:
                     if item.get('tradingsymbol') == symbol or item.get('symbol') == symbol:
@@ -896,7 +953,7 @@ class AngelOneClient:
     
     def search_symbol(self, search_term: str, exchange: str = "NFO") -> List[Dict]:
         """
-        Search for symbols
+        Search for symbols (with suppressed verbose SDK output)
         
         Args:
             search_term: Search string
@@ -906,7 +963,17 @@ class AngelOneClient:
             List of matching symbols
         """
         try:
-            result = self.smart_api.searchScrip(exchange=exchange, searchscrip=search_term)
+            # Suppress SmartAPI SDK's verbose print statements
+            import sys
+            import io
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()  # Capture stdout
+            
+            try:
+                result = self.smart_api.searchScrip(exchange=exchange, searchscrip=search_term)
+            finally:
+                sys.stdout = old_stdout  # Restore stdout
+                
             if result and result.get('status'):
                 return result.get('data', []) or []
             return []
@@ -914,6 +981,28 @@ class AngelOneClient:
             self.logger.error(f"Symbol search error: {e}")
             return []
     
+    def get_instrument_list(self) -> List[Dict]:
+        """
+        Fetch the full list of tradable instruments.
+        
+        Returns:
+            A list of instrument dictionaries.
+        """
+        self._ensure_logged_in()
+        try:
+            # The smartapi-python library downloads this from a static URL
+            # so it doesn't have a rate limit in the same way as other API calls.
+            instrument_list = self.smart_api.getInstruments()
+            if isinstance(instrument_list, list) and len(instrument_list) > 0:
+                self.logger.info(f"Fetched {len(instrument_list)} instruments.")
+                return instrument_list
+            else:
+                self.logger.error("Failed to fetch instrument list or list is empty.")
+                return []
+        except Exception as e:
+            self.logger.error(f"Error fetching instrument list: {e}", exc_info=True)
+            return []
+
     # =========================================================================
     # WEBSOCKET STREAMING
     # =========================================================================
