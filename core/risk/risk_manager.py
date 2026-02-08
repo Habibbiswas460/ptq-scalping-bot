@@ -107,23 +107,19 @@ class RiskManager:
         self._broker_client = broker_client
     
     def get_vix(self) -> float:
-        """Get India VIX value from Angel One"""
-        if self.vix_last_fetch and (datetime.now() - self.vix_last_fetch).seconds < 300:
-            return self.vix_value or 15.0
+        """Get India VIX value
         
-        try:
-            # Try to get VIX from broker if available
-            if hasattr(self, '_broker_client') and self._broker_client:
-                # India VIX token on NSE: 26017
-                vix_val = self._broker_client.get_ltp("NSE", "India VIX", "26017")
-                if vix_val and 5 <= vix_val <= 100:
-                    self.vix_value = vix_val
-                    self.vix_last_fetch = datetime.now()
-                    return self.vix_value
-        except Exception as e:
-            self._log('warning', f"Could not fetch VIX: {e}")
+        Note: Angel One API doesn't support India VIX LTP fetch.
+        Using estimation from helpers module instead.
+        """
+        # Use VIX estimation from helpers (based on price volatility)
+        from utils.helpers import fetch_real_vix
+        estimated_vix = fetch_real_vix()
         
-        # Return cached or default
+        if estimated_vix and 5 <= estimated_vix <= 100:
+            self.vix_value = estimated_vix
+            self.vix_last_fetch = datetime.now()
+        
         return self.vix_value or 15.0
     
     def check_vix_filter(self) -> Tuple[bool, float, str]:

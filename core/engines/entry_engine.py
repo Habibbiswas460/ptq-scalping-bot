@@ -11,6 +11,10 @@ from core.risk.validators import (
     validate_price_ptq, validate_time_ptq, 
     validate_quantity_ptq, greek_gate
 )
+from core.risk.session_trend import (
+    start_trading_session, update_market_price, 
+    can_trade_ce, can_trade_pe, get_trend_display
+)
 
 # Import SMART SCALP v3.0 Strategy
 try:
@@ -29,17 +33,19 @@ MAX_RECENT_TICKS = 120  # 2 minutes of data
 last_signal_params = {}
 
 
-def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str) -> Tuple[bool, str]:
+def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str, instrument_type: str = "") -> Tuple[bool, str]:
     """
-    Entry Signal Generator - SMART SCALP v3.0 + PTQ validation
+    Entry Signal Generator - SMART SCALP v3.0 + Session Trend + PTQ validation
     
     Uses multi-factor scoring system:
     - 10 bullish factors + 10 bearish factors
-    - Requires 5+ score and 60%+ confidence
+    - Requires 4+ score and 55%+ confidence
     - Dynamic SL/TP based on ATR and confidence
     
-    NOTE: Strategy now fetches real NIFTY data from Yahoo internally,
-    so we don't need many ticks for warmup.
+    Session Trend Logic:
+    - If price > opening: BULLISH (CE allowed)
+    - If price < opening: BEARISH (PE allowed)
+    - If price ≈ opening: SIDEWAYS (no trade)
     """
     global last_signal_params
     
@@ -47,11 +53,32 @@ def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str) -> Tuple[b
     if len(recent_ticks) < 10:
         return False, "Warming up..."
     
+    # Update session trend with current price
+    current_price = tick.get('ltp', tick.get('price', 0))
+    update_market_price(current_price)
+    trend_str = get_trend_display()
+    
     # === SMART SCALP v3.0 STRATEGY ===
     if HAS_SMART_SCALP:
         should_enter, message, params = smart_scalp_signal(recent_ticks)
         
         if should_enter:
+            # Get instrument type from strategy params
+            instrument = params.get('direction', 'CE')
+            
+            # Check session trend gate
+            if instrument == 'CE':
+                ce_ok, ce_msg = can_trade_ce()
+                if not ce_ok:
+                    return False, f"{ce_msg}"
+            else:  # PE
+                pe_ok, pe_msg = can_trade_pe()
+                if not pe_ok:
+                    return False, f"{pe_msg}"
+            
+            # Add trend info to message
+            full_message = f"{message} | {trend_str}"
+            
             # Store params for use by trade_manager
             last_signal_params = params
             
@@ -68,7 +95,7 @@ def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str) -> Tuple[b
                 if not greek_pass:
                     return False, f"Greeks: {greek_msg}"
             
-            return True, message
+            return True, full_message
         else:
             last_signal_params = {}
             return False, message
@@ -78,11 +105,12 @@ def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str) -> Tuple[b
 
 
 def _calculate_greeks(tick: Dict) -> Dict:
-    """Calculate Greeks for validation"""
+    """Calculate Greeks for validation (uses smart caching for optimization)"""
     current_price = tick['ltp']
     strike = round(current_price / 50) * 50
     
-    return GreeksCalculator.calculate(
+    # Use cached Greeks calculation (5-sec TTL + 1% spot move invalidation)
+    return GreeksCalculator.calculate_cached(
         spot_price=current_price,
         strike_price=strike,
         time_to_expiry=7/365.0,

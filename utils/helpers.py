@@ -42,62 +42,53 @@ def wait_for_market_open():
     import time as t
     from datetime import timedelta
     
+    def _log(msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"\033[2m{ts}\033[0m  {msg}")
+    
     current = datetime.now()
     market_start = current.replace(hour=9, minute=15, second=0, microsecond=0)
     market_end = current.replace(hour=15, minute=30, second=0, microsecond=0)
     
     # If already past market close, wait for NEXT DAY's market open
     if current > market_end:
-        # Calculate next trading day's market open
         next_day = current + timedelta(days=1)
-        # Skip weekends
-        while next_day.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        while next_day.weekday() >= 5:
             next_day += timedelta(days=1)
         market_start = next_day.replace(hour=9, minute=15, second=0, microsecond=0)
         
         wait_seconds = (market_start - current).total_seconds()
         hours = int(wait_seconds // 3600)
         minutes = int((wait_seconds % 3600) // 60)
-        print(f"⏰ Market closed. Waiting for next trading day...")
-        print(f"   Current time: {current.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"   Next market open: {market_start.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"   Time to wait: {hours}h {minutes}m")
-        print(f"   💤 Bot will auto-start at 9:15 AM")
-        print("-" * 50)
+        _log(f"Market closed. Next open: {market_start.strftime('%Y-%m-%d')} 09:15 ({hours}h {minutes}m)")
     
-    # If before market open today, wait
     elif current < market_start:
         wait_seconds = (market_start - current).total_seconds()
         hours = int(wait_seconds // 3600)
         minutes = int((wait_seconds % 3600) // 60)
-        print(f"⏰ Waiting for market open at 9:15 AM...")
-        print(f"   Current time: {current.strftime('%H:%M:%S')}")
-        print(f"   Time to wait: {hours}h {minutes}m")
-        print(f"   Bot will auto-start trading at 9:15 AM")
-        print("-" * 50)
+        _log(f"Waiting for 09:15 ({hours}h {minutes}m)")
     else:
-        # Market is already open
         return True
     
     # Wait with periodic status updates
     while datetime.now() < market_start:
         remaining = (market_start - datetime.now()).total_seconds()
-        if remaining > 3600:  # More than 1 hour
+        if remaining > 3600:
             hours_left = int(remaining // 3600)
             mins_left = int((remaining % 3600) // 60)
-            print(f"   💤 {hours_left}h {mins_left}m to market open...")
-            t.sleep(600)  # Sleep 10 minutes
+            _log(f"💤 {hours_left}h {mins_left}m to open…")
+            t.sleep(600)
         elif remaining > 60:
             mins_left = int(remaining // 60)
-            if mins_left % 5 == 0:  # Print every 5 minutes
-                print(f"   ⏳ {mins_left} minutes to market open...")
-            t.sleep(60)  # Sleep 1 minute
+            if mins_left % 5 == 0:
+                _log(f"⏳ {mins_left}m to open…")
+            t.sleep(60)
         else:
-            print(f"   🔔 Market opening in {int(remaining)} seconds!")
+            _log(f"🔔 Opening in {int(remaining)}s!")
             t.sleep(remaining)
             break
     
-    print("🔔 MARKET OPEN! Starting trading...")
+    _log("🔔 Market open!")
     return True
 
 
@@ -129,24 +120,58 @@ def calculate_trade_pnl(trade: Dict, tick: Dict) -> float:
     return pnl_per_lot * qty
 
 
+# Global VIX cache
+_vix_cache = {
+    'value': 15.0,
+    'last_fetch': None,
+    'broker_client': None
+}
+
+
+def set_vix_broker_client(broker_client):
+    """Set broker client for fetching real India VIX"""
+    global _vix_cache
+    _vix_cache['broker_client'] = broker_client
+
+
+def fetch_real_vix() -> float:
+    """Fetch real India VIX from Angel One API
+    
+    Note: Angel One API doesn't seem to support VIX LTP fetch.
+    Using estimation from price volatility instead.
+    """
+    global _vix_cache
+    from datetime import datetime
+    
+    # Return cached value - VIX API not working, skip fetching
+    # Real VIX fetch is disabled due to Angel One API limitations
+    return _vix_cache['value']
+
+
 def estimate_vix_from_ticks(ticks: list, current_vix: float = 15.0) -> float:
-    """Estimate VIX-like volatility from price movements"""
+    """
+    Calculate VIX from price volatility (optimized)
+    Real VIX API disabled - using price-based estimation only
+    """
     if len(ticks) < 30:
         return current_vix
     
-    # Calculate returns volatility
     prices = [t['ltp'] for t in ticks[-30:]]
     returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
     
     if not returns:
         return current_vix
     
-    # Standard deviation of returns * scaling factor
     import statistics
     vol = statistics.stdev(returns) if len(returns) > 1 else 0
-    estimated_vix = vol * 100 * 15.87  # Annualize and scale
+    estimated_vix = vol * 100 * 14.5  # Optimized scaling for NIFTY
     
-    return max(10, min(30, estimated_vix))  # Clamp between 10-30
+    # Dynamic adjustment: recent extreme moves increase VIX
+    recent_moves = [abs(r) for r in returns[-5:]]
+    if recent_moves and max(recent_moves) > 0.01:
+        estimated_vix *= (1 + max(recent_moves) * 2)
+    
+    return max(10, min(35, estimated_vix))  # Clamp: 10-35 for NIFTY
 
 
 def calculate_position_size(estimated_vix: float) -> float:

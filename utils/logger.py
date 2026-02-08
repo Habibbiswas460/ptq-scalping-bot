@@ -39,6 +39,17 @@ class Colors:
     UNDERLINE = '\033[4m'
 
 
+# ASCII Art & Decorations
+DECORATORS = {
+    'HEADER': '═' * 70,
+    'SUBHEADER': '─' * 70,
+    'DIVIDER': '┌' + '─' * 68 + '┐',
+    'DIVIDER_END': '└' + '─' * 68 + '┘',
+    'BOX_TL': '╔', 'BOX_TR': '╗', 'BOX_BL': '╚', 'BOX_BR': '╝',
+    'BOX_H': '═', 'BOX_V': '║'
+}
+
+
 class BotLogger:
     """Enhanced structured logger for bot events"""
     
@@ -99,50 +110,61 @@ class BotLogger:
     
     def _write_log(self, filepath: str, message: str, level: str = "INFO"):
         """Write to log file"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        log_line = f"[{timestamp}] [{level}] {message}\n"
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_line = f"[{timestamp}] [{level:4s}] {message}\n"
         
         with open(filepath, 'a') as f:
             f.write(log_line)
         
         if self.enable_console:
-            # Add colors for console output
             colored_message = self._colorize_message(message, level)
-            print(colored_message)
+            ts_dim = f"\033[2m{timestamp}\033[0m"
+            print(f"{ts_dim}  {colored_message}")
     
     def _colorize_message(self, message: str, level: str) -> str:
         """Add colors to console messages based on content"""
-        # Remove ANSI codes for file logging, but add them for console
-        if "🎯 SIGNAL FOUND" in message:
-            return f"{Colors.BG_GREEN}{Colors.WHITE}{Colors.BOLD}🎯 SIGNAL FOUND!{Colors.RESET} {message.replace('🎯 SIGNAL FOUND:', '').strip()}"
-        elif "❌ NO SIGNAL" in message:
-            return f"{Colors.RED}❌ NO SIGNAL:{Colors.RESET} {message.replace('❌ NO SIGNAL:', '').strip()}"
-        elif "🔄 WARMING UP" in message:
-            return f"{Colors.YELLOW}🔄 WARMING UP:{Colors.RESET} {message.replace('🔄 WARMING UP:', '').strip()}"
-        elif "📊 SCORE LOW" in message:
-            return f"{Colors.CYAN}📊 SCORE LOW:{Colors.RESET} {message.replace('📊 SCORE LOW:', '').strip()}"
-        elif "💓 HEARTBEAT" in message or "╔" in message:
-            return f"{Colors.CYAN}{message}{Colors.RESET}"
-        elif "🌟 STATUS UPDATE" in message:
-            return f"{Colors.MAGENTA}{Colors.BOLD}🌟 STATUS UPDATE{Colors.RESET}"
-        elif "🏆" in message or "╔═" in message:
-            return f"{Colors.YELLOW}{Colors.BOLD}{message}{Colors.RESET}"
-        elif "📊 FINAL" in message:
-            return f"{Colors.GREEN}{Colors.BOLD}{message}{Colors.RESET}"
-        elif "🔔 MARKET IS NOW OPEN" in message:
-            return f"{Colors.GREEN}{Colors.BOLD}{message}{Colors.RESET}"
-        elif "🎯 TRADING SESSION ACTIVE" in message:
-            return f"{Colors.GREEN}{Colors.BOLD}{message}{Colors.RESET}"
-        else:
-            # Default coloring based on level
-            if level == "ERROR":
-                return f"{Colors.RED}{message}{Colors.RESET}"
-            elif level == "WARN":
-                return f"{Colors.YELLOW}{message}{Colors.RESET}"
-            elif level == "INFO":
-                return f"{Colors.WHITE}{message}{Colors.RESET}"
-            else:
-                return message
+        msg = message
+        
+        # Signals
+        if "🎯 SIGNAL" in msg:
+            return f"{Colors.BG_GREEN}{Colors.WHITE}{Colors.BOLD} SIGNAL {Colors.RESET} {Colors.GREEN}{msg.split('SIGNAL:',1)[-1].strip()}{Colors.RESET}"
+        
+        # Heartbeat line
+        if "💓" in msg:
+            return f"{Colors.CYAN}{msg}{Colors.RESET}"
+        
+        # Status block
+        if "── STATUS" in msg:
+            return f"{Colors.MAGENTA}{msg}{Colors.RESET}"
+        
+        # Trade entry/exit
+        if "ENTRY" in msg and ("✅" in msg or "✓" in msg):
+            return f"{Colors.GREEN}{Colors.BOLD}{msg}{Colors.RESET}"
+        if "EXIT" in msg:
+            return f"{Colors.YELLOW}{Colors.BOLD}{msg}{Colors.RESET}"
+        
+        # Kill switch
+        if "KILL" in msg or "🛑" in msg:
+            return f"{Colors.BG_RED}{Colors.WHITE}{Colors.BOLD} KILL {Colors.RESET} {Colors.RED}{msg}{Colors.RESET}"
+        
+        # Warming up / no signal
+        if "⏳" in msg or "Warming" in msg:
+            return f"{Colors.YELLOW}{msg}{Colors.RESET}"
+        if "📊" in msg:
+            return f"{Colors.CYAN}{msg}{Colors.RESET}"
+        
+        # Session box / banner
+        if any(c in msg for c in "┌┐└┘├┤│─"):
+            return f"{Colors.DIM}{msg}{Colors.RESET}"
+        
+        # Errors / warnings
+        if "ERROR" in level:
+            return f"{Colors.RED}{Colors.BOLD}✗ {msg}{Colors.RESET}"
+        if level == "WARN":
+            return f"{Colors.YELLOW}⚠ {msg}{Colors.RESET}"
+        
+        # Default info
+        return f"{Colors.WHITE}{msg}{Colors.RESET}"
     
     def _write_json(self, filepath: str, data: Dict):
         """Append JSON entry"""
@@ -362,19 +384,11 @@ class BotLogger:
         wins = summary_data.get('winning_trades', 0)
         win_rate = (wins / total * 100) if total > 0 else 0
         
-        msg = (f"\n{'='*60}\n"
-               f"📊 DAILY SUMMARY - {timestamp}\n"
-               f"{'='*60}\n"
-               f"Total Trades: {total}\n"
-               f"Winners: {wins} | "
-               f"Losers: {summary_data.get('losing_trades', 0)}\n"
-               f"Win Rate: {win_rate:.1f}%\n"
-               f"Total PnL: ₹{summary_data.get('total_pnl', 0):+,.2f}\n"
-               f"Max Drawdown: ₹{summary_data.get('max_drawdown', 0):,.2f}\n"
-               f"Kill Switch: {summary_data.get('kill_switch_count', 0)} times\n"
-               f"Session Duration: {session_duration/3600:.1f} hours\n"
-               f"Ticks Processed: {self.tick_count:,}\n"
-               f"{'='*60}\n")
+        msg = (f"\n── DAILY SUMMARY ── {timestamp} ──\n"
+               f"  Trades: {total} ({wins}W / {summary_data.get('losing_trades', 0)}L) │ WR: {win_rate:.1f}%\n"
+               f"  PnL: ₹{summary_data.get('total_pnl', 0):+,.2f} │ Drawdown: ₹{summary_data.get('max_drawdown', 0):,.2f}\n"
+               f"  Kill Switch: {summary_data.get('kill_switch_count', 0)}x │ Duration: {session_duration/3600:.1f}h │ Ticks: {self.tick_count:,}\n"
+               f"──────────────────────────────────────\n")
         
         self._write_log(self.main_log, msg, "SUMMARY")
         
@@ -391,3 +405,158 @@ class BotLogger:
             'entries': self.entry_count,
             'exits': self.exit_count
         }
+    
+    # ==========================================
+    # LIVE LOG RETRIEVAL & FORMATTING
+    # ==========================================
+    
+    def get_recent_logs(self, lines: int = 50, log_type: str = "main") -> List[str]:
+        """Get recent log lines"""
+        try:
+            if log_type == "main":
+                filepath = self.main_log
+            elif log_type == "trade":
+                filepath = self.trade_log
+            elif log_type == "error":
+                filepath = self.error_log
+            elif log_type == "state":
+                filepath = self.state_log
+            else:
+                filepath = self.main_log
+            
+            with open(filepath, 'r') as f:
+                all_lines = f.readlines()
+            
+            return all_lines[-lines:] if all_lines else []
+        except FileNotFoundError:
+            return []
+    
+    def get_formatted_logs(self, lines: int = 30, log_type: str = "main") -> str:
+        """Get formatted logs for Telegram"""
+        log_lines = self.get_recent_logs(lines, log_type)
+        if not log_lines:
+            return "📝 No logs available yet"
+        
+        # Clean and format for Telegram
+        formatted = f"<b>📋 Recent {log_type.upper()} Logs</b>\n"
+        formatted += f"{DECORATORS['SUBHEADER']}\n"
+        
+        for line in log_lines:
+            # Remove timestamps for compact view
+            clean_line = line.strip()
+            if clean_line:
+                # Remove ANSI codes and extra brackets
+                clean_line = clean_line.replace('\033[0m', '').replace('\033[1m', '')
+                clean_line = clean_line.replace('\033[31m', '').replace('\033[32m', '')
+                clean_line = clean_line.replace('\033[33m', '').replace('\033[34m', '')
+                clean_line = clean_line.replace('\033[35m', '').replace('\033[36m', '')
+                clean_line = clean_line.replace('\033[37m', '')
+                
+                # Remove timestamp
+                if '[' in clean_line and ']' in clean_line:
+                    parts = clean_line.split(']', 2)
+                    if len(parts) >= 3:
+                        clean_line = parts[2].strip()
+                
+                formatted += f"<code>{clean_line}</code>\n"
+        
+        return formatted
+    
+    def get_trades_summary(self, limit: int = 10) -> str:
+        """Get formatted trades summary"""
+        try:
+            trades_data = []
+            with open(self.trades_json, 'r') as f:
+                for line in f:
+                    trades_data.append(json.loads(line.strip()))
+            
+            if not trades_data:
+                return "📊 No trades yet"
+            
+            # Get last 'limit' trades
+            recent = trades_data[-limit:]
+            
+            msg = "<b>📊 Recent Trades</b>\n"
+            msg += f"{DECORATORS['SUBHEADER']}\n\n"
+            
+            entry_trades = {}
+            for trade in recent:
+                if trade.get('event') == 'ENTRY':
+                    order_id = trade.get('order_id')
+                    entry_trades[order_id] = trade
+                elif trade.get('event') == 'EXIT':
+                    order_id = trade.get('order_id')
+                    pnl = trade.get('pnl', 0)
+                    emoji = "✅" if pnl > 0 else "❌" if pnl < 0 else "➖"
+                    
+                    if order_id in entry_trades:
+                        entry = entry_trades[order_id]
+                        symbol = entry.get('symbol', 'N/A')
+                        side = entry.get('side', 'N/A')
+                        pnl_pct = trade.get('pnl_pct', 0)
+                        
+                        msg += f"{emoji} <b>{side}</b> {symbol}\n"
+                        msg += f"   ₹{pnl:+,.0f} ({pnl_pct:+.2f}%)\n\n"
+            
+            return msg
+        except Exception as e:
+            return f"❌ Error loading trades: {e}"
+    
+    def get_signal_history(self, limit: int = 20) -> str:
+        """Get recent signal events"""
+        try:
+            events = []
+            with open(self.events_json, 'r') as f:
+                for line in f:
+                    event = json.loads(line.strip())
+                    if event.get('type') == 'signal':
+                        events.append(event)
+            
+            if not events:
+                return "🎯 No signals yet"
+            
+            recent = events[-limit:]
+            msg = "<b>🎯 Recent Signals</b>\n"
+            msg += f"{DECORATORS['SUBHEADER']}\n\n"
+            
+            for event in recent:
+                signal_type = event.get('signal_type', 'N/A')
+                passed = event.get('passed', False)
+                reason = event.get('reason', 'N/A')
+                timestamp = event.get('timestamp', '')[-8:]  # HH:MM:SS
+                
+                emoji = "✅" if passed else "❌"
+                msg += f"{emoji} <b>{signal_type}</b> @ {timestamp}\n"
+                msg += f"   {reason}\n\n"
+            
+            return msg
+        except Exception as e:
+            return f"❌ Error: {e}"
+    
+    def format_status_box(self, stats: Dict) -> str:
+        """Format status as beautiful box"""
+        box = f"\n{DECORATORS['BOX_TL']}{DECORATORS['BOX_H']*68}{DECORATORS['BOX_TR']}\n"
+        box += f"{DECORATORS['BOX_V']} 🤖 <b>BOT STATUS</b>\n"
+        
+        for key, value in stats.items():
+            line = f" • <b>{key}:</b> {value}"
+            box += f"{DECORATORS['BOX_V']} {line}\n"
+        
+        box += f"{DECORATORS['BOX_BL']}{DECORATORS['BOX_H']*68}{DECORATORS['BOX_BR']}\n"
+        return box
+
+
+# Global logger instance
+_logger: Optional[BotLogger] = None
+
+
+def init_logger(log_dir: str = "logs") -> BotLogger:
+    """Initialize global logger instance"""
+    global _logger
+    _logger = BotLogger(log_dir)
+    return _logger
+
+
+def get_logger() -> Optional[BotLogger]:
+    """Get global logger instance"""
+    return _logger

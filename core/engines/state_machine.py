@@ -193,18 +193,18 @@ def state_idle(tick: Dict, greeks: Dict, state: TradingState,
     # Entry signal check
     has_signal, signal_reason = entry_signal_func(tick)
     
-    # 🎯 SIGNAL CHECKING - Show every 10 loops for better visibility
-    if state.loop_count % 10 == 0:
-        if has_signal:
-            logger.info(f"🎯 SIGNAL FOUND: {signal_reason}")
+    # 🎯 SIGNAL CHECKING — reduced noise
+    if has_signal:
+        # Always show signals immediately
+        logger.info(f"🎯 SIGNAL: {signal_reason}")
+    elif state.loop_count % 300 == 0:
+        # Show rejection reason every ~30s (not every 1s)
+        if "warming" in signal_reason.lower():
+            logger.info(f"⏳ Warming up… {signal_reason}")
+        elif "score" in signal_reason.lower() or "conf" in signal_reason.lower():
+            logger.info(f"📊 {signal_reason}")
         else:
-            # Show different messages based on reason
-            if "warming" in signal_reason.lower():
-                logger.info(f"🔄 WARMING UP: {signal_reason}")
-            elif "score" in signal_reason.lower() or "conf" in signal_reason.lower():
-                logger.info(f"📊 SCORE LOW: {signal_reason}")
-            else:
-                logger.info(f"❌ NO SIGNAL: {signal_reason}")
+            logger.debug(f"No signal: {signal_reason}")
     
     # Require consecutive signals
     required_signals = CONFIG['entry_filters'].get('require_consecutive_signals', 1)
@@ -236,6 +236,25 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
     """Handle ENTRY_READY state - Place order using SMART SCALP v3.0 params"""
     state.consecutive_entry_signals = 0
     
+    # ── RISK MANAGER CHECK (FINAL FIX) ──
+    try:
+        from core.risk.risk_manager import get_risk_manager
+        rm = get_risk_manager()
+        can_trade, risk_details = rm.can_trade(spot_price=tick.get('spot_price'))
+        
+        if not can_trade:
+            reasons = risk_details.get('reasons', ['Risk check failed'])
+            logger.warning(f"⚠ RISK BLOCKED: {', '.join(reasons)}")
+            logger.state_change("ENTRY_READY", "COOLDOWN", f"Risk: {reasons[0]}")
+            return "COOLDOWN"
+        
+        size_multiplier = risk_details.get('size_multiplier', 1.0)
+        if size_multiplier != 1.0:
+            logger.info(f"📊 Risk size multiplier: {size_multiplier:.2f}")
+    except Exception as e:
+        logger.warning(f"⚠ RiskManager check error: {e} — proceeding with default")
+        size_multiplier = 1.0
+    
     # Get SMART SCALP v3.0 signal params
     try:
         from core.engines.entry_engine import get_last_signal_params, get_signal_direction, get_signal_quantity
@@ -257,6 +276,12 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
         adjusted_qty = int(base_qty * position_multiplier)
         if position_multiplier != 1.0:
             logger.info(f"📊 Position adjusted: {base_qty} → {adjusted_qty}")
+    
+    # Apply risk manager size multiplier
+    if size_multiplier != 1.0:
+        original_qty = adjusted_qty
+        adjusted_qty = max(1, int(adjusted_qty * size_multiplier))
+        logger.info(f"📊 Risk adjusted qty: {original_qty} → {adjusted_qty} (×{size_multiplier:.2f})")
     
     # Store direction in trade for exit reference
     trade = broker.place_order("BUY", qty=adjusted_qty, trades_this_hour=state.trades_this_hour, 

@@ -69,6 +69,7 @@ BROKER_NAME = 'angel_one'
 PAPER_TRADING = env_bool('PAPER_TRADING', True)
 TEST_MODE = env_bool('TEST_MODE', False)
 USE_LIVE_DATA = env_bool('USE_LIVE_DATA', True)
+ENABLE_WEBSOCKET = env_bool('ENABLE_WEBSOCKET', True)
 
 # =========================================================
 # 💵 CAPITAL & RISK
@@ -267,16 +268,7 @@ TELEGRAM_NOTIFY_KILL_SWITCH = env_bool('TELEGRAM_NOTIFY_KILL_SWITCH', True)
 TELEGRAM_DAILY_SUMMARY = env_bool('TELEGRAM_DAILY_SUMMARY', True)
 
 # =========================================================
-# 🖥️ DASHBOARD
-# =========================================================
-
-DASHBOARD_ENABLED = env_bool('DASHBOARD_ENABLED', True)
-DASHBOARD_HOST = env_str('DASHBOARD_HOST', '0.0.0.0')
-DASHBOARD_PORT = env_int('DASHBOARD_PORT', 8080)
-DASHBOARD_AUTO_START = env_bool('DASHBOARD_AUTO_START', True)
-
-# =========================================================
-# 💾 DATABASE
+#  DATABASE
 # =========================================================
 
 DATABASE_ENABLED = env_bool('DATABASE_ENABLED', True)
@@ -298,9 +290,21 @@ LOG_VERBOSE = env_bool('LOG_VERBOSE', False)
 # =========================================================
 
 SESSION_FILTER_ENABLED = env_bool('SESSION_FILTER_ENABLED', True)
-ALLOWED_SESSIONS = ['morning_1', 'morning_2', 'midday', 'afternoon']
-EXPIRY_ONLY_SESSIONS = ['morning_1', 'morning_2']
-BLACKOUT_SESSIONS = []
+
+# Define sessions as dictionaries with time ranges
+ALLOWED_SESSIONS = [
+    {'name': 'morning_1', 'start_hour': 9, 'start_minute': 20, 'end_hour': 10, 'end_minute': 30, 'reason': 'Morning session 1'},
+    {'name': 'morning_2', 'start_hour': 10, 'start_minute': 30, 'end_hour': 11, 'end_minute': 30, 'reason': 'Morning session 2'},
+    {'name': 'midday', 'start_hour': 12, 'start_minute': 30, 'end_hour': 13, 'end_minute': 30, 'reason': 'Midday session'},
+    {'name': 'afternoon', 'start_hour': 14, 'start_minute': 0, 'end_hour': 15, 'end_minute': 15, 'reason': 'Afternoon session'},
+]
+EXPIRY_ONLY_SESSIONS = [
+    {'name': 'expiry_morning_1', 'start_hour': 9, 'start_minute': 20, 'end_hour': 10, 'end_minute': 30, 'reason': 'Expiry morning 1'},
+    {'name': 'expiry_morning_2', 'start_hour': 10, 'start_minute': 30, 'end_hour': 11, 'end_minute': 30, 'reason': 'Expiry morning 2'},
+]
+BLACKOUT_SESSIONS = [
+    # {'name': 'lunch', 'start_hour': 11, 'start_minute': 30, 'end_hour': 12, 'end_minute': 30, 'reason': 'Lunch break - choppy market'},
+]
 
 # =========================================================
 # 📦 CONFIG DICTIONARY (Backwards Compatibility)
@@ -397,11 +401,6 @@ CONFIG = {
         'bot_token': TELEGRAM_BOT_TOKEN,
         'chat_id': TELEGRAM_CHAT_ID,
     },
-    'dashboard': {
-        'enabled': DASHBOARD_ENABLED,
-        'host': DASHBOARD_HOST,
-        'port': DASHBOARD_PORT,
-    },
     'database': {
         'enabled': DATABASE_ENABLED,
         'path': DATABASE_PATH,
@@ -429,8 +428,7 @@ def print_config():
     print(f"🚨 Kill Switch: ₹{KILL_SWITCH_LOSS}")
     print(f"📊 Min Score: {MIN_SCORE_TO_TRADE} | Min Confidence: {MIN_CONFIDENCE}%")
     print(f"📱 Telegram: {'✅' if TELEGRAM_ENABLED else '❌'}")
-    print(f"🖥️ Dashboard: {'✅' if DASHBOARD_ENABLED else '❌'} (:{DASHBOARD_PORT})")
-    print(f"💾 Database: {'✅' if DATABASE_ENABLED else '❌'}")
+    print(f" Database: {'✅' if DATABASE_ENABLED else '❌'}")
     print(f"🔄 Paper Trading: {'✅' if PAPER_TRADING else '❌ LIVE'}")
     print("=" * 60 + "\n")
 

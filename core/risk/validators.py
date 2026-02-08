@@ -71,9 +71,21 @@ def is_data_valid(tick: Dict) -> Tuple[bool, str]:
     if spread > SPREAD_LIMIT_PCT:
         return False, f"Wide spread ({spread:.3f}%)"
     
-    # Volume sanity
-    if tick.get('volume', 0) < CONFIG['data_hygiene']['min_volume']:
-        return False, "Low volume"
+    # Volume sanity - Skip if volume data not available (WebSocket may not send volume)
+    # Volume check is optional - many WebSocket feeds don't include accurate volume
+    min_volume = CONFIG['data_hygiene'].get('min_volume', 0)
+    tick_volume = tick.get('volume', -1)  # -1 means no volume data
+    
+    # Only reject if volume is explicitly 0 AND min_volume is set high
+    # If volume is -1 (not provided) or min_volume is 0, skip this check
+    if tick_volume == 0 and min_volume > 0:
+        # Check if we're in first 30 min - volume often 0 at market open
+        current_time = datetime.now()
+        market_start = current_time.replace(hour=9, minute=15, second=0)
+        time_since_open = (current_time - market_start).total_seconds()
+        
+        if time_since_open > 1800:  # After first 30 minutes
+            return False, "Low volume"
     
     return True, "OK"
 

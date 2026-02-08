@@ -296,7 +296,7 @@ echo ""
 # FINAL BANNER
 # ═══════════════════════════════════════════════════════════════════════════════
 printf "${BG_BLUE}${BWHITE}                                                                             ${NC}\n"
-printf "${BG_BLUE}${BWHITE}    🚀 PTQ BOT ACTIVE  │  Dashboard: http://localhost:8080  │  $(date '+%H:%M:%S')    ${NC}\n"
+printf "${BG_BLUE}${BWHITE}    🚀 PTQ BOT ACTIVE  │  Telegram Dashboard  │  $(date '+%H:%M:%S')    ${NC}\n"
 printf "${BG_BLUE}${BWHITE}                                                                             ${NC}\n"
 echo ""
 

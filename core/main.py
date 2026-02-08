@@ -25,13 +25,14 @@ from core.engines.state_machine import (
     trading_state, state_idle, state_entry_ready, 
     state_in_trade, state_cooldown
 )
+from core.risk.session_trend import start_trading_session
 from core.risk.kill_switch import emergency_check
 from core.risk.greeks_calc import calculate_greeks, init_greeks_fetcher
 from core.services.mode_switch import (
     update_trading_mode, get_current_mode, get_mode_emoji,
     is_entries_allowed, record_trade_result, reset_mode
 )
-from utils.helpers import now, market_open, estimate_vix_from_ticks, wait_for_market_open
+from utils.helpers import now, market_open, estimate_vix_from_ticks, wait_for_market_open, set_vix_broker_client
 from utils.logger import BotLogger
 
 # New feature imports
@@ -46,13 +47,6 @@ try:
     HAS_TELEGRAM = True
 except ImportError:
     HAS_TELEGRAM = False
-
-try:
-    from core.services.dashboard import start_dashboard_background, set_state_reference
-    HAS_DASHBOARD = True
-except ImportError:
-    HAS_DASHBOARD = False
-
 
 # Auto-reconnect settings
 MAX_RECONNECT_ATTEMPTS = 10
@@ -104,22 +98,24 @@ recent_ticks = []
 
 
 def init_features(logger, state):
-    """Initialize Telegram, Dashboard, and Database features"""
+    """Initialize Telegram, Database, and Live Logs features"""
     
     # Initialize Database
     if HAS_DATABASE and CONFIG.get('database', {}).get('enabled', True):
         logger.info("✓ Database initialized (SQLite)")
     
-    # Initialize Telegram
+    # Initialize Telegram Dashboard
     telegram_config = CONFIG.get('telegram', {})
+    telegram_instance = None
     if HAS_TELEGRAM and telegram_config.get('enabled', False):
-        telegram = init_telegram(
+        telegram_instance = init_telegram(
             token=telegram_config.get('bot_token', ''),
             chat_id=telegram_config.get('chat_id', ''),
             enabled=True
         )
-        telegram.set_state_reference(state, broker)
-        telegram.notify_startup({
+        telegram_instance.set_state_reference(state, broker)
+        telegram_instance.set_logger(logger)
+        telegram_instance.notify_startup({
             'capital': TOTAL_CAPITAL,
             'paper_trading': CONFIG['broker'].get('paper_trading', True),
             'ce_qty': CONFIG.get('strategy', {}).get('ce_entry', {}).get('quantity', 260),
@@ -127,16 +123,7 @@ def init_features(logger, state):
             'sl_points': 8,
             'tp_points': 16
         })
-        logger.info("✓ Telegram bot initialized")
-    
-    # Initialize Dashboard
-    dashboard_config = CONFIG.get('dashboard', {})
-    if HAS_DASHBOARD and dashboard_config.get('enabled', True):
-        set_state_reference(state, broker, recent_ticks)
-        if dashboard_config.get('auto_start', True):
-            port = dashboard_config.get('port', 8080)
-            start_dashboard_background(port=port)
-            logger.info(f"✓ Dashboard started at http://localhost:{port}")
+        logger.info("✓ Telegram dashboard initialized")
 
 
 def main():
@@ -153,7 +140,9 @@ def main():
     # Initialize Greeks fetcher with broker client (for API Greeks)
     if broker.broker_client:
         init_greeks_fetcher(broker.broker_client)
+        set_vix_broker_client(broker.broker_client)  # Enable real India VIX fetching
         logger.info("✓ Greeks API fetcher initialized")
+        logger.info("✓ India VIX fetcher initialized (real-time)")
     
     # Initialize new features (Telegram, Dashboard, Database)
     init_features(logger, state)
@@ -172,58 +161,58 @@ def main():
         SL_POINTS_MIN, SL_POINTS_MAX = 7, 10
     
     logger.info("")
-    logger.info("╔══════════════════════════════════════════════════════════════════════════════╗")
-    logger.info("║                          🏆 SMART SCALP v3.0 🏆                           ║")
-    logger.info("║                           ₹30K CONFIGURATION                             ║")
-    logger.info("╚══════════════════════════════════════════════════════════════════════════════╝")
-    logger.info("")
-    logger.info("🎯 STRATEGY: Multi-factor Scoring System")
-    logger.info(f"💰 CAPITAL: ₹{TOTAL_CAPITAL:,} | RISK/TRADE: ₹{RISK_PER_TRADE}")
-    logger.info(f"📊 QUANTITIES: CE {CE_QUANTITY} qty | PE {PE_QUANTITY} qty")
-    logger.info(f"🎯 REQUIREMENTS: {MIN_SCORE_TO_TRADE}+ Score | {MIN_CONFIDENCE}%+ Confidence")
-    logger.info(f"🛡️ RISK MANAGEMENT: SL {SL_POINTS_MIN}-{SL_POINTS_MAX} pts | TP 2.0-2.5x")
-    logger.info(f"🛑 KILL SWITCH: ₹{KILL_SWITCH_LOSS} | MAX DAILY LOSS: ₹{MAX_DAILY_LOSS_AMOUNT}")
-    logger.info(f"⏱ COOLDOWN: {COOLDOWN_NORMAL_SEC}s / {COOLDOWN_AFTER_SL_SEC}s (after SL)")
-    logger.info(f"📅 DAY TYPE: {state.day_type}")
-    logger.info(f"🎛 TRADING MODE: {get_current_mode()} {get_mode_emoji()}")
-    logger.info("")
-    logger.info("─" * 78)
+    logger.info("┌──────────────────────────────────────────────────────────────┐")
+    logger.info("│           SMART SCALP v3.0  ·  ₹30K Configuration          │")
+    logger.info("├──────────────────────────────────────────────────────────────┤")
+    logger.info(f"│  Capital: ₹{TOTAL_CAPITAL:>6,}  │  CE: {CE_QUANTITY:>3} qty  │  PE: {PE_QUANTITY:>3} qty      │")
+    logger.info(f"│  SL: {SL_POINTS_MIN}-{SL_POINTS_MAX} pts    │  TP: 2.0-2.5x   │  Score: {MIN_SCORE_TO_TRADE}+/{MIN_CONFIDENCE}%+   │")
+    logger.info(f"│  Kill: ₹{KILL_SWITCH_LOSS:<5}   │  Max Loss: ₹{MAX_DAILY_LOSS_AMOUNT:<5} │  Mode: {get_current_mode():<10} │")
+    logger.info(f"│  Cooldown: {COOLDOWN_NORMAL_SEC}s/{COOLDOWN_AFTER_SL_SEC}s │  Day: {state.day_type:<7}  │                  │")
+    logger.info("└──────────────────────────────────────────────────────────────┘")
     
     state.last_hour_reset = datetime.now().replace(minute=0, second=0, microsecond=0)
     
     try:
         # Wait for market to open if before 9:15 AM
         if not market_open():
-            logger.info("⏰ Market not open yet...")
+            logger.info("⏰ Waiting for market open (09:15)...")
             if not wait_for_market_open():
-                logger.info("📉 Market closed for today")
+                logger.info("Market closed for today")
                 return
-            logger.info("🔔 MARKET IS NOW OPEN! 🚀")
-            logger.info("🎯 Starting signal scanning and trade execution...")
-            logger.info("")
-            logger.info("╔══════════════════════════════════════════════════════════════════════════════╗")
-            logger.info("║                        🎯 TRADING SESSION ACTIVE 🎯                        ║")
-            logger.info("╚══════════════════════════════════════════════════════════════════════════════╝")
+            logger.info("🔔 MARKET OPEN — Scanning started")
+            logger.info("── SESSION ACTIVE ──")
         
-        logger.info(f"🔄 Entering main trading loop...")
+        # Initialize session trend tracker with opening price
+        # Get first tick to establish opening price reference
+        opening_tick = broker.get_tick()
+        if opening_tick and 'ltp' in opening_tick:
+            # Use spot_price (NIFTY index) not ltp (option premium)
+            opening_price = opening_tick.get('spot_price', opening_tick.get('ltp', 0))
+            start_trading_session(opening_price)
+            logger.info(f"📈 Session ref: NIFTY ₹{opening_price:,.2f}")
+        
+        logger.info("🔄 Main loop started")
         
         while market_open():
             state.loop_count += 1
             
-            # Heartbeat - More beautiful and informative
-            if state.loop_count % 100 == 0:
-                mode_emoji = get_mode_emoji()
-                current_mode = get_current_mode()
-                day_type_emoji = "🎯" if state.day_type == "EXPIRY" else "📅"
+            # Heartbeat — compact one-liner every 30s (~300 loops)
+            if state.loop_count % 300 == 0:
+                tick_now = broker.get_tick()
+                ltp_str = f"₹{tick_now['ltp']:.2f}" if tick_now else "--"
+                spot_str = f"₹{broker.spot_price:,.0f}" if broker.spot_price > 1000 else "--"
+                wr = f"{(state.winning_trades/(state.winning_trades+state.losing_trades)*100):.0f}%" if (state.winning_trades+state.losing_trades) > 0 else "--"
                 
-                logger.info(f"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║ 💓 HEARTBEAT #{state.loop_count:4d} | {mode_emoji} {current_mode:>10} | {day_type_emoji} {state.day_type:>6} ║
-║ 💰 PnL: ₹{state.daily_pnl_inr:+8.2f} ({state.daily_pnl_pct:+5.2f}%) ║
-║ 📊 Trades: {state.total_trades_today:2d} total | {state.winning_trades:2d}W/{state.losing_trades:2d}L ║
-║ 🎯 VIX: {state.estimated_vix:4.1f}% | ⏱ {datetime.now().strftime('%H:%M:%S')} ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-""".strip())
+                logger.info(
+                    f"💓 #{state.loop_count} │ "
+                    f"NIFTY {spot_str} │ "
+                    f"LTP {ltp_str} │ "
+                    f"PnL ₹{state.daily_pnl_inr:+.0f} │ "
+                    f"Trades {state.total_trades_today} ({state.winning_trades}W/{state.losing_trades}L {wr}) │ "
+                    f"Ticks {len(recent_ticks)}/{MAX_RECENT_TICKS} │ "
+                    f"{get_current_mode()} │ "
+                    f"{datetime.now().strftime('%H:%M:%S')}"
+                )
             
             # Reset hourly counter
             current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
@@ -248,6 +237,9 @@ def main():
             if len(recent_ticks) > MAX_RECENT_TICKS:
                 recent_ticks.pop(0)
             
+            # Track ticks processed
+            state.ticks_processed = getattr(state, 'ticks_processed', 0) + 1
+            
             # Emergency checks
             kill_triggered, kill_reason, kill_details = emergency_check(
                 tick, state.daily_pnl_inr, state.total_trades_today,
@@ -262,15 +254,39 @@ def main():
                     )
                     state.current_trade = None
                 
-                # Don't shutdown - just block new entries and continue monitoring
-                if state.state != "KILL_SWITCH":
-                    state.state = "KILL_SWITCH"
-                    logger.kill_switch(kill_reason, kill_details)
-                    logger.warning(f"⚠ KILL SWITCH - {kill_reason} - NO NEW ENTRIES (bot continues)")
+                # Check if this is a recoverable kill switch (spread cooldown)
+                is_spread_cooldown = kill_reason in ("Wide spread KILL", "Spread cooldown")
+                
+                if is_spread_cooldown:
+                    # Recoverable - pause briefly then retry
+                    if state.state != "KILL_SWITCH":
+                        state.state = "KILL_SWITCH"
+                        state.kill_switch_count = getattr(state, 'kill_switch_count', 0) + 1
+                        logger.kill_switch(kill_reason, kill_details)
+                        logger.warning(f"⚠ SPREAD KILL - {kill_reason} - Pausing {kill_details.get('cooldown_sec', 30)}s then retrying")
+                    elif kill_reason == "Spread cooldown":
+                        # Still in cooldown, just wait
+                        pass
+                    else:
+                        # Cooldown expired, spread is now OK -> recover!
+                        state.state = "IDLE"
+                        logger.info("✅ Spread recovered - resuming trading")
+                else:
+                    # Permanent kill switch (loss, max trades)
+                    if state.state != "KILL_SWITCH":
+                        state.state = "KILL_SWITCH"
+                        state.kill_switch_count = getattr(state, 'kill_switch_count', 0) + 1
+                        logger.kill_switch(kill_reason, kill_details)
+                        logger.warning(f"⚠ KILL SWITCH - {kill_reason} - NO NEW ENTRIES (bot continues)")
                 
                 # Continue running but skip entry logic
                 time.sleep(1)
                 continue
+            
+            # If we were in KILL_SWITCH but kill check passed, recover to IDLE
+            if state.state == "KILL_SWITCH":
+                state.state = "IDLE"
+                logger.info("✅ Kill switch cleared - resuming trading")
             
             # Calculate Greeks
             greeks = calculate_greeks(tick, broker.spot_price, broker.current_strike)
@@ -296,9 +312,9 @@ def main():
                     def entry_func(t):
                         return entry_signal(t, recent_ticks, state.day_type)
                     
-                    # Show tick count progress every 500 loops
+                    # Tick buffer progress — every 50s (~500 loops)
                     if state.loop_count % 500 == 0:
-                        logger.info(f"📈 Tick buffer: {len(recent_ticks)}/{MAX_RECENT_TICKS} | Spot: ₹{broker.spot_price:,.2f}")
+                        logger.info(f"📊 Buffer: {len(recent_ticks)}/{MAX_RECENT_TICKS} ticks | VIX: {state.estimated_vix:.1f}%")
                     
                     state.state = state_idle(tick, greeks, state, entry_func, logger)
                 else:
@@ -318,22 +334,21 @@ def main():
             elif state.state == "COOLDOWN":
                 state.state = state_cooldown(state, logger)
             
-            # Status update - More detailed and beautiful
-            if state.loop_count % 200 == 0:
+            # Detailed status — every 2 min (~1200 loops)
+            if state.loop_count % 1200 == 0:
                 mode_info = f"{get_mode_emoji()} {get_current_mode()}"
                 day_info = f"{'🎯' if state.day_type == 'EXPIRY' else '📅'} {state.day_type}"
+                trades_h = state.trades_this_hour
+                trades_d = state.total_trades_today
                 
-                logger.info(f"""
-🌟 STATUS UPDATE 🌟
-├─ Mode: {mode_info}
-├─ Day: {day_info}
-├─ State: {state.state}
-├─ PnL: ₹{state.daily_pnl_inr:+.2f} ({state.daily_pnl_pct:+.2f}%)
-├─ Trades: {state.trades_this_hour}/{MAX_TRADES_PER_HOUR}h, {state.total_trades_today}/{MAX_TRADES_PER_DAY}d
-├─ W/L: {state.winning_trades}W/{state.losing_trades}L ({(state.winning_trades/(state.winning_trades+state.losing_trades)*100) if (state.winning_trades+state.losing_trades) > 0 else 0:.1f}% WR)
-├─ VIX: {state.estimated_vix:.1f}%
-└─ Time: {now().strftime('%H:%M:%S')}
-""".strip())
+                logger.info(
+                    f"\n── STATUS ──────────────────────────────────────────\n"
+                    f"  Mode: {mode_info}  │  Day: {day_info}  │  State: {state.state}\n"
+                    f"  PnL: ₹{state.daily_pnl_inr:+.2f} ({state.daily_pnl_pct:+.2f}%)\n"
+                    f"  Trades: {trades_h}/{MAX_TRADES_PER_HOUR} this hour, {trades_d}/{MAX_TRADES_PER_DAY} today\n"
+                    f"  VIX: {state.estimated_vix:.1f}% │ Consec Losses: {state.consecutive_losses}\n"
+                    f"────────────────────────────────────────────────────"
+                )
             
             time.sleep(0.5)  # 500ms cycle - optimized for API limits
         
@@ -355,13 +370,15 @@ def main():
         return "RECONNECT"
     
     except Exception as e:
+        import traceback
         error_str = str(e).lower()
         # Check if it's a network-related error
         if any(x in error_str for x in ['name resolution', 'connection', 'network', 'timeout', 'unreachable']):
             logger.error(f"🌐 Network error detected: {e}")
             return "RECONNECT"
         
-        logger.error(f"Fatal error in main loop", e)
+        logger.error(f"Fatal error in main loop | Exception: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         if state.current_trade:
             broker.exit_position(
                 state.current_trade, "Error shutdown",
@@ -377,23 +394,21 @@ def main():
             'losing_trades': state.losing_trades,
             'total_pnl': state.daily_pnl_inr,
             'max_drawdown': min(0, state.daily_pnl_inr),
-            'kill_switch_count': 1 if state.state == "KILL_SWITCH" else 0
+            'kill_switch_count': getattr(state, 'kill_switch_count', 0),
+            'ticks_processed': getattr(state, 'ticks_processed', 0)
         })
         
         # Cleanup
         broker.logout()
         
         logger.info("")
-        logger.info("╔══════════════════════════════════════════════════════════════════════════════╗")
-        logger.info("║                           📊 FINAL SESSION STATS 📊                        ║")
-        logger.info("║                           ₹30K CONFIGURATION                              ║")
-        logger.info("╚══════════════════════════════════════════════════════════════════════════════╝")
-        logger.info(f"💰 DAILY P&L: ₹{state.daily_pnl_inr:+.2f} ({state.daily_pnl_pct:+.2f}%)")
-        logger.info(f"📊 TRADES: {state.total_trades_today} total | {state.winning_trades}W/{state.losing_trades}L")
-        logger.info(f"🎯 WIN RATE: {state.total_trades_today and (state.winning_trades/state.total_trades_today*100):.1f}%")
-        logger.info(f"📉 CONSECUTIVE LOSSES: {state.consecutive_losses}")
-        logger.info(f"⚙️ FINAL STATE: {state.state}")
-        logger.info("=" * 78)
+        logger.info("┌─────────── SESSION SUMMARY ───────────┐")
+        logger.info(f"│  P&L: ₹{state.daily_pnl_inr:+8.2f} ({state.daily_pnl_pct:+.2f}%)       │")
+        logger.info(f"│  Trades: {state.total_trades_today:2d} total ({state.winning_trades}W / {state.losing_trades}L)       │")
+        logger.info(f"│  Win Rate: {state.total_trades_today and (state.winning_trades/state.total_trades_today*100):.1f}%                       │")
+        logger.info(f"│  Consec Losses: {state.consecutive_losses}                    │")
+        logger.info(f"│  State: {state.state:<12}                    │")
+        logger.info("└───────────────────────────────────────┘")
         logger.info("✓ Bot shutdown complete")
     
     return "COMPLETED"
@@ -408,11 +423,8 @@ def run_with_auto_reconnect():
     temp_logger = BotLogger(enable_console=True)
     
     temp_logger.info("")
-    temp_logger.info("=" * 60)
-    temp_logger.info("🚀 PTQ SCALPING BOT - AUTO-RECONNECT ENABLED")
-    temp_logger.info("=" * 60)
-    temp_logger.info(f"Max reconnect attempts: {MAX_RECONNECT_ATTEMPTS}")
-    temp_logger.info(f"Wait between reconnects: {RECONNECT_WAIT_SECONDS}s")
+    temp_logger.info("── PTQ SCALPING BOT ── Auto-Reconnect ON ──")
+    temp_logger.info(f"   Reconnects: {MAX_RECONNECT_ATTEMPTS} max │ Wait: {RECONNECT_WAIT_SECONDS}s")
     temp_logger.info("")
     
     while reconnect_count < MAX_RECONNECT_ATTEMPTS:
@@ -486,9 +498,7 @@ def run_with_auto_reconnect():
         temp_logger.error(f"✗ Max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) exceeded")
     
     temp_logger.info("")
-    temp_logger.info("=" * 60)
-    temp_logger.info("🏁 BOT SESSION ENDED")
-    temp_logger.info("=" * 60)
+    temp_logger.info("── SESSION ENDED ──")
 
 
 if __name__ == "__main__":

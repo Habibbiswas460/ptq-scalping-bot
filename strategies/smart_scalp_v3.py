@@ -18,6 +18,8 @@ from typing import Dict, Tuple, List, Optional
 from datetime import datetime
 import os
 
+from config.constants import SL_POINTS_FIXED, TP_POINTS_FIXED, CE_QUANTITY, PE_QUANTITY
+
 
 class SmartScalpV3:
     """
@@ -527,12 +529,12 @@ class SmartScalpV3:
         """
         config = self.ce_config if direction == "CE" else self.pe_config
         
-        # FIXED SL/TP - NO DYNAMIC
-        sl_points = 8  # FIXED 8 points
-        tp_points = 16  # FIXED 16 points (2x RR)
+        # SL/TP from .env via config.constants (FINAL FIX — was hardcoded)
+        sl_points = SL_POINTS_FIXED   # .env SL_POINTS (default 8)
+        tp_points = TP_POINTS_FIXED   # .env TP_POINTS (default 16)
         
-        # Quantity - FIXED
-        quantity = 260 if direction == "CE" else 156
+        # Quantity from .env via config.constants (FINAL FIX — was hardcoded)
+        quantity = CE_QUANTITY if direction == "CE" else PE_QUANTITY
         
         return {
             "sl_points": sl_points,

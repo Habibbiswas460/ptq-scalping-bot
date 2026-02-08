@@ -27,9 +27,7 @@ aiohttp>=3.9.0  # For async Telegram
 # Environment & Config
 python-dotenv>=1.0.0
 
-# Dashboard & API
-fastapi>=0.109.0
-uvicorn>=0.27.0
+# Dashboard removed — using Telegram dashboard
 
 # Statistics (for VIX estimation)
 # statistics  # Standard library, no install needed

@@ -1,9 +1,4 @@
-"""Services - Dashboard, Database, Telegram, Session, Mode"""
-from core.services.dashboard import (
-    app as dashboard_app, 
-    start_dashboard_background, 
-    set_state_reference
-)
+"""Services - Database, Telegram, Session, Mode"""
 from core.services.database import (
     DatabaseManager, db,
     log_trade_entry, log_trade_exit,

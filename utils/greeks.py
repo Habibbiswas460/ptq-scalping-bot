@@ -4,12 +4,40 @@ Lightweight implementation for option Greeks calculation
 """
 
 import math
+import time
 from typing import Dict, Optional
 from datetime import datetime
 
 
 class GreeksCalculator:
-    """Calculate option Greeks using BSM model"""
+    """Calculate option Greeks using BSM model with smart caching"""
+    
+    # Cache for Greeks calculations: {cache_key: (greeks_dict, timestamp, spot_price)}
+    _cache: Dict[str, tuple] = {}
+    _cache_ttl_sec: float = 5.0  # 5 second cache validity
+    _spot_move_threshold: float = 0.01  # 1% spot price move invalidates cache
+    
+    @staticmethod
+    def _generate_cache_key(spot: float, strike: float, tte: float, vol: float, rfr: float, opt_type: str) -> str:
+        """Generate cache key from parameters (rounded for consistency)"""
+        return f"{round(spot, 1)}_{round(strike, 0)}_{round(tte, 6)}_{round(vol, 4)}_{round(rfr, 4)}_{opt_type}"
+    
+    @staticmethod
+    def _is_cache_valid(cached_data: tuple, current_spot: float) -> bool:
+        """Check if cached Greeks are still valid (TTL and spot move checks)"""
+        greeks_dict, timestamp, cached_spot = cached_data
+        
+        # Check TTL validity
+        if time.time() - timestamp > GreeksCalculator._cache_ttl_sec:
+            return False
+        
+        # Check spot price movement (1% threshold)
+        if cached_spot > 0:
+            spot_move_pct = abs(current_spot - cached_spot) / cached_spot
+            if spot_move_pct > GreeksCalculator._spot_move_threshold:
+                return False
+        
+        return True
     
     @staticmethod
     def norm_cdf(x: float) -> float:
@@ -118,6 +146,66 @@ class GreeksCalculator:
                 'theta_sec': 0.0005,
                 'tte': time_to_expiry * 365 * 24 * 3600
             }
+    
+    @staticmethod
+    def calculate_cached(
+        spot_price: float,
+        strike_price: float,
+        time_to_expiry: float,  # in years
+        volatility: float,
+        risk_free_rate: float = 0.05,
+        option_type: str = 'CE'
+    ) -> Dict[str, float]:
+        """
+        Calculate Greeks with smart caching (5-sec TTL + 1% spot move detection)
+        
+        Args:
+            spot_price: Current underlying price
+            strike_price: Option strike price
+            time_to_expiry: Time to expiry in years
+            volatility: Implied volatility
+            risk_free_rate: Risk-free rate
+            option_type: 'CE' or 'PE'
+        
+        Returns:
+            Dict with cached or fresh Greeks (delta, gamma, theta, vega, theta_sec)
+        
+        Cache behavior:
+            - Valid for 5 seconds OR until spot price moves 1%
+            - Significantly reduces Black-Scholes calculations per tick
+            - Zero impact on trading accuracy (same formula, just cached result)
+        """
+        # Generate cache key from parameters
+        cache_key = GreeksCalculator._generate_cache_key(
+            spot_price, strike_price, time_to_expiry, volatility, risk_free_rate, option_type
+        )
+        
+        # Check if we have valid cached data
+        if cache_key in GreeksCalculator._cache:
+            cached_data = GreeksCalculator._cache[cache_key]
+            if GreeksCalculator._is_cache_valid(cached_data, spot_price):
+                # Cache hit - return cached Greeks
+                return cached_data[0]
+        
+        # Cache miss or invalid - calculate fresh Greeks
+        greeks = GreeksCalculator.calculate(
+            spot_price=spot_price,
+            strike_price=strike_price,
+            time_to_expiry=time_to_expiry,
+            volatility=volatility,
+            risk_free_rate=risk_free_rate,
+            option_type=option_type
+        )
+        
+        # Store in cache with timestamp and spot price for invalidation
+        GreeksCalculator._cache[cache_key] = (greeks, time.time(), spot_price)
+        
+        return greeks
+    
+    @staticmethod
+    def clear_cache():
+        """Clear all cached Greeks (useful for expiry change or day rollover)"""
+        GreeksCalculator._cache.clear()
     
     @staticmethod
     def calculate_from_ltp(
