@@ -1,49 +1,8 @@
-# PTQ Scalping Bot v2.0
+# PTQ Scalping Bot v3.4
 
-## SMART SCALP v3.0 - Institutional Grade NIFTY Options Scalping
+## SMART SCALP v3.4 - Institutional Grade NIFTY Options Scalping
 
 A sophisticated Python-based automated trading bot for NIFTY options scalping using Angel One SmartAPI. Features multi-factor scoring system with institutional-grade confluence detection.
-
----
-
-## ⚡ SmartAPI Optimization Deep Dive
-
-Based on official SmartAPI documentation analysis (`https://smartapi.angelbroking.com/docs`):
-
-### Rate Limits & Capabilities (Official):
-```
-WebSocket:           1000 tokens/connection (we use 2-5)
-Market Data API:     10 req/sec, 50 symbols/request (we use 1 symbol!)
-getLtpData:          10 req/sec (not 1 req/sec!)
-searchScrip:         1 req/sec (need caching)
-getPosition:         1 req/sec (cache 5-10 sec)
-optionGreek:         1 req/sec (use local calc instead!)
-```
-
-### Quick Wins Identified:
-
-**🔥 Biggest Opportunity: Batch Market Data (Phase 2 - Next)**
-- Current: `getLtpData()` for 1 symbol per request
-- Better: Use Market Data API with 50 symbols per request
-- Impact: **99% reduction** (50 req → 1 req per cycle)
-- Rate Limit: 10 req/sec available (much higher!)
-- Bandwidth: 80% less if using OHLC mode instead of FULL
-
-**✅ Already Done: Greeks Caching (Phase 1)**
-- Reduced from 100 calc/sec to 10 calc/sec
-- 90% reduction achieved
-- All tests passing
-
-**📋 Next Priority Chain:**
-1. Phase 2: Batch Market Data API (99% reduction)
-2. Phase 3: Symbol Caching (96% reduction)  
-3. Phase 4: Smart Position Querying (70% reduction)
-4. Phase 5: WebSocket Redundancy (3 connections)
-
-**Expected Total (All Phases):**
-- Current API calls: 4,500/day
-- After optimization: 50-100/day
-- **98% overall reduction possible**
 
 ---
 
@@ -53,10 +12,8 @@ optionGreek:         1 req/sec (use local calc instead!)
 |--------|-------|
 | Win Rate | 58.5% (CE: 62%, PE: 54%) |
 | Profit Factor | 2.06x |
-| Monthly Return | +42.2% |
-| Max Drawdown | -15.4% |
-| Monthly P&L | ₹50,608 |
-| API Optimization (Phase 1) | ✅ 90% Greeks reduction |
+| Risk-Reward | 1:2 (6pt SL, 12pt TP) |
+| API Optimization | 95.5% reduction (5 phases) |
 
 ---
 
@@ -64,50 +21,76 @@ optionGreek:         1 req/sec (use local calc instead!)
 
 ```
 PTQ-scalping bot/
-├── app.py                      # Entry point
-├── run.sh                      # Startup script
-├── requirements.txt            # Dependencies
+├── app.py                          # Entry point
+├── run.sh                          # Startup script
+├── requirements.txt                # Dependencies
+├── .env                            # All config & credentials (gitignored)
 │
-├── core/                       # Core trading logic
-│   ├── broker.py               # Angel One broker interface
-│   ├── main.py                 # Main trading loop
-│   ├── entry_engine.py         # Entry signal generation
-│   ├── exit_engine.py          # Exit signal handling
-│   ├── trade_manager.py        # Trade execution
-│   ├── risk_manager.py         # Risk controls
-│   ├── state_machine.py        # Trading state management
-│   ├── kill_switch.py          # Emergency stop system
-│   ├── mode_switch.py          # Adaptive mode switching
-│   ├── validators.py           # PTQ validation rules
-│   ├── session_manager.py      # Session tracking
-│   └── greeks_calc.py          # Option Greeks calculation
+├── config/                         # Configuration
+│   ├── constants.py                # Loads .env → Python variables
+│   └── validator.py                # Startup validation
 │
-├── strategies/                 # Trading strategies
-│   └── smart_scalp_v3.py       # SMART SCALP v3.0 strategy
+├── core/                           # Core trading logic
+│   ├── __init__.py
+│   ├── main.py                     # Main trading loop
+│   ├── backtest.py                 # Backtesting engine
+│   │
+│   ├── engines/                    # Signal engines
+│   │   ├── entry_engine.py         # Entry signal generation
+│   │   ├── exit_engine.py          # Exit signal handling
+│   │   └── state_machine.py        # Trading state management
+│   │
+│   ├── risk/                       # Risk management
+│   │   ├── risk_manager.py         # VIX filter, drawdown, sizing
+│   │   ├── kill_switch.py          # Emergency stop system
+│   │   ├── validators.py           # PTQ validation rules
+│   │   ├── greeks_calc.py          # Option Greeks calculation
+│   │   └── session_trend.py        # Session trend tracking
+│   │
+│   ├── services/                   # Services
+│   │   ├── database.py             # SQLite trade logging
+│   │   ├── telegram_bot.py         # Telegram notifications
+│   │   ├── mode_switch.py          # Adaptive mode switching
+│   │   └── session_manager.py      # Session tracking
+│   │
+│   └── trading/                    # Trade execution
+│       ├── broker.py               # Angel One interface + WebSocket
+│       └── trade_manager.py        # Trade execution wrapper
 │
-├── brokers/                    # Broker integrations
+├── strategies/                     # Trading strategies
+│   └── smart_scalp_v3.py          # SMART SCALP v3.4 strategy
+│
+├── brokers/                        # Broker integrations
 │   └── angel_one/
-│       ├── client.py           # Angel One SmartAPI client
-│       ├── exceptions.py       # Custom exceptions
-│       └── DOCUMENTATION.md    # API documentation
+│       ├── client.py               # SmartAPI client
+│       ├── exceptions.py           # Custom exceptions
+│       └── DOCUMENTATION.md        # API documentation
 │
-├── config/                     # Configuration files
-│   ├── bot_config.json         # Main configuration
-│   ├── credentials.json        # API credentials (gitignored)
-│   └── constants.py            # Python constants
+├── utils/                          # Utilities
+│   ├── greeks.py                   # BSM Greeks calculator (cached)
+│   ├── logger.py                   # Logging system
+│   ├── helpers.py                  # Helper functions
+│   ├── analytics.py                # Performance analytics
+│   └── monitoring.py               # Health monitoring
 │
-├── utils/                      # Utilities
-│   ├── greeks.py               # Greeks calculator
-│   ├── logger.py               # Logging system
-│   └── helpers.py              # Helper functions
+├── tests/                          # Test suite (75 tests)
+│   ├── test_greeks.py
+│   ├── test_greeks_caching.py
+│   ├── test_kill_switch.py
+│   ├── test_batch_market_data.py
+│   ├── test_phases_3_4_5.py
+│   ├── test_analytics.py
+│   └── test_websocket.py
 │
-├── logs/                       # Trade logs
+├── logs/                           # Daily trade logs
 │   └── YYYY-MM-DD/
-│       ├── trades.json         # Trade records
-│       └── summary.json        # Daily summary
+│       ├── trades.csv
+│       ├── trades.json
+│       ├── summary.json
+│       └── events.json
 │
-└── docs/                       # Documentation
-    └── 30K_CONFIG.md           # 30K capital configuration guide
+└── data/                           # Persistent data
+    └── trades.db                   # SQLite database
 ```
 
 ---
@@ -118,42 +101,12 @@ PTQ-scalping bot/
 - **Broker**: Angel One SmartAPI
 - **Data Source**: Angel One (Real-time LTP, OHLC, Greeks)
 - **Options**: NIFTY Weekly Options (NFO)
-- **Strategy**: SMART SCALP v3.0 Multi-Factor Scoring
+- **Strategy**: SMART SCALP v3.4 Multi-Factor Scoring
+- **Config**: `.env` file (all settings)
 
 ---
 
-## 📡 Broker Integration
-
-### Angel One SmartAPI
-
-All market data comes exclusively from Angel One:
-- Real-time NIFTY spot price (NSE)
-- Option chain data (NFO)
-- LTP, OHLC, Volume, OI
-- Option Greeks (Delta, Gamma, Theta, Vega)
-- India VIX for volatility filter
-
-### Symbol Format
-
-NIFTY option symbols follow this format:
-```
-NIFTY{DDMMMYY}{STRIKE}{CE/PE}
-```
-
-**Examples:**
-- `NIFTY03FEB2625400CE` - NIFTY 25400 CE expiring 03 Feb 2026
-- `NIFTY06FEB2625350PE` - NIFTY 25350 PE expiring 06 Feb 2026
-
-### Expiry Detection
-
-The bot automatically detects the nearest weekly expiry:
-- Searches day-by-day for the next 14 days
-- Handles holiday-shifted expiries (not always Thursday)
-- Republic Day 2026 shifted expiry: 30 Jan → 03 Feb (Tuesday)
-
----
-
-## 🎯 SMART SCALP v3.0 Strategy
+## 🎯 SMART SCALP v3.4 Strategy
 
 ### Multi-Factor Scoring System
 
@@ -188,16 +141,17 @@ The strategy evaluates **10 bullish factors** and **10 bearish factors**:
 | Requirement | Value |
 |-------------|-------|
 | Minimum Score | 5+ points (out of 10) |
-| Minimum Confidence | 60%+ |
-| Time Window | 9:20 AM - 3:15 PM |
+| Minimum Confidence | 70%+ (85% after 3 SL) |
+| Time Window | 9:20 AM - 3:10 PM |
 | VIX Filter | 10-25 (avoid extreme volatility) |
+| Premium Range | ₹90 - ₹350 |
 
 ### Position Sizing
 
-| Option Type | Quantity | Capital |
-|-------------|----------|---------|
-| CE Entry | 260 (4 lots × 65) | 100% |
-| PE Entry | 156 (2.4 lots × 65) | 60% |
+| Option Type | Quantity | Lots |
+|-------------|----------|------|
+| CE Entry | 65 | 1 lot × 65 |
+| PE Entry | 65 | 1 lot × 65 |
 
 ---
 
@@ -208,20 +162,21 @@ The strategy evaluates **10 bullish factors** and **10 bearish factors**:
 | Parameter | Value |
 |-----------|-------|
 | Total Capital | ₹30,000 |
-| Risk Per Trade | ₹600 (2%) |
-| Max Daily Loss | ₹900 (3%) |
-| Kill Switch | ₹1,200 (4%) |
-| Max Drawdown | ₹3,000 (10%) |
+| Risk Per Trade | 1.5% |
+| Max Daily Loss | ₹1,500 (5%) |
+| Kill Switch | ₹450 |
+| Kill Switch Consec Loss | 3 trades |
 
 ### Fixed Stop Loss & Target
 
-| Parameter | CE Trade | PE Trade |
-|-----------|----------|----------|
-| SL Points | 8 pts | 8 pts |
-| TP Points | 16 pts | 16 pts |
-| Risk-Reward | 1:2 | 1:2 |
-| Max Loss | ₹2,080 | ₹1,248 |
-| Max Profit | ₹4,160 | ₹2,496 |
+| Parameter | Value |
+|-----------|-------|
+| SL Points | 6 pts |
+| TP Points | 12 pts |
+| Risk-Reward | 1:2 |
+| Breakeven Trigger | +5 pts → lock +2 pts |
+| Trailing Distance | 3 pts below max profit |
+| TSL Steps | 10 step levels |
 
 ---
 
@@ -229,8 +184,8 @@ The strategy evaluates **10 bullish factors** and **10 bearish factors**:
 
 ### 1. Clone Repository
 ```bash
-git clone https://github.com/yourusername/ptq-scalping-bot.git
-cd ptq-scalping-bot
+git clone <repo-url>
+cd "PTQ-scalping bot"
 ```
 
 ### 2. Create Virtual Environment
@@ -244,26 +199,48 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Configure Credentials
+### 4. Configure Settings
 
-Create `config/credentials.json`:
-```json
-{
-  "angel_one": {
-    "api_key": "YOUR_API_KEY",
-    "client_id": "YOUR_CLIENT_ID",
-    "password": "YOUR_PASSWORD",
-    "totp_token": "YOUR_TOTP_SECRET"
-  }
-}
+All configuration is in `.env` file:
+```bash
+# Copy example and edit
+cp .env.example .env
+nano .env
+```
+
+Key settings in `.env`:
+```bash
+# Broker Credentials
+ANGEL_CLIENT_ID=your_client_id
+ANGEL_PASSWORD=your_password
+ANGEL_API_KEY=your_api_key
+ANGEL_TOTP_SECRET=your_totp_secret
+
+# Trading Mode
+PAPER_TRADING=true
+USE_LIVE_DATA=false
+
+# Capital & Risk
+TOTAL_CAPITAL=30000
+SL_POINTS=6
+TP_POINTS=12
+CE_QUANTITY=65
+PE_QUANTITY=65
+
+# Strategy
+MIN_SCORE=5
+MIN_CONFIDENCE=70
+
+# Telegram (Optional)
+TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN=your_token
+TELEGRAM_CHAT_ID=your_chat_id
 ```
 
 ### 5. Run the Bot
 ```bash
-# Using run script
 ./run.sh
-
-# Or directly
+# Or directly:
 python app.py
 ```
 
@@ -271,30 +248,19 @@ python app.py
 
 ## 📝 Configuration
 
-### Paper Trading Mode
+### Paper Trading Mode (Default)
 
-Edit `config/bot_config.json`:
-```json
-{
-  "broker": {
-    "paper_trading": true,
-    "use_live_data": true
-  }
-}
+Set in `.env`:
+```bash
+PAPER_TRADING=true
+USE_LIVE_DATA=false
 ```
-
-- `paper_trading: true` - No real orders, simulated execution
-- `use_live_data: true` - Uses real NIFTY spot from Angel One
 
 ### Live Trading Mode
 
-```json
-{
-  "broker": {
-    "paper_trading": false,
-    "use_live_data": true
-  }
-}
+```bash
+PAPER_TRADING=false
+USE_LIVE_DATA=true
 ```
 
 ⚠️ **WARNING**: Live trading uses real money. Test thoroughly in paper mode first.
@@ -314,7 +280,7 @@ Edit `config/bot_config.json`:
    │
 5. Build Option Symbol
    │
-6. Main Loop:
+6. Main Loop (9:20 AM - 3:10 PM):
    │
    ├─→ Get Real-time Tick
    │    │
@@ -322,19 +288,21 @@ Edit `config/bot_config.json`:
    │    │
    │    ├─→ Score Entry Factors (10 bullish + 10 bearish)
    │    │
-   │    ├─→ Check Risk Limits
+   │    ├─→ Check Risk Limits + Kill Switch
    │    │
-   │    └─→ Generate Signal (if score ≥ 5 & confidence ≥ 60%)
+   │    └─→ Generate Signal (if score ≥ 5 & confidence ≥ 70%)
    │
    ├─→ Execute Trade (if signal)
    │    │
-   │    ├─→ Place Order
+   │    ├─→ Place Order (with slippage validation)
    │    │
-   │    ├─→ Set Stop Loss
+   │    ├─→ Set SL at -6 pts
    │    │
-   │    └─→ Monitor Exit
+   │    ├─→ Monitor Exit (breakeven at +5, trail at +3)
+   │    │
+   │    └─→ Step Trailing SL (10 levels)
    │
-   └─→ Repeat until Market Close (3:30 PM)
+   └─→ Repeat until Market Close
    
 7. Generate Daily Summary
 ```
@@ -361,93 +329,79 @@ Edit `config/bot_config.json`:
 ## 🛡️ Risk Management
 
 ### Kill Switch
-- Activates at ₹1,200 daily loss
+- Activates at ₹450 kill-switch loss, ₹1,500 max daily loss, OR 3 consecutive losses
 - Stops all trading for the day
-- Logs emergency state
+- Logs emergency state + Telegram alert
 
 ### Trade Limits
-- Max 3 trades per hour
-- Max 6 trades per day
-- 30-second cooldown between trades
-- 60-second cooldown after stop loss
+- Max 10 trades per hour
+- Max 15 trades per day
+- 180s cooldown after trade
+- 300s cooldown after stop loss
+- 1200s cooldown after 3 consecutive losses
 
-### Adaptive Mode
+### Adaptive Modes
 The bot switches modes based on performance:
-- **NORMAL**: Standard parameters
-- **CAUTIOUS**: After 2 consecutive losses (tighter filters)
-- **AGGRESSIVE**: After 3 consecutive wins (wider targets)
-- **RECOVERY**: After hitting 50% of daily loss limit
+- **AGGRESSIVE**: Standard parameters (default)
+- **SAFE**: After consecutive losses (tighter filters, reduced size)
+- **LOCKDOWN**: After hitting daily loss limit (no new trades)
+
+### Live Slippage Guard
+- Validates entry/exit slippage against MAX_SLIPPAGE_PCT
+- Sends Telegram alert on excessive slippage
+- Intraday spike detector (1.5% in 10s → 60s pause)
 
 ---
 
 ## 📋 Logging
 
 ### Trade Logs
-Location: `logs/YYYY-MM-DD/trades.json`
-```json
-{
-  "timestamp": "2026-01-28 10:30:45",
-  "symbol": "NIFTY03FEB2625400CE",
-  "direction": "LONG",
-  "entry_price": 125.50,
-  "exit_price": 141.50,
-  "quantity": 260,
-  "pnl": 4160,
-  "signal_score": 7,
-  "confidence": 72
-}
-```
+Location: `logs/YYYY-MM-DD/trades.csv`
 
 ### Daily Summary
 Location: `logs/YYYY-MM-DD/summary.json`
-```json
-{
-  "date": "2026-01-28",
-  "total_trades": 4,
-  "winning_trades": 3,
-  "losing_trades": 1,
-  "win_rate": 75.0,
-  "gross_pnl": 8320,
-  "net_pnl": 6072
-}
-```
+
+### Events
+Location: `logs/YYYY-MM-DD/events.json`
 
 ---
 
 ## 🚀 Quick Start
 
 ```bash
-# Activate environment
 source venv/bin/activate
-
-# Run in paper trading mode (default)
 python app.py
-
-# Watch the output
-# ✅ Angel One connected - Real NIFTY: ₹25,342.75
-# ✓ Using Strike: 25350
-# ✓ Expiry: 03FEB26 | Symbol: NIFTY03FEB2625350CE
-# 🔄 Entering main trading loop...
 ```
 
 ---
 
-## 📞 Support
+## 🧪 Testing
 
-For issues or questions:
-1. Check `logs/` for error details
-2. Verify `credentials.json` is correct
-3. Ensure market hours (9:15 AM - 3:30 PM IST)
-4. Confirm Angel One API subscription is active
+```bash
+# Run all 75 tests
+python -m pytest tests/ -v
+
+# Run specific test
+python tests/test_greeks.py
+python tests/test_kill_switch.py
+```
+
+---
+
+## ⚡ API Optimizations (5 Phases Complete)
+
+| Phase | Optimization | Reduction |
+|-------|-------------|-----------|
+| 1 | Greeks Caching | 90% |
+| 2 | Batch Market Data | 99% |
+| 3 | Symbol Cache (24h TTL) | 98% |
+| 4 | Position Cache (5s TTL) | 65% |
+| 5 | WebSocket Redundancy (3x) | Reliability |
+
+**Total: 95.5% API call reduction** (4,500 → 200 calls/day)
 
 ---
 
 ## ⚠️ Disclaimer
 
 This bot is for educational purposes only. Trading in derivatives involves significant risk of loss. Past performance does not guarantee future results. Use at your own risk.
-
----
-
-## 📜 License
-
-MIT License - See LICENSE file for details.

@@ -13,7 +13,8 @@ from config.constants import (
     CONFIG, TOTAL_CAPITAL, RISK_PER_TRADE, KILL_SWITCH_LOSS,
     MAX_DAILY_LOSS_AMOUNT, MAX_TRADES_PER_HOUR, MAX_TRADES_PER_DAY,
     STOP_LOSS_AMOUNT, PROFIT_TARGET_1, PROFIT_TARGET_2,
-    COOLDOWN_NORMAL_SEC, COOLDOWN_AFTER_SL_SEC
+    COOLDOWN_NORMAL_SEC, COOLDOWN_AFTER_SL_SEC,
+    SL_POINTS_FIXED, TP_POINTS_FIXED, CE_QUANTITY, PE_QUANTITY
 )
 
 # Import core modules (new organized paths)
@@ -26,7 +27,7 @@ from core.engines.state_machine import (
     state_in_trade, state_cooldown
 )
 from core.risk.session_trend import start_trading_session
-from core.risk.kill_switch import emergency_check
+from core.risk.kill_switch import emergency_check, track_rejected_tick, reset_rejected_tick_counter, is_stale_data_kill_active, is_high_latency_paused
 from core.risk.greeks_calc import calculate_greeks, init_greeks_fetcher
 from core.services.mode_switch import (
     update_trading_mode, get_current_mode, get_mode_emoji,
@@ -57,14 +58,25 @@ NETWORK_CHECK_INTERVAL = 60  # Check network every 60 seconds
 def check_internet_connection(host="8.8.8.8", port=53, timeout=3):
     """
     Check if internet connection is available.
-    Uses Google's DNS server for quick check.
+    Uses multiple DNS servers for fallback (v3.3).
     """
-    try:
-        socket.setdefaulttimeout(timeout)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
-        return True
-    except (socket.error, socket.timeout):
-        return False
+    dns_servers = [
+        ("8.8.8.8", 53),       # Google DNS
+        ("1.1.1.1", 53),       # Cloudflare DNS
+        ("208.67.222.222", 53), # OpenDNS
+    ]
+    
+    for dns_host, dns_port in dns_servers:
+        try:
+            socket.setdefaulttimeout(timeout)
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((dns_host, dns_port))
+            s.close()
+            return True
+        except (socket.error, socket.timeout, OSError):
+            continue
+    
+    return False
 
 
 def wait_for_internet(logger, max_wait_minutes=30):
@@ -98,7 +110,18 @@ recent_ticks = []
 
 
 def init_features(logger, state):
-    """Initialize Telegram, Database, and Live Logs features"""
+    """Initialize Telegram, Database, RiskManager and Live Logs features"""
+    
+    # ============================================
+    # CRITICAL FIX: Initialize RiskManager globally
+    # ============================================
+    try:
+        from core.risk.risk_manager import RiskManager, set_risk_manager
+        rm = RiskManager(CONFIG, logger)
+        set_risk_manager(rm)
+        logger.info("✓ RiskManager initialized (globally active)")
+    except Exception as e:
+        logger.warning(f"⚠ RiskManager init failed: {e} — risk checks may be skipped")
     
     # Initialize Database
     if HAS_DATABASE and CONFIG.get('database', {}).get('enabled', True):
@@ -118,24 +141,123 @@ def init_features(logger, state):
         telegram_instance.notify_startup({
             'capital': TOTAL_CAPITAL,
             'paper_trading': CONFIG['broker'].get('paper_trading', True),
-            'ce_qty': CONFIG.get('strategy', {}).get('ce_entry', {}).get('quantity', 260),
-            'pe_qty': CONFIG.get('strategy', {}).get('pe_entry', {}).get('quantity', 156),
-            'sl_points': 8,
-            'tp_points': 16
+            'ce_qty': CE_QUANTITY,
+            'pe_qty': PE_QUANTITY,
+            'sl_points': SL_POINTS_FIXED,
+            'tp_points': TP_POINTS_FIXED
         })
         logger.info("✓ Telegram dashboard initialized")
 
 
+def close_current_trade(state, reason, logger, current_tick=None) -> bool:
+    """
+    Close the active trade and update accounting exactly once.
+    Returns False when live exit was not confirmed, leaving current_trade intact.
+    """
+    if not state.current_trade:
+        return True
+
+    trade_direction = state.current_trade.get('direction', 'CE')
+    result = broker.exit_position(
+        state.current_trade, reason,
+        state.daily_pnl_inr, TOTAL_CAPITAL, current_tick
+    )
+
+    if not result.get('exit_confirmed', True):
+        logger.error("🚨 Exit was not confirmed. Blocking new entries until manual review.")
+        state.state = "KILL_SWITCH"
+        state.manual_intervention_required = True
+        state.kill_switch_count = getattr(state, 'kill_switch_count', 0) + 1
+        return False
+
+    is_loss = result['pnl_inr'] < 0
+    state.update_pnl(result['pnl_inr'], TOTAL_CAPITAL, is_loss, trade_direction)
+    state.current_trade = None
+    state.manual_intervention_required = False
+    return True
+
+
 def main():
-    """Main trading loop - SMART SCALP v3.0"""
+    """Main trading loop - SMART SCALP v3.4"""
     global recent_ticks
     
-    # Connect to broker
+    # ════════════════════════════════════════════════════════════════════════
+    # PRE-MARKET STANDBY MODE
+    # If started before 09:10 AM, sleep until 09:10 then connect
+    # This ensures fresh ScripMaster + WebSocket connection
+    # ════════════════════════════════════════════════════════════════════════
+    from datetime import timedelta
+    current = datetime.now()
+    pre_market_time = current.replace(hour=9, minute=10, second=0, microsecond=0)
+    market_close_time = current.replace(hour=15, minute=30, second=0, microsecond=0)
+    
+    # Check if we need to wait for next trading day
+    if current > market_close_time:
+        # Market closed - wait for next day
+        next_day = current + timedelta(days=1)
+        while next_day.weekday() >= 5:  # Skip weekends
+            next_day += timedelta(days=1)
+        pre_market_time = next_day.replace(hour=9, minute=10, second=0, microsecond=0)
+    
+    if current < pre_market_time:
+        wait_seconds = (pre_market_time - current).total_seconds()
+        hours = int(wait_seconds // 3600)
+        minutes = int((wait_seconds % 3600) // 60)
+        
+        print()
+        print("╔═══════════════════════════════════════════════════════════════╗")
+        print("║            🌙 PRE-MARKET STANDBY MODE                         ║")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print(f"║  Current Time: {current.strftime('%Y-%m-%d %H:%M:%S')}                        ║")
+        print(f"║  Connect At:   {pre_market_time.strftime('%Y-%m-%d')} 09:10:00                        ║")
+        print(f"║  Wait Time:    {hours}h {minutes}m                                       ║")
+        print("╠═══════════════════════════════════════════════════════════════╣")
+        print("║  Bot will sleep and wake up 5 minutes before market open.    ║")
+        print("║  This ensures fresh ScripMaster + WebSocket connection.      ║")
+        print("╚═══════════════════════════════════════════════════════════════╝")
+        print()
+        
+        # Sleep with periodic status updates
+        while datetime.now() < pre_market_time:
+            remaining = (pre_market_time - datetime.now()).total_seconds()
+            
+            if remaining > 3600:
+                # More than 1 hour - sleep 30 min, show status
+                hours_left = int(remaining // 3600)
+                mins_left = int((remaining % 3600) // 60)
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(f"\033[2m{ts}\033[0m  💤 Standby: {hours_left}h {mins_left}m until connect...")
+                time.sleep(1800)  # 30 min sleep
+            elif remaining > 300:
+                # 5-60 min - sleep 5 min
+                mins_left = int(remaining // 60)
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(f"\033[2m{ts}\033[0m  ⏳ Standby: {mins_left}m until connect...")
+                time.sleep(300)  # 5 min sleep
+            else:
+                # Less than 5 min - sleep remaining
+                ts = datetime.now().strftime("%H:%M:%S")
+                print(f"\033[2m{ts}\033[0m  🔔 Waking up in {int(remaining)}s...")
+                time.sleep(remaining)
+                break
+        
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"\033[2m{ts}\033[0m  🌅 Pre-market wake up! Connecting to broker...")
+        print()
+    # ════════════════════════════════════════════════════════════════════════
+    
+    # Connect to broker (NOW with fresh connection)
     if not broker.connect():
         return
     
     logger = broker.logger
     state = trading_state
+    
+    # ════════════════════════════════════════════════════════════════════════
+    # RESTORE PnL FROM TODAY'S TRADES (on bot restart)
+    # ════════════════════════════════════════════════════════════════════════
+    if state.restore_from_trades(TOTAL_CAPITAL):
+        logger.info(f"📊 Restored: {state.total_trades_today} trades, PnL ₹{state.daily_pnl_inr:+,.0f}")
     
     # Initialize Greeks fetcher with broker client (for API Greeks)
     if broker.broker_client:
@@ -150,22 +272,20 @@ def main():
     # Import SMART SCALP config
     try:
         from config.constants import (
-            STRATEGY_NAME, STRATEGY_VERSION, CE_QUANTITY, PE_QUANTITY,
-            MIN_SCORE_TO_TRADE, MIN_CONFIDENCE, SL_POINTS_MIN, SL_POINTS_MAX
+            STRATEGY_NAME, STRATEGY_VERSION,
+            MIN_SCORE_TO_TRADE, MIN_CONFIDENCE
         )
         has_smart_scalp = True
     except ImportError:
         has_smart_scalp = False
-        CE_QUANTITY, PE_QUANTITY = 260, 156
-        MIN_SCORE_TO_TRADE, MIN_CONFIDENCE = 5, 60
-        SL_POINTS_MIN, SL_POINTS_MAX = 7, 10
+        MIN_SCORE_TO_TRADE, MIN_CONFIDENCE = 4, 70
     
     logger.info("")
     logger.info("┌──────────────────────────────────────────────────────────────┐")
-    logger.info("│           SMART SCALP v3.0  ·  ₹30K Configuration          │")
+    logger.info("│           SMART SCALP v3.4  ·  ₹30K Configuration          │")
     logger.info("├──────────────────────────────────────────────────────────────┤")
     logger.info(f"│  Capital: ₹{TOTAL_CAPITAL:>6,}  │  CE: {CE_QUANTITY:>3} qty  │  PE: {PE_QUANTITY:>3} qty      │")
-    logger.info(f"│  SL: {SL_POINTS_MIN}-{SL_POINTS_MAX} pts    │  TP: 2.0-2.5x   │  Score: {MIN_SCORE_TO_TRADE}+/{MIN_CONFIDENCE}%+   │")
+    logger.info(f"│  SL: {SL_POINTS_FIXED} pts      │  TP: {TP_POINTS_FIXED} pts    │  Score: {MIN_SCORE_TO_TRADE}+/{MIN_CONFIDENCE}%+   │")
     logger.info(f"│  Kill: ₹{KILL_SWITCH_LOSS:<5}   │  Max Loss: ₹{MAX_DAILY_LOSS_AMOUNT:<5} │  Mode: {get_current_mode():<10} │")
     logger.info(f"│  Cooldown: {COOLDOWN_NORMAL_SEC}s/{COOLDOWN_AFTER_SL_SEC}s │  Day: {state.day_type:<7}  │                  │")
     logger.info("└──────────────────────────────────────────────────────────────┘")
@@ -224,12 +344,104 @@ def main():
             # Get market tick
             tick = broker.get_tick()
             
+            # ============================================
+            # GLOBAL NETWORK CIRCUIT BREAKER (v3.3 - Exponential Backoff)
+            # If tick is None = Internet/API down
+            # Retry with backoff: 5s, 10s, 20s, 40s, 60s (max)
+            # ============================================
+            if tick is None:
+                # Initialize circuit breaker state
+                if not hasattr(state, '_network_sleep_count'):
+                    state._network_sleep_count = 0
+                    state._network_backoff = 5  # Start at 5 seconds
+                
+                state._network_sleep_count += 1
+                
+                # Log ONCE at start of outage
+                if state._network_sleep_count == 1:
+                    logger.warning("🛑 Network/API Down! Retrying with exponential backoff...")
+                    state._network_backoff = 5  # Reset backoff
+                    # Exit any open trade safely
+                    if state.current_trade:
+                        logger.warning("   ⚠ Exiting open trade due to network failure")
+                        if close_current_trade(state, "Network down - emergency exit", logger):
+                            state.state = "COOLDOWN"
+                
+                # Check internet with DNS fallback
+                if state._network_sleep_count % 3 == 0:
+                    if check_internet_connection():
+                        logger.info(f"🌐 Internet OK but API down - retrying broker connection...")
+                        state._network_backoff = 5  # Reset backoff on internet recovery
+                
+                # Log retry attempt
+                logger.info(f"🔄 Network retry #{state._network_sleep_count} (backoff: {state._network_backoff}s)")
+                
+                # Sleep with exponential backoff (max 60 seconds)
+                time.sleep(state._network_backoff)
+                state._network_backoff = min(60, state._network_backoff * 2)
+                
+                # After 10 retries (~10 min with backoff), log warning
+                if state._network_sleep_count >= 10:
+                    logger.warning(f"🔄 Still no network after {state._network_sleep_count} retries. Continuing...")
+                    state._network_sleep_count = 0
+                    state._network_backoff = 5
+                
+                continue  # Skip rest of loop, retry get_tick()
+            
+            # Network is back - reset counter and log recovery
+            if hasattr(state, '_network_sleep_count') and state._network_sleep_count > 0:
+                sleep_time = state._network_sleep_count * 60
+                logger.info(f"✅ Network restored after {sleep_time}s - resuming trading")
+                state._network_sleep_count = 0
+            
+            # BUG FIX #13: Count ALL ticks received (before validation)
+            # This ensures summary.json shows actual tick count, not just valid ones
+            state.total_ticks_received = getattr(state, 'total_ticks_received', 0) + 1
+            
             # Data validation
             is_valid, validation_msg = is_data_valid(tick)
             if not is_valid:
+                state.invalid_ticks = getattr(state, 'invalid_ticks', 0) + 1
                 if state.loop_count % 100 == 0:
                     logger.tick_rejected(validation_msg, tick)
+                
+                # FIX: Track consecutive rejected ticks — stale data kill switch
+                stale_kill, stale_reason, stale_details = track_rejected_tick()
+                if stale_kill:
+                    logger.warning(f"🚨 {stale_reason}: {stale_details['consecutive_rejected']} consecutive rejected ticks")
+                    logger.warning("   → Data feed is broken. BLOCKING new entries until valid data returns.")
+                    if state.current_trade:
+                        close_current_trade(state, f"Kill switch: {stale_reason}", logger, tick)
+                    if state.state != "KILL_SWITCH":
+                        state.state = "KILL_SWITCH"
+                        state.kill_switch_count = getattr(state, 'kill_switch_count', 0) + 1
+                        logger.kill_switch(stale_reason, stale_details)
+                
                 time.sleep(0.1)
+                continue
+            
+            # Valid tick received — check if we can clear stale data kill switch
+            can_clear_stale, clear_info = reset_rejected_tick_counter()
+            
+            # If stale data kill is still in effect (cooldown or need more valid ticks), stay in kill state
+            if getattr(state, 'manual_intervention_required', False):
+                if state.loop_count % 20 == 0:
+                    logger.error("🚨 Manual intervention required - bot will not resume entries")
+                time.sleep(1)
+                continue
+
+            if not can_clear_stale and state.state == "KILL_SWITCH" and is_stale_data_kill_active():
+                reason = clear_info.get('reason', 'unknown')
+                if reason == 'cooldown':
+                    remaining = clear_info.get('remaining_sec', 0)
+                    if state.loop_count % 20 == 0:  # Log every ~10 seconds
+                        logger.info(f"⏳ Stale data cooldown: {remaining:.0f}s remaining ({clear_info.get('valid_ticks', 0)} valid ticks)")
+                elif reason == 'need_more_valid':
+                    valid = clear_info.get('valid_ticks', 0)
+                    required = clear_info.get('required', 10)
+                    if state.loop_count % 10 == 0:  # Log every ~5 seconds
+                        logger.info(f"⏳ Stale data recovery: {valid}/{required} consecutive valid ticks")
+                time.sleep(0.5)
                 continue
             
             # Update recent ticks
@@ -248,16 +460,25 @@ def main():
             
             if kill_triggered:
                 if state.current_trade:
-                    broker.exit_position(
-                        state.current_trade, "Kill switch: " + kill_reason,
-                        state.daily_pnl_inr, TOTAL_CAPITAL
-                    )
-                    state.current_trade = None
+                    close_current_trade(state, "Kill switch: " + kill_reason, logger, tick)
                 
-                # Check if this is a recoverable kill switch (spread cooldown)
+                # Check if this is a recoverable kill switch
                 is_spread_cooldown = kill_reason in ("Wide spread KILL", "Spread cooldown")
+                is_latency_pause = kill_reason in ("High latency PAUSE", "Latency recovery")
+                is_recoverable = is_spread_cooldown or is_latency_pause or kill_details.get('recoverable', False)
                 
-                if is_spread_cooldown:
+                if is_latency_pause:
+                    # Latency pause - recoverable when latency improves
+                    if state.state != "KILL_SWITCH":
+                        state.state = "KILL_SWITCH"
+                        state.kill_switch_count = getattr(state, 'kill_switch_count', 0) + 1
+                        logger.kill_switch(kill_reason, kill_details)
+                        logger.warning(f"⚠ HIGH LATENCY PAUSE - {kill_details.get('latency_ms', 0):.0f}ms - Waiting for network to stabilize")
+                    elif kill_reason == "Latency recovery":
+                        # Still recovering - show progress
+                        if state.loop_count % 10 == 0:
+                            logger.info(f"⏳ Latency recovery: {kill_details.get('low_latency_count', 0)}/{kill_details.get('need', 5)} low latency ticks")
+                elif is_spread_cooldown:
                     # Recoverable - pause briefly then retry
                     if state.state != "KILL_SWITCH":
                         state.state = "KILL_SWITCH"
@@ -286,7 +507,10 @@ def main():
             # If we were in KILL_SWITCH but kill check passed, recover to IDLE
             if state.state == "KILL_SWITCH":
                 state.state = "IDLE"
-                logger.info("✅ Kill switch cleared - resuming trading")
+                if clear_info.get('reason') == 'recovered':
+                    logger.info(f"✅ Stale data recovered - {clear_info.get('valid_ticks', 10)} consecutive valid ticks - resuming trading")
+                else:
+                    logger.info("✅ Kill switch cleared - resuming trading")
             
             # Calculate Greeks
             greeks = calculate_greeks(tick, broker.spot_price, broker.current_strike)
@@ -328,7 +552,7 @@ def main():
             elif state.state == "IN_TRADE":
                 state.state = state_in_trade(
                     tick, greeks, state, check_exit_conditions, 
-                    broker, TOTAL_CAPITAL, logger
+                    broker, TOTAL_CAPITAL, logger, recent_ticks
                 )
             
             elif state.state == "COOLDOWN":
@@ -357,10 +581,7 @@ def main():
     except KeyboardInterrupt:
         logger.warning("⚠ Manual shutdown")
         if state.current_trade:
-            broker.exit_position(
-                state.current_trade, "Manual shutdown",
-                state.daily_pnl_inr, TOTAL_CAPITAL
-            )
+            close_current_trade(state, "Manual shutdown", logger)
         return "SHUTDOWN"
     
     except (ConnectionError, socket.error, OSError) as e:
@@ -380,14 +601,15 @@ def main():
         logger.error(f"Fatal error in main loop | Exception: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         if state.current_trade:
-            broker.exit_position(
-                state.current_trade, "Error shutdown",
-                state.daily_pnl_inr, TOTAL_CAPITAL
-            )
+            close_current_trade(state, "Error shutdown", logger)
         return "ERROR"
     
     finally:
         # Daily summary
+        total_ticks = getattr(state, 'total_ticks_received', 0)
+        valid_ticks = getattr(state, 'ticks_processed', 0)
+        invalid_ticks = getattr(state, 'invalid_ticks', 0)
+        
         logger.daily_summary({
             'total_trades': state.total_trades_today,
             'winning_trades': state.winning_trades,
@@ -395,7 +617,9 @@ def main():
             'total_pnl': state.daily_pnl_inr,
             'max_drawdown': min(0, state.daily_pnl_inr),
             'kill_switch_count': getattr(state, 'kill_switch_count', 0),
-            'ticks_processed': getattr(state, 'ticks_processed', 0)
+            'ticks_received': total_ticks,
+            'ticks_valid': valid_ticks,
+            'ticks_invalid': invalid_ticks
         })
         
         # Cleanup

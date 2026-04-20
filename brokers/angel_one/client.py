@@ -213,7 +213,8 @@ class AngelOneClient:
         self.symbol_cache_ttl: Dict[str, float] = {}  # token expiry times
         self.symbol_cache_ttl_sec = 86400.0  # 24 hours (Phase 3)
         
-        # WebSocket
+        # WebSocket - RACE CONDITION FIX v3.1: Thread-safe access
+        self._ws_lock = threading.RLock()  # Reentrant lock for WebSocket
         self.ws = None  # WebSocketApp instance
         self.ws_thread: Optional[threading.Thread] = None
         self.ws_connected = False
@@ -229,6 +230,12 @@ class AngelOneClient:
         
         # Rate limiting
         self.last_call_time: Dict[str, float] = {}
+        
+        # Circuit breaker for network errors (reduces log spam during outages)
+        self._api_error_count: int = 0
+        self._api_cooldown_until: float = 0.0
+        self._api_cooldown_duration: float = 60.0  # 60 second cooldown
+        self._api_error_threshold: int = 5  # Enter cooldown after 5 consecutive errors
         
         # Tick data
         self.latest_ticks: Dict[str, Dict] = {}
@@ -404,7 +411,8 @@ class AngelOneClient:
         order_tag: str = "",
         squareoff: float = 0,
         stoploss: float = 0,
-        trailing_stoploss: float = 0
+        trailing_stoploss: float = 0,
+        symbol_token: Optional[str] = None
     ) -> Dict:
         """
         Place an order
@@ -425,6 +433,7 @@ class AngelOneClient:
             squareoff: Squareoff value (ROBO orders)
             stoploss: Stoploss value (ROBO orders)
             trailing_stoploss: Trailing SL (ROBO orders)
+            symbol_token: Optional pre-resolved token to avoid another lookup
             
         Returns:
             Order response with orderid
@@ -436,7 +445,7 @@ class AngelOneClient:
         self._ensure_logged_in()
         
         # Get symbol token
-        symbol_token = self.get_symbol_token(symbol, exchange)
+        symbol_token = symbol_token or self.get_symbol_token(symbol, exchange)
         if not symbol_token:
             raise AngelOneOrderError(f"Symbol token not found for {symbol}")
         
@@ -616,7 +625,7 @@ class AngelOneClient:
     
     def get_ltp(self, exchange: str, symbol: str, symbol_token: str, max_retries: int = 3) -> Optional[float]:
         """
-        Get Last Traded Price with retry logic
+        Get Last Traded Price with retry logic and circuit breaker
         
         Args:
             exchange: Exchange code
@@ -627,14 +636,31 @@ class AngelOneClient:
         Returns:
             LTP as float or None
         """
+        # Circuit breaker check - skip API call during cooldown
+        current_time = time.time()
+        if current_time < self._api_cooldown_until:
+            return None  # Silently return during cooldown
+            
         for attempt in range(max_retries):
             self._rate_limit('getLtpData')
             self._ensure_logged_in()
             
             try:
                 response = self.smart_api.ltpData(exchange, symbol, symbol_token)
+                # DEBUG: Log raw response to diagnose stale data
+                self.logger.debug(f"[LTP RAW] {symbol}: {response}")
                 if response and response.get('status') and response.get('data'):
-                    return float(response['data'].get('ltp', 0))
+                    ltp = float(response['data'].get('ltp', 0))
+                    # Log if LTP seems stale (same as previous)
+                    prev_ltp = getattr(self, '_prev_ltp', {}).get(symbol)
+                    if prev_ltp and abs(ltp - prev_ltp) < 0.01:
+                        self.logger.debug(f"[LTP UNCHANGED] {symbol}: ₹{ltp:.2f}")
+                    if not hasattr(self, '_prev_ltp'):
+                        self._prev_ltp = {}
+                    self._prev_ltp[symbol] = ltp
+                    # Reset circuit breaker on success
+                    self._api_error_count = 0
+                    return ltp
                 
                 # Check for rate limit error in response
                 if response and 'Access denied' in str(response.get('message', '')):
@@ -651,7 +677,17 @@ class AngelOneClient:
                     self.logger.warning(f"⏳ Rate limited, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
                     time.sleep(wait_time)
                     continue
-                self.logger.error(f"LTP error for {symbol}: {e}")
+                
+                # Network error - apply circuit breaker
+                self._api_error_count += 1
+                if self._api_error_count == 1:
+                    # Log first error
+                    self.logger.error(f"LTP error for {symbol}: {e}")
+                elif self._api_error_count == self._api_error_threshold:
+                    # Enter cooldown mode
+                    self._api_cooldown_until = time.time() + self._api_cooldown_duration
+                    self.logger.warning(f"🔌 Circuit breaker triggered: {self._api_error_count} consecutive errors. Cooldown for {self._api_cooldown_duration}s")
+                # Skip logging intermediate errors to reduce spam
                 return None
         
         self.logger.error(f"LTP failed after {max_retries} retries for {symbol}")
@@ -1085,6 +1121,10 @@ class AngelOneClient:
             self.logger.debug(f"📦 Symbol cache HIT: {symbol} → {cached_token}")
             return cached_token
         
+        # Circuit breaker check - skip API call during cooldown
+        if time.time() < self._api_cooldown_until:
+            return None  # Silently return during cooldown
+        
         try:
             # Suppress SmartAPI SDK's verbose print statements
             import sys
@@ -1105,10 +1145,21 @@ class AngelOneClient:
                             # Cache with 24-hour TTL (Phase 3)
                             self._cache_symbol_token(cache_key, token)
                             self.logger.debug(f"📦 Symbol cache SET: {symbol} → {token} (24h TTL)")
+                            # Reset circuit breaker on success
+                            self._api_error_count = 0
                             return token
             return None
         except Exception as e:
-            self.logger.error(f"Symbol token search error for {symbol}: {e}")
+            # Network error - apply circuit breaker
+            self._api_error_count += 1
+            if self._api_error_count == 1:
+                # Log first error
+                self.logger.error(f"Symbol token search error for {symbol}: {e}")
+            elif self._api_error_count == self._api_error_threshold:
+                # Enter cooldown mode
+                self._api_cooldown_until = time.time() + self._api_cooldown_duration
+                self.logger.warning(f"🔌 Circuit breaker triggered: {self._api_error_count} consecutive errors. Cooldown for {self._api_cooldown_duration}s")
+            # Skip logging intermediate errors to reduce spam
             return None
     
     def search_symbol(self, search_term: str, exchange: str = "NFO") -> List[Dict]:
@@ -1241,38 +1292,47 @@ class AngelOneClient:
             self.ws_thread.start()
     
     def stop_websocket(self):
-        """Stop WebSocket connection"""
-        if self.ws:
+        """Stop WebSocket connection (RACE CONDITION FIX v3.1: Thread-safe)"""
+        with self._ws_lock:
+            self.ws_connected = False  # Set first to prevent races
+            ws_ref = self.ws  # Capture reference
+            self.ws = None  # Clear reference immediately
+        
+        # Close outside lock to avoid deadlock
+        if ws_ref:
             try:
-                self.ws.close()
-            except:
-                pass
-            self.ws = None
-        self.ws_connected = False
+                # Check if ws object has close method before calling
+                if hasattr(ws_ref, 'close') and callable(ws_ref.close):
+                    ws_ref.close()
+            except Exception as e:
+                self.logger.debug(f"WebSocket close ignored: {e}")
+        
         self.logger.info("WebSocket stopped")
     
     def subscribe(self, tokens: List[tuple]):
         """
-        Subscribe to market data
+        Subscribe to market data (RACE CONDITION FIX v3.1: Thread-safe)
         
         Args:
             tokens: List of (exchange, token, mode) tuples
                 Example: [("NFO", "12345", WS_MODE_LTP)]
         """
-        if not self.ws_connected:
-            self.logger.warning("WebSocket not connected")
-            return
+        with self._ws_lock:
+            if not self.ws_connected or not self.ws:
+                self.logger.warning("WebSocket not connected or not initialized")
+                return
+            ws_ref = self.ws  # Capture reference while locked
             
-        # Group by exchange
-        exchange_tokens = {}
-        for exchange, token, mode in tokens:
-            ws_exchange = self._get_ws_exchange_type(exchange)
-            if ws_exchange not in exchange_tokens:
-                exchange_tokens[ws_exchange] = []
-            exchange_tokens[ws_exchange].append(token)
-            self.subscriptions[token] = mode
+            # Group by exchange
+            exchange_tokens = {}
+            for exchange, token, mode in tokens:
+                ws_exchange = self._get_ws_exchange_type(exchange)
+                if ws_exchange not in exchange_tokens:
+                    exchange_tokens[ws_exchange] = []
+                exchange_tokens[ws_exchange].append(token)
+                self.subscriptions[token] = mode
         
-        # Build subscribe message
+        # Build subscribe message (outside lock - just data manipulation)
         token_list = []
         for exchange_type, token_ids in exchange_tokens.items():
             token_list.append({
@@ -1289,27 +1349,36 @@ class AngelOneClient:
             }
         }
         
-        self.ws.send(json.dumps(subscribe_msg))
-        self.logger.info(f"Subscribed to {len(tokens)} tokens")
+        # Send outside lock to avoid holding lock during I/O
+        try:
+            if ws_ref and hasattr(ws_ref, 'send') and callable(ws_ref.send):
+                ws_ref.send(json.dumps(subscribe_msg))
+                self.logger.info(f"Subscribed to {len(tokens)} tokens")
+            else:
+                self.logger.warning("WebSocket not ready for subscribe")
+        except Exception as e:
+            self.logger.warning(f"Subscribe failed: {e}")
     
     def unsubscribe(self, tokens: List[tuple]):
         """
-        Unsubscribe from market data
+        Unsubscribe from market data (RACE CONDITION FIX v3.1: Thread-safe)
         
         Args:
             tokens: List of (exchange, token, mode) tuples
         """
-        if not self.ws_connected:
-            return
+        with self._ws_lock:
+            if not self.ws_connected or not self.ws:
+                return
+            ws_ref = self.ws  # Capture reference while locked
             
-        # Build unsubscribe message
-        exchange_tokens = {}
-        for exchange, token, mode in tokens:
-            ws_exchange = self._get_ws_exchange_type(exchange)
-            if ws_exchange not in exchange_tokens:
-                exchange_tokens[ws_exchange] = []
-            exchange_tokens[ws_exchange].append(token)
-            self.subscriptions.pop(token, None)
+            # Build unsubscribe message
+            exchange_tokens = {}
+            for exchange, token, mode in tokens:
+                ws_exchange = self._get_ws_exchange_type(exchange)
+                if ws_exchange not in exchange_tokens:
+                    exchange_tokens[ws_exchange] = []
+                exchange_tokens[ws_exchange].append(token)
+                self.subscriptions.pop(token, None)
         
         token_list = []
         for exchange_type, token_ids in exchange_tokens.items():
@@ -1327,7 +1396,11 @@ class AngelOneClient:
             }
         }
         
-        self.ws.send(json.dumps(unsubscribe_msg))
+        try:
+            if ws_ref and hasattr(ws_ref, 'send') and callable(ws_ref.send):
+                ws_ref.send(json.dumps(unsubscribe_msg))
+        except Exception as e:
+            self.logger.debug(f"Unsubscribe failed: {e}")
     
     def _ws_connect(self, connection_id: int = 0):
         """Internal: Connect to WebSocket"""
@@ -1344,10 +1417,14 @@ class AngelOneClient:
             on_open=self._on_ws_open,
             on_message=self._on_ws_message,
             on_error=self._on_ws_error,
-            on_close=self._on_ws_close
+            on_close=self._on_ws_close,
+            on_ping=lambda ws, msg: None,  # Handle ping from server
+            on_pong=self._on_ws_pong  # Track pong responses
         )
         
-        self.ws.run_forever()
+        # Use protocol-level pings every 25s to prevent idle timeout
+        # Angel One closes connections after ~60s of inactivity
+        self.ws.run_forever(ping_interval=25, ping_timeout=10)
     
     def _on_ws_open(self, ws):
         """WebSocket opened"""
@@ -1385,24 +1462,30 @@ class AngelOneClient:
     def _on_ws_error(self, ws, error):
         """WebSocket error"""
         self.logger.error(f"WebSocket error: {error}")
+        # Notify BrokerInterface that WebSocket is no longer reliable
+        if hasattr(self, '_broker_ws_disconnect_cb') and self._broker_ws_disconnect_cb:
+            self._broker_ws_disconnect_cb(f"WS error: {error}")
     
     def _on_ws_close(self, ws, close_status_code, close_msg):
         """WebSocket closed"""
         self.ws_connected = False
         self.logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+        # Notify BrokerInterface that WebSocket disconnected
+        if hasattr(self, '_broker_ws_disconnect_cb') and self._broker_ws_disconnect_cb:
+            self._broker_ws_disconnect_cb(f"WS closed: {close_status_code} - {close_msg}")
+    
+    def _on_ws_pong(self, ws, message):
+        """Handle pong response from server - connection is alive"""
+        # Protocol-level pong received, connection is healthy
+        pass
     
     def _start_heartbeat(self):
-        """Start WebSocket heartbeat"""
-        def heartbeat():
-            while self.ws_connected and self.ws:
-                try:
-                    self.ws.send("ping")
-                    time.sleep(30)  # Send heartbeat every 30 seconds
-                except:
-                    break
-        
-        heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
-        heartbeat_thread.start()
+        """
+        Legacy heartbeat method - now handled by WebSocket protocol pings.
+        Kept for backwards compatibility but no longer sends text pings.
+        The ws.run_forever(ping_interval=25, ping_timeout=10) handles keepalive.
+        """
+        pass  # Protocol-level pings handle this now
     
     def _parse_ws_binary(self, data: bytes) -> Optional[Dict]:
         """

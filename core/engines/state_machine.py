@@ -3,6 +3,9 @@ PTQ Scalping Bot - State Machine
 Trading state management (IDLE, ENTRY_READY, IN_TRADE, COOLDOWN)
 """
 
+import os
+import csv
+import re
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
 
@@ -14,9 +17,115 @@ from config.constants import (
     COOLDOWN_AFTER_CONSECUTIVE_LOSS,
     COOLDOWN_EXPIRY_NORMAL, COOLDOWN_EXPIRY_AFTER_SL,
     SESSION_FILTER_ENABLED, ALLOWED_SESSIONS,
-    EXPIRY_ONLY_SESSIONS, BLACKOUT_SESSIONS
+    EXPIRY_ONLY_SESSIONS, BLACKOUT_SESSIONS,
+    TRADING_START_TIME
 )
 from utils.helpers import now, calculate_position_size
+
+# Strike rotation interval (seconds)
+STRIKE_ROTATION_INTERVAL = 60
+
+# v3.4: Intraday spike detection — pause after sudden price jumps
+SPIKE_THRESHOLD_PCT = 1.5   # 1.5% spot move in ≤10 seconds = spike
+SPIKE_PAUSE_SEC = 60         # Pause 60s after spike detected
+_last_spot_prices = []        # Ring buffer of (timestamp, spot_price)
+_spike_pause_until = None     # datetime when spike pause expires
+
+
+def _check_intraday_spike(tick: dict, logger) -> bool:
+    """
+    v3.4: Detect sudden intraday price spikes (news events, flash crashes).
+    Tracks spot price over last 10 seconds; if move > SPIKE_THRESHOLD_PCT%, 
+    pauses trading for SPIKE_PAUSE_SEC seconds.
+    
+    Returns True if trading should be paused.
+    """
+    global _last_spot_prices, _spike_pause_until
+    from datetime import datetime, timedelta
+    
+    current = datetime.now()
+    
+    # If already in spike pause, check if expired
+    if _spike_pause_until and current < _spike_pause_until:
+        return True
+    elif _spike_pause_until and current >= _spike_pause_until:
+        _spike_pause_until = None  # Pause expired, resume
+    
+    spot = tick.get('spot_price', 0)
+    if spot <= 0:
+        return False
+    
+    # Add current price to ring buffer
+    _last_spot_prices.append((current, spot))
+    
+    # Keep only last 30 entries (~10-15 seconds at 2-3 ticks/sec)
+    if len(_last_spot_prices) > 30:
+        _last_spot_prices = _last_spot_prices[-30:]
+    
+    # Need at least 3 data points
+    if len(_last_spot_prices) < 3:
+        return False
+    
+    # Compare current price vs oldest in buffer (within last 10s)
+    cutoff = current - timedelta(seconds=10)
+    old_prices = [(t, p) for t, p in _last_spot_prices if t >= cutoff]
+    if len(old_prices) < 2:
+        return False
+    
+    oldest_price = old_prices[0][1]
+    if oldest_price <= 0:
+        return False
+    
+    move_pct = abs(spot - oldest_price) / oldest_price * 100
+    
+    if move_pct >= SPIKE_THRESHOLD_PCT:
+        _spike_pause_until = current + timedelta(seconds=SPIKE_PAUSE_SEC)
+        logger.warning(
+            f"🚨 SPIKE DETECTED: Spot ₹{oldest_price:.0f} → ₹{spot:.0f} "
+            f"({move_pct:+.2f}% in <10s) | Pausing {SPIKE_PAUSE_SEC}s"
+        )
+        try:
+            from core.services.telegram_bot import send_alert
+            send_alert(f"🚨 SPIKE: ₹{oldest_price:.0f}→₹{spot:.0f} ({move_pct:.1f}%) | Paused {SPIKE_PAUSE_SEC}s")
+        except Exception:
+            pass
+        return True
+    
+    return False
+
+
+def _calculate_rsi(recent_ticks: list, period: int = 14) -> float:
+    """Calculate RSI from recent ticks for momentum exit"""
+    if not recent_ticks or len(recent_ticks) < period + 1:
+        return 50  # Neutral if not enough data
+    
+    prices = [t.get('ltp', 0) for t in recent_ticks if t.get('ltp')]
+    if len(prices) < period + 1:
+        return 50
+    
+    gains = []
+    losses = []
+    
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
+    
+    if len(gains) < period:
+        return 50
+    
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    
+    if avg_loss == 0:
+        return 100 if avg_gain > 0 else 50
+    
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 
 class TradingState:
@@ -29,6 +138,7 @@ class TradingState:
         # Current trade
         self.current_trade: Optional[Dict] = None
         self.cooldown_until: Optional[datetime] = None
+        self.manual_intervention_required = False
         
         # PnL tracking
         self.daily_pnl_inr = 0.0
@@ -41,6 +151,18 @@ class TradingState:
         self.consecutive_loss_pause_until: Optional[datetime] = None
         self.winning_trades = 0
         self.losing_trades = 0
+        
+        # ═══════════════════════════════════════════════════════════════
+        # PHASE 4: Per-Direction Loss Tracking (v3.2)
+        # ═══════════════════════════════════════════════════════════════
+        self.consecutive_ce_losses = 0
+        self.consecutive_pe_losses = 0
+        self.last_trade_direction: Optional[str] = None
+        
+        # Direction-specific cooldown (prevents permanent blocking)
+        self.ce_blocked_until: Optional[datetime] = None
+        self.pe_blocked_until: Optional[datetime] = None
+        self.DIRECTION_COOLDOWN_MIN = 30  # 30 minutes cooldown after 2 losses
         
         # Entry signal tracking
         self.consecutive_entry_signals = 0
@@ -62,8 +184,167 @@ class TradingState:
         self.winning_trades = 0
         self.losing_trades = 0
         self.consecutive_losses = 0
+        # Phase 4: Reset per-direction counters
+        self.consecutive_ce_losses = 0
+        self.consecutive_pe_losses = 0
+        self.ce_blocked_until = None
+        self.pe_blocked_until = None
+        self.last_trade_direction = None
+        self.manual_intervention_required = False
     
-    def update_pnl(self, pnl_inr: float, total_capital: float, is_loss: bool):
+    def is_direction_blocked(self, direction: str) -> tuple:
+        """
+        Check if a direction (CE/PE) is blocked due to consecutive losses.
+        Returns (is_blocked, reason) tuple.
+        
+        Logic:
+        - If 2+ consecutive losses AND cooldown not expired → blocked
+        - If cooldown expired → reset counter and allow trading
+        """
+        now = datetime.now()
+        
+        if direction == 'CE':
+            if self.consecutive_ce_losses >= 2:
+                if self.ce_blocked_until and now < self.ce_blocked_until:
+                    remaining = (self.ce_blocked_until - now).seconds // 60
+                    return True, f"CE blocked ({self.consecutive_ce_losses} losses, {remaining}min cooldown)"
+                else:
+                    # Cooldown expired - reset counter and allow recovery trade
+                    self.consecutive_ce_losses = 1  # Reset to 1 (still cautious)
+                    self.ce_blocked_until = None
+                    print(f"✅ CE cooldown expired - allowing recovery trade")
+                    return False, "CE cooldown expired"
+            return False, ""
+        
+        elif direction == 'PE':
+            if self.consecutive_pe_losses >= 2:
+                if self.pe_blocked_until and now < self.pe_blocked_until:
+                    remaining = (self.pe_blocked_until - now).seconds // 60
+                    return True, f"PE blocked ({self.consecutive_pe_losses} losses, {remaining}min cooldown)"
+                else:
+                    # Cooldown expired - reset counter and allow recovery trade
+                    self.consecutive_pe_losses = 1  # Reset to 1 (still cautious)
+                    self.pe_blocked_until = None
+                    print(f"✅ PE cooldown expired - allowing recovery trade")
+                    return False, "PE cooldown expired"
+            return False, ""
+        
+        return False, ""
+
+    def restore_from_trades(self, total_capital: float = 100000.0) -> bool:
+        """
+        Restore PnL and counters from today's trades.csv after bot restart.
+        This ensures PnL is preserved when bot is stopped and restarted.
+        
+        Returns:
+            True if restored from existing trades, False if no trades found
+        """
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        trades_file = os.path.join("logs", today_str, "trades.csv")
+        
+        if not os.path.exists(trades_file):
+            return False
+        
+        try:
+            total_pnl = 0.0
+            wins = 0
+            losses = 0
+            ce_losses = 0
+            pe_losses = 0
+            last_direction = None
+            trade_count = 0
+            
+            with open(trades_file, 'r') as f:
+                reader = csv.DictReader(f)
+                
+                # Track consecutive losses at end
+                recent_trades = []
+                
+                for row in reader:
+                    if row.get('event') == 'EXIT':
+                        trade_count += 1
+                        
+                        # Get PnL - try CSV value first, then parse from exit_reason
+                        pnl = 0.0
+                        csv_pnl = float(row.get('pnl', 0)) if row.get('pnl') else 0
+                        exit_reason = row.get('exit_reason', '')
+                        
+                        # Check for corrupted PnL and parse from exit_reason
+                        if csv_pnl != 0 and abs(csv_pnl) < 50000:
+                            pnl = csv_pnl
+                        else:
+                            # Parse from exit_reason text
+                            profit_match = re.search(r'Profit:\s*₹?([0-9,]+)', exit_reason)
+                            loss_match = re.search(r'Loss:\s*₹?-?([0-9,]+)', exit_reason)
+                            
+                            if profit_match:
+                                pnl = float(profit_match.group(1).replace(',', ''))
+                            elif loss_match:
+                                pnl = -float(loss_match.group(1).replace(',', ''))
+                            else:
+                                pnl = csv_pnl  # Use CSV value as fallback
+                        
+                        total_pnl += pnl
+                        
+                        # Determine direction from symbol
+                        symbol = row.get('symbol', '')
+                        direction = 'CE' if 'CE' in symbol else 'PE'
+                        
+                        if pnl > 0:
+                            wins += 1
+                            recent_trades.append({'pnl': pnl, 'dir': direction, 'loss': False})
+                        else:
+                            losses += 1
+                            recent_trades.append({'pnl': pnl, 'dir': direction, 'loss': True})
+            
+            if trade_count == 0:
+                return False
+            
+            # Calculate consecutive losses from recent trades
+            # Only reset on win of SAME direction, independent tracking per direction
+            for trade in recent_trades:
+                if trade['loss']:
+                    if trade['dir'] == 'CE':
+                        ce_losses += 1
+                        # DON'T reset pe_losses
+                    else:
+                        pe_losses += 1
+                        # DON'T reset ce_losses
+                else:
+                    # Only reset the winning direction's counter
+                    if trade['dir'] == 'CE':
+                        ce_losses = 0
+                    else:
+                        pe_losses = 0
+                last_direction = trade['dir']
+            
+            # Apply restored values
+            self.daily_pnl_inr = total_pnl
+            self.daily_pnl_pct = (total_pnl / total_capital) * 100
+            self.total_trades_today = trade_count
+            self.winning_trades = wins
+            self.losing_trades = losses
+            self.consecutive_ce_losses = ce_losses
+            self.consecutive_pe_losses = pe_losses
+            self.last_trade_direction = last_direction
+            
+            # Count overall consecutive losses
+            consec_losses = 0
+            for trade in reversed(recent_trades):
+                if trade['loss']:
+                    consec_losses += 1
+                else:
+                    break
+            self.consecutive_losses = consec_losses
+            
+            print(f"✅ Restored from {trade_count} trades: PnL ₹{total_pnl:+,.0f} ({wins}W/{losses}L)")
+            return True
+            
+        except Exception as e:
+            print(f"⚠️ Could not restore trades: {e}")
+            return False
+    
+    def update_pnl(self, pnl_inr: float, total_capital: float, is_loss: bool, direction: str = None):
         """Update PnL and counters after trade exit"""
         self.daily_pnl_inr += pnl_inr
         self.daily_pnl_pct = (self.daily_pnl_inr / total_capital) * 100
@@ -71,10 +352,31 @@ class TradingState:
         if is_loss:
             self.consecutive_losses += 1
             self.losing_trades += 1
+            # Phase 4: Track per-direction losses (DON'T reset other direction!)
+            if direction == 'CE':
+                self.consecutive_ce_losses += 1
+                # Set cooldown after 2 consecutive losses (prevents permanent blocking)
+                if self.consecutive_ce_losses >= 2:
+                    self.ce_blocked_until = datetime.now() + timedelta(minutes=self.DIRECTION_COOLDOWN_MIN)
+                    print(f"⏸️ CE direction on cooldown for {self.DIRECTION_COOLDOWN_MIN}min (after {self.consecutive_ce_losses} losses)")
+            elif direction == 'PE':
+                self.consecutive_pe_losses += 1
+                # Set cooldown after 2 consecutive losses
+                if self.consecutive_pe_losses >= 2:
+                    self.pe_blocked_until = datetime.now() + timedelta(minutes=self.DIRECTION_COOLDOWN_MIN)
+                    print(f"⏸️ PE direction on cooldown for {self.DIRECTION_COOLDOWN_MIN}min (after {self.consecutive_pe_losses} losses)")
         else:
             self.consecutive_losses = 0
             self.winning_trades += 1
+            # Only reset the WINNING direction's counter and cooldown
+            if direction == 'CE':
+                self.consecutive_ce_losses = 0
+                self.ce_blocked_until = None
+            elif direction == 'PE':
+                self.consecutive_pe_losses = 0
+                self.pe_blocked_until = None
         
+        self.last_trade_direction = direction
         self.total_trades_today += 1
         
         # Record trade result for mode switching
@@ -147,8 +449,11 @@ def check_trade_limits(state: TradingState, logger) -> Tuple[bool, str]:
                 logger.info(f"⏸ Paused. Resuming in {remaining}s")
             return False, "Consecutive loss pause"
         else:
-            logger.info("✅ Pause ended. Resetting.")
+            logger.info("✅ Pause ended. Resetting consecutive losses.")
             state.consecutive_loss_pause_until = None
+            state.consecutive_losses = 0  # FIX: Reset consecutive losses after pause
+            state.consecutive_ce_losses = 0
+            state.consecutive_pe_losses = 0
     
     return True, "OK"
 
@@ -172,6 +477,30 @@ def get_cooldown_duration(state: TradingState) -> int:
 def state_idle(tick: Dict, greeks: Dict, state: TradingState, 
                entry_signal_func, logger) -> str:
     """Handle IDLE state - Entry gate"""
+    # ============================================
+    # STRIKE ROTATION: Check every 60 seconds
+    # Ensures ATM strike is updated even if no trades
+    # ============================================
+    from core.trading.broker import broker
+    current = now()
+    
+    if not hasattr(state, '_last_strike_rotation'):
+        state._last_strike_rotation = None
+    
+    should_rotate = (
+        state._last_strike_rotation is None or 
+        (current - state._last_strike_rotation).total_seconds() >= STRIKE_ROTATION_INTERVAL
+    )
+    
+    if should_rotate and tick.get('spot_price'):
+        try:
+            rotated = broker.check_and_rotate_strike()
+            state._last_strike_rotation = current
+            if rotated:
+                logger.info(f"🔄 Strike rotated to ATM @ spot {tick.get('spot_price', 0):.0f}")
+        except Exception as e:
+            logger.debug(f"Strike rotation check failed: {e}")
+    
     # Session filter
     session_ok, session_msg = is_trading_session_allowed(state.day_type)
     if not session_ok:
@@ -182,13 +511,27 @@ def state_idle(tick: Dict, greeks: Dict, state: TradingState,
     if not limits_ok:
         return "IDLE"
     
-    # Skip first 15 minutes
-    if CONFIG['entry_filters'].get('avoid_first_15min', True):
-        current = now()
-        if current.hour == 9 and current.minute < 30:
-            if state.loop_count % 1000 == 0:
-                logger.info("⏱ Skipping first 15 minutes")
-            return "IDLE"
+    # ============================================
+    # PULLBACK & PROTECT: No trades before configured start time
+    # Uses TRADING_START_TIME from config (default 09:20)
+    # ============================================
+    try:
+        start_h, start_m = map(int, TRADING_START_TIME.split(':'))
+    except (ValueError, AttributeError):
+        start_h, start_m = 9, 20
+    if current.hour < start_h or (current.hour == start_h and current.minute < start_m):
+        if state.loop_count % 1000 == 0:
+            logger.info(f"⏱ Morning volatility filter: Waiting until {TRADING_START_TIME} (now {current.strftime('%H:%M')})")
+        return "IDLE"
+    
+    # ============================================
+    # v3.4: INTRADAY SPIKE DETECTION
+    # Pauses trading after sudden spot price jumps (news/flash crash)
+    # ============================================
+    if _check_intraday_spike(tick, logger):
+        if state.loop_count % 200 == 0:
+            logger.info("🚨 Spike pause active — waiting for market to settle")
+        return "IDLE"
     
     # Entry signal check
     has_signal, signal_reason = entry_signal_func(tick)
@@ -233,7 +576,7 @@ def state_idle(tick: Dict, greeks: Dict, state: TradingState,
 
 def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
                       broker, logger) -> str:
-    """Handle ENTRY_READY state - Place order using SMART SCALP v3.0 params"""
+    """Handle ENTRY_READY state - Place order using SMART SCALP v3.4 params"""
     state.consecutive_entry_signals = 0
     
     # ── RISK MANAGER CHECK (FINAL FIX) ──
@@ -255,7 +598,7 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
         logger.warning(f"⚠ RiskManager check error: {e} — proceeding with default")
         size_multiplier = 1.0
     
-    # Get SMART SCALP v3.0 signal params
+    # Get SMART SCALP v3.4 signal params
     try:
         from core.engines.entry_engine import get_last_signal_params, get_signal_direction, get_signal_quantity
         signal_params = get_last_signal_params()
@@ -309,24 +652,86 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
 
 
 def state_in_trade(tick: Dict, greeks: Dict, state: TradingState,
-                   exit_check_func, broker, total_capital: float, logger) -> str:
+                   exit_check_func, broker, total_capital: float, logger,
+                   recent_ticks: list = None) -> str:
     """Handle IN_TRADE state - Monitor and exit"""
     from utils.helpers import estimate_vix_from_ticks
     from core.engines.entry_engine import MAX_RECENT_TICKS
     
-    # Check exit conditions
+    # ═══════════════════════════════════════════════════════════════════
+    # CRITICAL FIX: Verify tick is for the CORRECT symbol before exit check
+    # After symbol switch, WebSocket may still be sending old symbol's ticks
+    # ═══════════════════════════════════════════════════════════════════
+    if state.current_trade:
+        trade_symbol = state.current_trade.get('symbol', '')
+        tick_symbol = tick.get('symbol', '')
+        
+        # Skip exit check if tick is from wrong symbol
+        if tick_symbol and trade_symbol and tick_symbol != trade_symbol:
+            # Log only once per minute to avoid spam
+            if not hasattr(state, '_last_symbol_mismatch_log'):
+                state._last_symbol_mismatch_log = 0
+            
+            import time
+            if time.time() - state._last_symbol_mismatch_log > 60:
+                logger.warning(f"⚠ Tick symbol mismatch: got {tick_symbol}, need {trade_symbol} — waiting...")
+                state._last_symbol_mismatch_log = time.time()
+            
+            return "IN_TRADE"  # Wait for correct tick
+        
+        # Also validate tick has reasonable price relative to entry
+        entry_price = state.current_trade.get('entry_price', 0)
+        tick_ltp = tick.get('ltp', 0)
+        
+        if entry_price > 0 and tick_ltp > 0:
+            price_diff_pct = abs(tick_ltp - entry_price) / entry_price * 100
+            
+            # If price differs by >50% from entry, likely wrong symbol data
+            if price_diff_pct > 50:
+                if not hasattr(state, '_last_price_mismatch_log'):
+                    state._last_price_mismatch_log = 0
+                
+                import time
+                if time.time() - state._last_price_mismatch_log > 60:
+                    logger.warning(f"⚠ Suspicious tick: Entry ₹{entry_price:.2f} vs LTP ₹{tick_ltp:.2f} ({price_diff_pct:.0f}% diff) — skipping")
+                    state._last_price_mismatch_log = time.time()
+                
+                return "IN_TRADE"  # Wait for valid tick
+    
+    # Calculate RSI for momentum exit
+    rsi = _calculate_rsi(recent_ticks) if recent_ticks else None
+    
+    # Check exit conditions (now includes RSI for momentum exit)
     should_exit, exit_reason = exit_check_func(
-        state.current_trade, tick, greeks, state.day_type, logger
+        state.current_trade, tick, greeks, state.day_type, logger, rsi
     )
     
     if should_exit:
+        # FIX: Pass the SAME tick that triggered exit to exit_position
+        # This prevents PnL mismatch from calling get_tick() again
         result = broker.exit_position(
             state.current_trade, exit_reason, 
-            state.daily_pnl_inr, total_capital
+            state.daily_pnl_inr, total_capital,
+            current_tick=tick
         )
+        if not result.get('exit_confirmed', True):
+            logger.error("🚨 Exit was not confirmed. Holding trade state and blocking new entries.")
+            state.state = "KILL_SWITCH"
+            state.manual_intervention_required = True
+            state.kill_switch_count = getattr(state, 'kill_switch_count', 0) + 1
+            return "KILL_SWITCH"
+        
+        # Get direction BEFORE clearing trade
+        trade_direction = state.current_trade.get('direction', 'CE') if state.current_trade else None
         
         is_loss = result['pnl_inr'] < 0
-        state.update_pnl(result['pnl_inr'], total_capital, is_loss)
+        state.update_pnl(result['pnl_inr'], total_capital, is_loss, trade_direction)
+        
+        # 🔄 STRIKE ROTATION after trade exit (Gemini recommendation)
+        # Check if spot has moved 50+ pts from current strike
+        if broker.check_and_rotate_strike(trade_direction):
+            logger.info("📍 Strike rotated to stay ATM")
+        
         state.current_trade = None
         
         # Set cooldown

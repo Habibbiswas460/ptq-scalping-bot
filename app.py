@@ -28,8 +28,17 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 # Method 3: Override the global logging config
 logging.basicConfig(level=logging.CRITICAL)
 
-from core.main import main
+from config.validator import validate_config_quiet
+from core.main import run_with_auto_reconnect
 
 if __name__ == "__main__":
-    main()
+    is_valid, errors, warnings = validate_config_quiet()
+    if warnings:
+        for warning in warnings:
+            print(warning)
+    if not is_valid:
+        for error in errors:
+            print(error)
+        sys.exit(1)
 
+    run_with_auto_reconnect()
