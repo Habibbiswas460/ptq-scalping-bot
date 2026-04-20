@@ -56,15 +56,16 @@ def is_data_valid(tick: Dict) -> Tuple[bool, str]:
         if spot < min_spot or spot > max_spot:
             return False, f"Invalid spot ₹{spot:.2f} (range: ₹{min_spot}-₹{max_spot})"
     
-    # Timestamp freshness (< 500ms old)
+    # Timestamp freshness (< 2000ms old - increased tolerance for WebSocket lag)
     tick_age_ms = current_time_ms() - tick['timestamp']
-    if tick_age_ms > 500:
+    if tick_age_ms > 2000:
         return False, f"Stale tick ({tick_age_ms}ms old)"
     
-    # Latency check
-    latency = calc_latency_ms(tick)
-    if latency > LATENCY_LIMIT_MS:
-        return False, f"High latency ({latency:.1f}ms)"
+    # Latency check - SKIP since timestamp freshness check above is more appropriate
+    # The latency check was redundant (same calculation as stale tick check)
+    # latency = calc_latency_ms(tick)
+    # if latency > LATENCY_LIMIT_MS:
+    #     return False, f"High latency ({latency:.1f}ms)"
     
     # Spread check
     spread = spread_pct(tick)
@@ -95,13 +96,24 @@ def is_data_valid(tick: Dict) -> Tuple[bool, str]:
 # =========================================================
 
 def calculate_vwap(ticks: List[Dict], period: int = 60) -> float:
-    """Calculate VWAP from recent ticks"""
+    """Calculate VWAP from recent ticks
+    
+    Note: Skips ticks without valid volume (no arbitrary defaults)
+    """
     if len(ticks) == 0:
         return 0
     
     recent = ticks[-period:] if len(ticks) > period else ticks
-    total_pv = sum(t['ltp'] * t.get('volume', 10000) for t in recent)
-    total_v = sum(t.get('volume', 10000) for t in recent)
+    
+    # Only use ticks with actual volume data
+    ticks_with_vol = [(t['ltp'], t.get('volume', 0)) for t in recent if t.get('volume', 0) > 0]
+    
+    if not ticks_with_vol:
+        # Fallback: simple average price if no volume data
+        return sum(t['ltp'] for t in recent) / len(recent) if recent else 0
+    
+    total_pv = sum(ltp * vol for ltp, vol in ticks_with_vol)
+    total_v = sum(vol for _, vol in ticks_with_vol)
     
     return total_pv / total_v if total_v > 0 else 0
 

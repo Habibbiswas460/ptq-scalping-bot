@@ -16,6 +16,9 @@ import os
 from datetime import datetime, timedelta
 from typing import Dict, Tuple, Optional, List
 
+# Module-level lazy import cache for VIX function
+_fetch_real_vix_fn = None
+
 
 class RiskManager:
     """Advanced Risk Management System"""
@@ -112,9 +115,14 @@ class RiskManager:
         Note: Angel One API doesn't support India VIX LTP fetch.
         Using estimation from helpers module instead.
         """
-        # Use VIX estimation from helpers (based on price volatility)
-        from utils.helpers import fetch_real_vix
-        estimated_vix = fetch_real_vix()
+        global _fetch_real_vix_fn
+        
+        # Lazy import with caching (avoids import on every call)
+        if _fetch_real_vix_fn is None:
+            from utils.helpers import fetch_real_vix
+            _fetch_real_vix_fn = fetch_real_vix
+        
+        estimated_vix = _fetch_real_vix_fn()
         
         if estimated_vix and 5 <= estimated_vix <= 100:
             self.vix_value = estimated_vix
@@ -628,6 +636,13 @@ class RiskManager:
 # ==================== SINGLETON & LEGACY FUNCTIONS ====================
 
 _risk_manager = None
+
+def set_risk_manager(rm: RiskManager):
+    """Set the global risk manager instance (call after initialization)"""
+    global _risk_manager
+    _risk_manager = rm
+    return _risk_manager
+
 
 def get_risk_manager(config: Dict = None, logger=None) -> RiskManager:
     """Get or create risk manager singleton"""

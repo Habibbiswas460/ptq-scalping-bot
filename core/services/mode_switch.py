@@ -6,8 +6,12 @@ Professional prop-style trading control
 
 from datetime import datetime
 from typing import Dict, List, Tuple
+import threading
 
-from config.constants import CONFIG
+from config.constants import CONFIG, MAX_DAILY_LOSS_AMOUNT
+
+# Thread lock for mode state
+_mode_lock = threading.Lock()
 
 
 # =============================================================================
@@ -37,7 +41,7 @@ if PAPER_TRADING:
         'gamma_normal_max': 0.15,
         'gamma_expiry_max': 0.20,
         'theta_sec_limit': 0.35,
-        'spread_limit_pct': 1.0,      # Relaxed for paper
+        'spread_limit_pct': 2.5,      # Relaxed for paper - options can have wide spreads
         'chop_threshold': 0.00005,
     }
     
@@ -48,7 +52,7 @@ if PAPER_TRADING:
         'gamma_normal_max': 0.12,
         'gamma_expiry_max': 0.18,
         'theta_sec_limit': 0.30,
-        'spread_limit_pct': 0.8,      # Relaxed for paper
+        'spread_limit_pct': 2.0,      # Relaxed for paper
         'chop_threshold': 0.0001,
     }
 else:
@@ -60,7 +64,7 @@ else:
         'gamma_normal_max': 0.10,
         'gamma_expiry_max': 0.15,
         'theta_sec_limit': 0.25,
-        'spread_limit_pct': 0.5,
+        'spread_limit_pct': 1.5,      # Live trading needs tighter spreads
         'chop_threshold': 0.0001,
     }
 
@@ -71,7 +75,7 @@ else:
         'gamma_normal_max': 0.07,
         'gamma_expiry_max': 0.10,
         'theta_sec_limit': 0.15,
-        'spread_limit_pct': 0.3,
+        'spread_limit_pct': 1.0,      # Tight spread in safe mode
         'chop_threshold': 0.00015,
     }
 
@@ -95,8 +99,9 @@ VOLUME_RECOVERY_THRESHOLD = 1.1       # avg ratio >= 1.1
 RANGE_RECOVERY_THRESHOLD = 0.0004     # range > 0.04%
 THETA_RECOVERY_THRESHOLD = 0.20       # theta/sec < 0.20
 
-# Lockdown trigger
-LOCKDOWN_LOSS_THRESHOLD = -700        # Daily PnL <= -700 = lockdown
+# Lockdown trigger - use 90% of MAX_DAILY_LOSS from settings
+# Only lockdown when approaching the user's configured limit
+LOCKDOWN_LOSS_THRESHOLD = -MAX_DAILY_LOSS_AMOUNT * 0.9  # e.g., -2700 for ₹3000 max
 
 
 # =============================================================================
@@ -127,9 +132,13 @@ class ModeState:
             self.recent_ranges.pop(0)
     
     def avg_volume_ratio(self) -> float:
-        """Get average of last 10 volume ratios"""
+        """Get average of last 10 volume ratios
+        
+        BUG FIX #17: Return None-like value (0.0) when no data
+        This prevents false assumptions about volume being 'normal'
+        """
         if not self.recent_volume_ratios:
-            return 1.0
+            return 0.0  # No data = assume low volume, not normal
         return sum(self.recent_volume_ratios) / len(self.recent_volume_ratios)
     
     def avg_range(self) -> float:
@@ -184,8 +193,9 @@ def should_go_safe(tick: Dict, greeks: Dict, day_type: str, daily_pnl: float) ->
         return True, f"Consecutive losses: {_mode_state.consecutive_losses}"
     
     # 2. Volume deterioration
+    # BUG FIX #17 update: Skip check if no volume data yet (avg=0 means no data collected)
     avg_vol = _mode_state.avg_volume_ratio()
-    if avg_vol < VOLUME_DETERIORATION_THRESHOLD:
+    if avg_vol > 0 and avg_vol < VOLUME_DETERIORATION_THRESHOLD:
         return True, f"Volume deterioration: {avg_vol:.2f}"
     
     # 3. Chop detection (price compression)
@@ -279,59 +289,60 @@ def update_trading_mode(tick: Dict, greeks: Dict, day_type: str,
     """
     global _current_mode, active_thresholds, _mode_state
     
-    # Update tracking data
-    if recent_ticks and len(recent_ticks) >= 10:
-        # Calculate volume ratio
-        current_vol = tick.get('volume', 0)
-        recent_vols = [t.get('volume', 0) for t in recent_ticks[-60:]]
-        avg_vol = sum(recent_vols) / len(recent_vols) if recent_vols else 1
-        if avg_vol > 0:
-            _mode_state.add_volume_ratio(current_vol / avg_vol)
+    with _mode_lock:
+        # Update rolling observations
+        if recent_ticks and len(recent_ticks) > 5:
+            # Calculate volume ratio
+            current_vol = tick.get('volume', 0)
+            recent_vols = [t.get('volume', 0) for t in recent_ticks[-60:]]
+            avg_vol = sum(recent_vols) / len(recent_vols) if recent_vols else 1
+            if avg_vol > 0:
+                _mode_state.add_volume_ratio(current_vol / avg_vol)
+            
+            # Calculate price range
+            prices = [t.get('ltp', 0) for t in recent_ticks[-60:]]
+            if prices:
+                _mode_state.add_range(max(prices) - min(prices))
         
-        # Calculate price range
-        prices = [t.get('ltp', 0) for t in recent_ticks[-60:]]
-        if prices:
-            _mode_state.add_range(max(prices) - min(prices))
-    
-    # Check switch cooldown
-    if not _mode_state.can_switch():
-        return _current_mode
-    
-    old_mode = _current_mode
-    
-    # Priority 1: Check for LOCKDOWN
-    lockdown, lockdown_reason = should_lockdown(daily_pnl)
-    if lockdown and _current_mode != MODE_LOCKDOWN:
-        _current_mode = MODE_LOCKDOWN
-        _mode_state.record_switch(MODE_LOCKDOWN)
-        _log_mode_switch(old_mode, MODE_LOCKDOWN, lockdown_reason)
-        return _current_mode
-    
-    # Already in lockdown - stay there
-    if _current_mode == MODE_LOCKDOWN:
-        return _current_mode
-    
-    # Priority 2: Check for SAFE
-    if _current_mode == MODE_AGGRESSIVE:
-        go_safe, safe_reason = should_go_safe(tick, greeks, day_type, daily_pnl)
-        if go_safe:
-            _current_mode = MODE_SAFE
-            active_thresholds = SAFE_THRESHOLDS.copy()
-            _mode_state.record_switch(MODE_SAFE)
-            _log_mode_switch(old_mode, MODE_SAFE, safe_reason)
+        # Check switch cooldown
+        if not _mode_state.can_switch():
             return _current_mode
-    
-    # Priority 3: Check for AGGRESSIVE
-    if _current_mode == MODE_SAFE:
-        go_aggressive, agg_reason = should_go_aggressive(tick, greeks, day_type, daily_pnl)
-        if go_aggressive:
-            _current_mode = MODE_AGGRESSIVE
-            active_thresholds = AGGRESSIVE_THRESHOLDS.copy()
-            _mode_state.record_switch(MODE_AGGRESSIVE)
-            _log_mode_switch(old_mode, MODE_AGGRESSIVE, agg_reason)
+        
+        old_mode = _current_mode
+        
+        # Priority 1: Check for LOCKDOWN
+        lockdown, lockdown_reason = should_lockdown(daily_pnl)
+        if lockdown and _current_mode != MODE_LOCKDOWN:
+            _current_mode = MODE_LOCKDOWN
+            _mode_state.record_switch(MODE_LOCKDOWN)
+            _log_mode_switch(old_mode, MODE_LOCKDOWN, lockdown_reason)
             return _current_mode
-    
-    return _current_mode
+        
+        # Already in lockdown - stay there
+        if _current_mode == MODE_LOCKDOWN:
+            return _current_mode
+        
+        # Priority 2: Check for SAFE
+        if _current_mode == MODE_AGGRESSIVE:
+            go_safe, safe_reason = should_go_safe(tick, greeks, day_type, daily_pnl)
+            if go_safe:
+                _current_mode = MODE_SAFE
+                active_thresholds = SAFE_THRESHOLDS.copy()
+                _mode_state.record_switch(MODE_SAFE)
+                _log_mode_switch(old_mode, MODE_SAFE, safe_reason)
+                return _current_mode
+        
+        # Priority 3: Check for AGGRESSIVE
+        if _current_mode == MODE_SAFE:
+            go_aggressive, agg_reason = should_go_aggressive(tick, greeks, day_type, daily_pnl)
+            if go_aggressive:
+                _current_mode = MODE_AGGRESSIVE
+                active_thresholds = AGGRESSIVE_THRESHOLDS.copy()
+                _mode_state.record_switch(MODE_AGGRESSIVE)
+                _log_mode_switch(old_mode, MODE_AGGRESSIVE, agg_reason)
+                return _current_mode
+        
+        return _current_mode
 
 
 def _log_mode_switch(old_mode: str, new_mode: str, reason: str):
@@ -361,16 +372,17 @@ def get_threshold(key: str) -> float:
 
 def record_trade_result(is_win: bool):
     """Record trade result for mode switching logic"""
-    global _mode_state
-    _mode_state.record_trade_result(is_win)
+    with _mode_lock:
+        _mode_state.record_trade_result(is_win)
 
 
 def reset_mode():
     """Reset to aggressive mode (for new day)"""
     global _current_mode, active_thresholds, _mode_state
-    _current_mode = MODE_AGGRESSIVE
-    active_thresholds = AGGRESSIVE_THRESHOLDS.copy()
-    _mode_state = ModeState()
+    with _mode_lock:
+        _current_mode = MODE_AGGRESSIVE
+        active_thresholds = AGGRESSIVE_THRESHOLDS.copy()
+        _mode_state = ModeState()
 
 
 def is_entries_allowed() -> bool:

@@ -80,8 +80,11 @@ class GreeksCalculator:
             volatility = 0.15  # Default 15% IV
         
         if spot_price <= 0 or strike_price <= 0:
+            # Return sensible defaults based on option type
+            # CE delta positive (~0.5 ATM), PE delta negative (~-0.5 ATM)
+            default_delta = 0.5 if option_type == 'CE' else -0.5
             return {
-                'delta': 0.5,
+                'delta': default_delta,
                 'gamma': 0.001,
                 'theta': -50.0,
                 'vega': 5.0,

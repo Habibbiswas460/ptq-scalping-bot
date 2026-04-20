@@ -1,6 +1,6 @@
 """
 PTQ Scalping Bot - Entry Signal Engine
-SMART SCALP v3.0 - Multi-Factor Scoring System
+SMART SCALP v3.4 - Multi-Factor Scoring System
 """
 
 from typing import Dict, Tuple, List
@@ -15,15 +15,19 @@ from core.risk.session_trend import (
     start_trading_session, update_market_price, 
     can_trade_ce, can_trade_pe, get_trend_display
 )
+from config.constants import (
+    MIN_CONFIDENCE, MIN_CONFIDENCE_AFTER_3SL,
+    MIN_ENTRY_PREMIUM, MAX_ENTRY_PREMIUM
+)
 
-# Import SMART SCALP v3.0 Strategy
+# Import SMART SCALP v3.4 Strategy
 try:
     from strategies.smart_scalp_v3 import smart_scalp_signal, get_strategy
     HAS_SMART_SCALP = True
 except ImportError:
     HAS_SMART_SCALP = False
     import logging
-    logging.warning("⚠️ SMART SCALP v3.0 not available, falling back to PTQ")
+    logging.warning("⚠️ SMART SCALP v3.4 not available, falling back to PTQ")
 
 
 # Track recent ticks for analysis
@@ -35,17 +39,17 @@ last_signal_params = {}
 
 def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str, instrument_type: str = "") -> Tuple[bool, str]:
     """
-    Entry Signal Generator - SMART SCALP v3.0 + Session Trend + PTQ validation
+    Entry Signal Generator - SMART SCALP v3.4 + Session Trend + PTQ validation
     
     Uses multi-factor scoring system:
-    - 10 bullish factors + 10 bearish factors
-    - Requires 4+ score and 55%+ confidence
-    - Dynamic SL/TP based on ATR and confidence
+    - 9 bullish factors + 9 bearish factors
+    - Requires 4+ score and 70%+ confidence
+    - Fixed SL 6pts / TP 12pts (R:R 1:2)
     
     Session Trend Logic:
     - If price > opening: BULLISH (CE allowed)
     - If price < opening: BEARISH (PE allowed)
-    - If price ≈ opening: SIDEWAYS (no trade)
+    - If price ≈ opening: SIDEWAYS (both allowed v3.3)
     """
     global last_signal_params
     
@@ -65,14 +69,45 @@ def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str, instrument
         if should_enter:
             # Get instrument type from strategy params
             instrument = params.get('direction', 'CE')
+            confidence = params.get('confidence', 0)
             
-            # Check session trend gate
+            # ═══════════════════════════════════════════════════════════════
+            # CONFIDENCE FILTER (v3.4) - Minimum 70%, 85% after 3 consecutive SL
+            # ═══════════════════════════════════════════════════════════════
+            try:
+                from core.engines.state_machine import trading_state
+                consecutive_losses = trading_state.consecutive_losses
+            except:
+                consecutive_losses = 0
+            
+            # After 3 consecutive SL, require higher confidence
+            required_conf = MIN_CONFIDENCE_AFTER_3SL if consecutive_losses >= 3 else MIN_CONFIDENCE
+            
+            if confidence < required_conf:
+                if consecutive_losses >= 3:
+                    return False, f"Low conf {confidence}% < {required_conf}% (3+ SL streak)"
+                return False, f"Low confidence {confidence}% < {required_conf}%"
+            
+            # ═══════════════════════════════════════════════════════════════
+            # ENTRY PRICE FILTER (v3.1) - ATM nearby ₹90-150 range
+            # ═══════════════════════════════════════════════════════════════
+            current_premium = tick.get('ltp', 0)
+            if current_premium < MIN_ENTRY_PREMIUM:
+                return False, f"Premium too low ₹{current_premium:.0f} < ₹{MIN_ENTRY_PREMIUM:.0f}"
+            if current_premium > MAX_ENTRY_PREMIUM:
+                return False, f"Premium too high ₹{current_premium:.0f} > ₹{MAX_ENTRY_PREMIUM:.0f}"
+            
+            # Get RSI from strategy details for reversal detection
+            details = params.get('details', {})
+            rsi = details.get('rsi', 50)
+            
+            # Check session trend gate (now with RSI for reversal trades)
             if instrument == 'CE':
-                ce_ok, ce_msg = can_trade_ce()
+                ce_ok, ce_msg = can_trade_ce(rsi)
                 if not ce_ok:
                     return False, f"{ce_msg}"
             else:  # PE
-                pe_ok, pe_msg = can_trade_pe()
+                pe_ok, pe_msg = can_trade_pe(rsi)
                 if not pe_ok:
                     return False, f"{pe_msg}"
             
@@ -106,12 +141,17 @@ def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str, instrument
 
 def _calculate_greeks(tick: Dict) -> Dict:
     """Calculate Greeks for validation (uses smart caching for optimization)"""
-    current_price = tick['ltp']
-    strike = round(current_price / 50) * 50
+    option_price = tick['ltp']
+    # BUG FIX: Use NIFTY spot price (~23000), not option premium (~200)
+    spot_price = tick.get('spot_price', 0)
+    if spot_price < 10000:  # Fallback if spot_price missing
+        spot_price = option_price * 100  # Rough estimate
+    
+    strike = round(spot_price / 50) * 50  # ATM strike from spot
     
     # Use cached Greeks calculation (5-sec TTL + 1% spot move invalidation)
     return GreeksCalculator.calculate_cached(
-        spot_price=current_price,
+        spot_price=spot_price,
         strike_price=strike,
         time_to_expiry=7/365.0,
         volatility=0.15,
@@ -177,14 +217,17 @@ def get_signal_direction() -> str:
 
 def get_signal_quantity() -> int:
     """Get quantity from last signal"""
-    return last_signal_params.get('quantity', 260)
+    from config.constants import CE_QUANTITY
+    return last_signal_params.get('quantity', CE_QUANTITY)
 
 
 def get_signal_sl_points() -> float:
     """Get SL points from last signal"""
-    return last_signal_params.get('sl_points', 9)
+    from config.constants import SL_POINTS_FIXED
+    return last_signal_params.get('sl_points', SL_POINTS_FIXED)
 
 
 def get_signal_tp_points() -> float:
     """Get TP points from last signal"""
-    return last_signal_params.get('tp_points', 18)
+    from config.constants import TP_POINTS_FIXED
+    return last_signal_params.get('tp_points', TP_POINTS_FIXED)

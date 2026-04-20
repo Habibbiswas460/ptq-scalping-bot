@@ -28,14 +28,20 @@ class TradeAnalytics:
             return []
         
         trades = []
+        parse_errors = 0
         with open(trades_file, 'r') as f:
-            for line in f:
+            for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if line:
                     try:
                         trades.append(json.loads(line))
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as e:
+                        parse_errors += 1
+                        if parse_errors <= 3:  # Log first 3 errors only
+                            print(f"[WARN] JSON parse error in {trades_file} line {line_num}: {e}")
                         continue
+        if parse_errors > 3:
+            print(f"[WARN] {parse_errors} total JSON parse errors in {trades_file}")
         return trades
     
     def get_paired_trades(self, trades: List[Dict]) -> List[Dict]:
@@ -425,5 +431,222 @@ def analyze_today():
     return analytics
 
 
+def analyze_period(days: int = 7):
+    """Analyze trades over multiple days"""
+    analytics = TradeAnalytics()
+    
+    # Collect trades from multiple days
+    all_trades = []
+    dates_analyzed = []
+    
+    for i in range(days):
+        date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        trades = analytics.load_trades(date)
+        if trades:
+            paired = analytics.get_paired_trades(trades)
+            all_trades.extend(paired)
+            dates_analyzed.append(date)
+    
+    if not all_trades:
+        print(f"📊 No trades found in the last {days} days")
+        return None
+    
+    # Calculate aggregate metrics
+    metrics = analytics.calculate_metrics(all_trades)
+    
+    # Print summary
+    print("=" * 70)
+    print(f"📊 PTQ SCALPING BOT - {days}-DAY ANALYSIS")
+    print(f"📅 Period: {dates_analyzed[-1]} to {dates_analyzed[0]}")
+    print(f"📆 Days with trades: {len(dates_analyzed)}")
+    print("=" * 70)
+    print("")
+    
+    s = metrics['summary']
+    p = metrics['pnl']
+    
+    print("📈 PERFORMANCE SUMMARY")
+    print("-" * 40)
+    print(f"Total Trades:      {s['total_trades']}")
+    print(f"Win Rate:          {s['win_rate']}%")
+    print(f"Total PnL:         ₹{p['total_pnl']:+,.2f}")
+    print(f"Avg PnL/Day:       ₹{p['total_pnl']/len(dates_analyzed):+,.2f}")
+    print(f"Profit Factor:     {s['profit_factor']}")
+    print(f"Max Drawdown:      ₹{p['max_drawdown']:,.2f}")
+    print("")
+    
+    # Best/Worst hours
+    hourly = metrics['hourly_pnl']
+    if hourly:
+        print("📊 BEST & WORST TRADING HOURS")
+        print("-" * 40)
+        sorted_hours = sorted(hourly.items(), key=lambda x: x[1]['pnl'], reverse=True)
+        if sorted_hours:
+            best = sorted_hours[0]
+            worst = sorted_hours[-1]
+            print(f"Best Hour:   {best[0]}:00 - PnL: ₹{best[1]['pnl']:+,.2f} ({best[1]['win_rate']}% win rate, {best[1]['trades']} trades)")
+            print(f"Worst Hour:  {worst[0]}:00 - PnL: ₹{worst[1]['pnl']:+,.2f} ({worst[1]['win_rate']}% win rate, {worst[1]['trades']} trades)")
+        print("")
+    
+    # Exit reason breakdown
+    print("🚪 EXIT REASONS")
+    print("-" * 40)
+    for reason, count in sorted(metrics['exit_reasons'].items(), key=lambda x: -x[1]):
+        pct = count / s['total_trades'] * 100 if s['total_trades'] > 0 else 0
+        print(f"  {reason:20} {count:3} ({pct:.1f}%)")
+    print("")
+    
+    return metrics
+
+
+def analyze_weekly():
+    """Analyze last 7 days of trading"""
+    return analyze_period(7)
+
+
+def analyze_monthly():
+    """Analyze last 30 days of trading"""
+    return analyze_period(30)
+
+
+def get_best_worst_hours(days: int = 30) -> Dict[str, Any]:
+    """Find the best and worst trading hours based on historical data"""
+    analytics = TradeAnalytics()
+    
+    # Collect all hourly data
+    all_hourly = defaultdict(lambda: {'trades': 0, 'pnl': 0, 'wins': 0, 'losses': 0})
+    
+    for i in range(days):
+        date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        trades = analytics.load_trades(date)
+        if trades:
+            paired = analytics.get_paired_trades(trades)
+            for trade in paired:
+                try:
+                    hour = trade['entry_time'].split(' ')[1].split(':')[0]
+                    all_hourly[hour]['trades'] += 1
+                    all_hourly[hour]['pnl'] += trade['pnl']
+                    if trade['pnl'] > 0:
+                        all_hourly[hour]['wins'] += 1
+                    elif trade['pnl'] < 0:
+                        all_hourly[hour]['losses'] += 1
+                except:
+                    continue
+    
+    # Calculate win rates
+    result = {}
+    for hour in all_hourly:
+        total = all_hourly[hour]['trades']
+        wins = all_hourly[hour]['wins']
+        all_hourly[hour]['win_rate'] = round(wins / total * 100, 1) if total > 0 else 0
+        all_hourly[hour]['avg_pnl'] = round(all_hourly[hour]['pnl'] / total, 2) if total > 0 else 0
+        result[hour] = dict(all_hourly[hour])
+    
+    # Sort by profitability
+    sorted_hours = sorted(result.items(), key=lambda x: x[1]['pnl'], reverse=True)
+    
+    return {
+        'hourly_stats': result,
+        'best_hours': sorted_hours[:3] if len(sorted_hours) >= 3 else sorted_hours,
+        'worst_hours': sorted_hours[-3:] if len(sorted_hours) >= 3 else sorted_hours[::-1]
+    }
+
+
+def print_trading_calendar(days: int = 30):
+    """Print a calendar view of trading days with PnL"""
+    analytics = TradeAnalytics()
+    
+    print("=" * 70)
+    print("📅 TRADING CALENDAR")
+    print("=" * 70)
+    print(f"{'Date':<12} {'Trades':>8} {'Wins':>6} {'Win%':>8} {'PnL':>12} {'Status'}")
+    print("-" * 70)
+    
+    total_pnl = 0
+    trading_days = 0
+    winning_days = 0
+    
+    for i in range(days - 1, -1, -1):  # Oldest to newest
+        date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+        trades = analytics.load_trades(date)
+        
+        if trades:
+            paired = analytics.get_paired_trades(trades)
+            if paired:
+                trading_days += 1
+                day_pnl = sum(t['pnl'] for t in paired)
+                total_pnl += day_pnl
+                wins = len([t for t in paired if t['pnl'] > 0])
+                win_rate = wins / len(paired) * 100 if paired else 0
+                
+                if day_pnl > 0:
+                    winning_days += 1
+                    status = "🟢 PROFIT"
+                elif day_pnl < 0:
+                    status = "🔴 LOSS"
+                else:
+                    status = "⚪ EVEN"
+                
+                print(f"{date:<12} {len(paired):>8} {wins:>6} {win_rate:>7.1f}% {day_pnl:>+11.2f} {status}")
+    
+    print("-" * 70)
+    day_win_rate = winning_days / trading_days * 100 if trading_days > 0 else 0
+    print(f"{'TOTAL':<12} {trading_days:>8} days {winning_days:>6} win  {day_win_rate:>6.1f}% {total_pnl:>+11.2f}")
+    print("=" * 70)
+
+
+def interactive_analytics():
+    """Interactive analytics menu"""
+    while True:
+        print("")
+        print("=" * 50)
+        print("📊 PTQ ANALYTICS MENU")
+        print("=" * 50)
+        print("  1. Today's Report")
+        print("  2. Weekly Analysis (7 days)")
+        print("  3. Monthly Analysis (30 days)")
+        print("  4. Trading Calendar")
+        print("  5. Best/Worst Hours")
+        print("  6. Exit & Return")
+        print("-" * 50)
+        
+        choice = input("Select option (1-6): ").strip()
+        
+        if choice == '1':
+            analyze_today()
+        elif choice == '2':
+            analyze_weekly()
+        elif choice == '3':
+            analyze_monthly()
+        elif choice == '4':
+            print_trading_calendar()
+        elif choice == '5':
+            hours_data = get_best_worst_hours()
+            print("\n📊 BEST TRADING HOURS (by total PnL):")
+            for hour, stats in hours_data['best_hours']:
+                print(f"  {hour}:00 - {stats['trades']} trades, ₹{stats['pnl']:+,.2f} PnL, {stats['win_rate']}% win rate")
+            print("\n📊 WORST TRADING HOURS (by total PnL):")
+            for hour, stats in hours_data['worst_hours']:
+                print(f"  {hour}:00 - {stats['trades']} trades, ₹{stats['pnl']:+,.2f} PnL, {stats['win_rate']}% win rate")
+        elif choice == '6':
+            print("Returning...")
+            break
+        else:
+            print("Invalid option!")
+
+
 if __name__ == "__main__":
-    analyze_today()
+    import sys
+    if len(sys.argv) > 1:
+        if sys.argv[1] == '--weekly':
+            analyze_weekly()
+        elif sys.argv[1] == '--monthly':
+            analyze_monthly()
+        elif sys.argv[1] == '--calendar':
+            print_trading_calendar()
+        elif sys.argv[1] == '--interactive':
+            interactive_analytics()
+        else:
+            analyze_today()
+    else:
+        analyze_today()

@@ -56,6 +56,8 @@ class TelegramBot:
             'signals': self._cb_signals,
             'refresh': self._cb_refresh,
             'help': self._cb_help,
+            'analytics': self._cb_analytics,
+            'ws_status': self._cb_ws_status,
         }
 
         # Command handlers (text commands)
@@ -69,6 +71,8 @@ class TelegramBot:
             '/stop': self._cmd_stop,
             '/resume': self._cmd_resume,
             '/help': self._cmd_help,
+            '/analytics': self._cmd_analytics,
+            '/ws': self._cmd_ws_status,
         }
 
     def set_state_reference(self, state, broker=None):
@@ -461,9 +465,93 @@ class TelegramBot:
             "  /logs — toggle live logs\n"
             "  /stop — stop trading\n"
             "  /resume — resume trading\n"
+            "  /analytics — 7-day summary\n"
+            "  /ws — WebSocket status\n"
             "  /help — this help\n"
         )
         await self._answer_callback(callback_id)
+        await self._edit_msg(msg_id, text, reply_markup=self._back_keyboard())
+
+    async def _cb_analytics(self, callback_id: str, msg_id: int):
+        """Show analytics in callback"""
+        await self._answer_callback(callback_id, "📊 Loading analytics...")
+        try:
+            from utils.analytics import TradeAnalytics
+            from datetime import datetime, timedelta
+            
+            analytics = TradeAnalytics()
+            total_pnl = 0
+            total_trades = 0
+            total_wins = 0
+            days_with_data = 0
+            
+            for i in range(7):
+                date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+                trades = analytics.load_trades(date)
+                if trades:
+                    paired = analytics.get_paired_trades(trades)
+                    if paired:
+                        days_with_data += 1
+                        total_trades += len(paired)
+                        total_pnl += sum(t['pnl'] for t in paired)
+                        total_wins += len([t for t in paired if t['pnl'] > 0])
+            
+            win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
+            avg_pnl = total_pnl / days_with_data if days_with_data > 0 else 0
+            
+            emoji = "📈" if total_pnl > 0 else "📉"
+            
+            text = (
+                f"{emoji} <b>7-DAY ANALYTICS</b>\n"
+                f"{'━'*25}\n"
+                f"  Total P&L: <code>₹{total_pnl:+,.2f}</code>\n"
+                f"  Avg/Day: <code>₹{avg_pnl:+,.2f}</code>\n"
+                f"  Trades: <code>{total_trades}</code>\n"
+                f"  Win Rate: <code>{win_rate:.1f}%</code>\n"
+                f"  Trading Days: <code>{days_with_data}/7</code>\n"
+            )
+        except Exception as e:
+            text = f"❌ Analytics error: {str(e)[:100]}"
+        
+        await self._edit_msg(msg_id, text, reply_markup=self._back_keyboard())
+
+    async def _cb_ws_status(self, callback_id: str, msg_id: int):
+        """Show WebSocket status in callback"""
+        await self._answer_callback(callback_id, "🔌 Checking...")
+        
+        if not self.broker:
+            text = "❌ Broker not connected"
+        else:
+            try:
+                if hasattr(self.broker, 'get_ws_status'):
+                    status = self.broker.get_ws_status()
+                    connected = status.get('connected', False)
+                    time_since = status.get('time_since_last_tick')
+                    reconnects = status.get('reconnect_attempts', 0)
+                    circuit_open = status.get('circuit_breaker_open', False)
+                    buffer_size = status.get('tick_buffer_size', 0)
+                    
+                    ws_emoji = "🟢" if connected else "🔴"
+                    circuit_emoji = "⚠️" if circuit_open else "✓"
+                    
+                    time_text = f"<code>{time_since:.1f}s ago</code>" if time_since else "<code>N/A</code>"
+                    
+                    text = (
+                        f"🔌 <b>WEBSOCKET STATUS</b>\n"
+                        f"{'━'*25}\n"
+                        f"  Status: {ws_emoji} {'Connected' if connected else 'Disconnected'}\n"
+                        f"  Last tick: {time_text}\n"
+                        f"  Reconnects: <code>{reconnects}</code>\n"
+                        f"  Circuit: {circuit_emoji} {'OPEN' if circuit_open else 'Closed'}\n"
+                        f"  Buffer: <code>{buffer_size}</code> ticks\n"
+                    )
+                else:
+                    ws_connected = getattr(self.broker, '_ws_connected', False)
+                    ws_emoji = "🟢" if ws_connected else "🔴"
+                    text = f"🔌 WebSocket: {ws_emoji} {'Connected' if ws_connected else 'Disconnected'}"
+            except Exception as e:
+                text = f"❌ Error: {str(e)[:100]}"
+        
         await self._edit_msg(msg_id, text, reply_markup=self._back_keyboard())
 
     # ═══════════════════════════════════════════
@@ -521,9 +609,86 @@ class TelegramBot:
             "<b>🤖 PTQ SCALP BOT</b>\n\n"
             "Type /dash to open the interactive dashboard.\n\n"
             "<b>Quick commands:</b>\n"
-            "/status /pnl /trades /logs /stop /resume"
+            "/status /pnl /trades /logs /stop /resume\n"
+            "/analytics /ws"
         )
         await self._send_msg(text)
+
+    async def _cmd_analytics(self, chat_id: str):
+        """Show weekly analytics summary"""
+        try:
+            from utils.analytics import TradeAnalytics
+            from datetime import datetime, timedelta
+            
+            analytics = TradeAnalytics()
+            total_pnl = 0
+            total_trades = 0
+            total_wins = 0
+            days_with_data = 0
+            
+            for i in range(7):
+                date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+                trades = analytics.load_trades(date)
+                if trades:
+                    paired = analytics.get_paired_trades(trades)
+                    if paired:
+                        days_with_data += 1
+                        total_trades += len(paired)
+                        total_pnl += sum(t['pnl'] for t in paired)
+                        total_wins += len([t for t in paired if t['pnl'] > 0])
+            
+            win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
+            avg_pnl = total_pnl / days_with_data if days_with_data > 0 else 0
+            
+            emoji = "📈" if total_pnl > 0 else "📉"
+            
+            text = (
+                f"{emoji} <b>7-DAY ANALYTICS</b>\n"
+                f"{'━'*25}\n"
+                f"  Total P&L: <code>₹{total_pnl:+,.2f}</code>\n"
+                f"  Avg/Day: <code>₹{avg_pnl:+,.2f}</code>\n"
+                f"  Trades: <code>{total_trades}</code>\n"
+                f"  Win Rate: <code>{win_rate:.1f}%</code>\n"
+                f"  Trading Days: <code>{days_with_data}/7</code>\n"
+            )
+            await self._send_msg(text)
+        except Exception as e:
+            await self._send_msg(f"❌ Analytics error: {str(e)[:100]}")
+
+    async def _cmd_ws_status(self, chat_id: str):
+        """Show WebSocket connection status"""
+        if not self.broker:
+            await self._send_msg("❌ Broker not connected")
+            return
+        
+        try:
+            if hasattr(self.broker, 'get_ws_status'):
+                status = self.broker.get_ws_status()
+                connected = status.get('connected', False)
+                time_since = status.get('time_since_last_tick')
+                reconnects = status.get('reconnect_attempts', 0)
+                circuit_open = status.get('circuit_breaker_open', False)
+                
+                ws_emoji = "🟢" if connected else "🔴"
+                circuit_emoji = "⚠️" if circuit_open else "✓"
+                
+                text = (
+                    f"🔌 <b>WEBSOCKET STATUS</b>\n"
+                    f"{'━'*25}\n"
+                    f"  Status: {ws_emoji} {'Connected' if connected else 'Disconnected'}\n"
+                    f"  Last tick: <code>{time_since:.1f}s ago</code>\n" if time_since else
+                    f"  Last tick: <code>N/A</code>\n"
+                    f"  Reconnects: <code>{reconnects}</code>\n"
+                    f"  Circuit: {circuit_emoji} {'OPEN' if circuit_open else 'Closed'}\n"
+                )
+            else:
+                ws_connected = getattr(self.broker, '_ws_connected', False)
+                ws_emoji = "🟢" if ws_connected else "🔴"
+                text = f"🔌 WebSocket: {ws_emoji} {'Connected' if ws_connected else 'Disconnected'}"
+            
+            await self._send_msg(text)
+        except Exception as e:
+            await self._send_msg(f"❌ Error: {str(e)[:100]}")
 
     # ═══════════════════════════════════════════
     # NOTIFICATION METHODS (auto-sent by bot)
@@ -825,6 +990,11 @@ def get_telegram() -> Optional[TelegramBot]:
 def send_telegram(message: str):
     if _telegram_bot:
         _telegram_bot.send_message(message)
+
+def send_alert(message: str):
+    """Send urgent alert via Telegram (used by kill_switch, broker, state_machine)"""
+    if _telegram_bot:
+        _telegram_bot.send_message(f"🚨 {message}")
 
 def notify_entry(trade: Dict):
     if _telegram_bot:

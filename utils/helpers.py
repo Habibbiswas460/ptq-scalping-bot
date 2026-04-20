@@ -137,14 +137,29 @@ def set_vix_broker_client(broker_client):
 def fetch_real_vix() -> float:
     """Fetch real India VIX from Angel One API
     
-    Note: Angel One API doesn't seem to support VIX LTP fetch.
-    Using estimation from price volatility instead.
+    India VIX Token: 999920005 on NSE
     """
     global _vix_cache
     from datetime import datetime
     
-    # Return cached value - VIX API not working, skip fetching
-    # Real VIX fetch is disabled due to Angel One API limitations
+    # Check if we have broker client and cache is stale (> 60 seconds)
+    broker_client = _vix_cache.get('broker_client')
+    last_fetch = _vix_cache.get('last_fetch')
+    
+    # Try to fetch real VIX if cache is stale
+    if broker_client:
+        try:
+            now = datetime.now()
+            if last_fetch is None or (now - last_fetch).total_seconds() > 60:
+                # India VIX token on NSE
+                vix_ltp = broker_client.get_ltp("NSE", "INDIAVIX", "999920005")
+                if vix_ltp and 5 <= vix_ltp <= 100:  # Valid VIX range
+                    _vix_cache['value'] = vix_ltp
+                    _vix_cache['last_fetch'] = now
+                    return vix_ltp
+        except Exception:
+            pass  # Fall back to cached value
+    
     return _vix_cache['value']
 
 
@@ -152,26 +167,35 @@ def estimate_vix_from_ticks(ticks: list, current_vix: float = 15.0) -> float:
     """
     Calculate VIX from price volatility (optimized)
     Real VIX API disabled - using price-based estimation only
+    BUG FIX: Use NIFTY spot_price, not option LTP
     """
     if len(ticks) < 30:
         return current_vix
     
-    prices = [t['ltp'] for t in ticks[-30:]]
+    # Use spot_price (NIFTY ~23000) not option LTP (~200)
+    prices = [t.get('spot_price', t['ltp']) for t in ticks[-30:]]
+    # Skip if prices look like option premiums (< 1000)
+    if prices and prices[-1] < 1000:
+        return current_vix
+    
     returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
     
     if not returns:
         return current_vix
     
     import statistics
+    import math
     vol = statistics.stdev(returns) if len(returns) > 1 else 0
-    estimated_vix = vol * 100 * 14.5  # Optimized scaling for NIFTY
+    # BUG FIX #7: Correct annualization factor is sqrt(252) ≈ 15.87 (not 14.5)
+    # VIX = daily_stdev * sqrt(252_trading_days) * 100
+    estimated_vix = vol * math.sqrt(252) * 100
     
     # Dynamic adjustment: recent extreme moves increase VIX
     recent_moves = [abs(r) for r in returns[-5:]]
     if recent_moves and max(recent_moves) > 0.01:
         estimated_vix *= (1 + max(recent_moves) * 2)
     
-    return max(10, min(35, estimated_vix))  # Clamp: 10-35 for NIFTY
+    return max(10, min(40, estimated_vix))  # Clamp: 10-40 for NIFTY
 
 
 def calculate_position_size(estimated_vix: float) -> float:

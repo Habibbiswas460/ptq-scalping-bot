@@ -5,7 +5,7 @@ from core.engines.entry_engine import (
     get_signal_sl_points, get_signal_tp_points,
     MAX_RECENT_TICKS
 )
-from core.engines.exit_engine import check_exit_conditions, get_trailing_sl
+from core.engines.exit_engine import check_exit_conditions, get_step_trailing_sl
 from core.engines.state_machine import (
     trading_state, state_idle, state_entry_ready,
     state_in_trade, state_cooldown

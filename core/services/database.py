@@ -164,11 +164,34 @@ class DatabaseManager:
                 )
             ''')
             
+            # Active positions table (for position recovery on restart)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS active_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id TEXT UNIQUE,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    qty INTEGER NOT NULL,
+                    entry_price REAL NOT NULL,
+                    entry_time TIMESTAMP NOT NULL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    current_price REAL,
+                    unrealized_pnl REAL DEFAULT 0,
+                    session_id TEXT,
+                    broker_order_id TEXT,
+                    last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT DEFAULT 'ACTIVE'
+                )
+            ''')
+            
             # Create indexes for faster queries
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(date(entry_time))')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticks_timestamp ON ticks(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_active_positions_status ON active_positions(status)')
             
             conn.commit()
     
@@ -523,6 +546,115 @@ class DatabaseManager:
             'max_loss_streak': max_loss_streak
         }
 
+    # ==========================================
+    # POSITION RECOVERY OPERATIONS
+    # ==========================================
+    
+    def save_active_position(self, position: Dict) -> int:
+        """Save/update active position for recovery"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO active_positions (
+                    order_id, symbol, direction, side, qty,
+                    entry_price, entry_time, stop_loss, take_profit,
+                    current_price, unrealized_pnl, session_id,
+                    broker_order_id, last_update, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'ACTIVE')
+            ''', (
+                position.get('order_id'),
+                position.get('symbol'),
+                position.get('direction'),
+                position.get('side', 'BUY'),
+                position.get('qty', 1),
+                position.get('entry_price'),
+                position.get('entry_time', datetime.now().isoformat()),
+                position.get('stop_loss'),
+                position.get('take_profit'),
+                position.get('current_price'),
+                position.get('unrealized_pnl', 0),
+                position.get('session_id'),
+                position.get('broker_order_id')
+            ))
+            conn.commit()
+            return cursor.lastrowid
+    
+    def get_active_positions(self) -> List[Dict]:
+        """Get all active positions (for recovery)"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM active_positions 
+                WHERE status = 'ACTIVE'
+                ORDER BY entry_time DESC
+            ''')
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def close_position_in_db(self, order_id: str) -> bool:
+        """Mark a position as closed in the database"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE active_positions 
+                SET status = 'CLOSED', last_update = CURRENT_TIMESTAMP
+                WHERE order_id = ?
+            ''', (order_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+    
+    def check_orphan_positions(self) -> List[Dict]:
+        """
+        Check for orphan positions (positions that weren't properly closed).
+        An orphan is an active position older than current session.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # Consider positions from previous days as potential orphans
+            cursor.execute('''
+                SELECT * FROM active_positions 
+                WHERE status = 'ACTIVE'
+                AND date(entry_time) < date('now')
+                ORDER BY entry_time ASC
+            ''')
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def get_positions_from_last_session(self) -> List[Dict]:
+        """Get positions that may need recovery (today's active positions)"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM active_positions 
+                WHERE status = 'ACTIVE'
+                AND date(entry_time) = ?
+                ORDER BY entry_time DESC
+            ''', (today,))
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def clear_all_active_positions(self) -> int:
+        """Clear all active positions (use with caution)"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE active_positions 
+                SET status = 'CLEARED', last_update = CURRENT_TIMESTAMP
+                WHERE status = 'ACTIVE'
+            ''')
+            conn.commit()
+            return cursor.rowcount
+    
+    def update_position_price(self, order_id: str, current_price: float, unrealized_pnl: float) -> bool:
+        """Update current price and PnL for an active position"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE active_positions 
+                SET current_price = ?, unrealized_pnl = ?, last_update = CURRENT_TIMESTAMP
+                WHERE order_id = ? AND status = 'ACTIVE'
+            ''', (current_price, unrealized_pnl, order_id))
+            conn.commit()
+            return cursor.rowcount > 0
+
 
 # Singleton instance
 db = DatabaseManager()
@@ -546,3 +678,33 @@ def save_state(state: Dict) -> bool:
 
 def load_state() -> Optional[Dict]:
     return db.load_bot_state()
+
+
+# Position recovery convenience functions
+def save_position(position: Dict) -> int:
+    """Save active position for recovery"""
+    return db.save_active_position(position)
+
+def get_active_positions() -> List[Dict]:
+    """Get all active positions"""
+    return db.get_active_positions()
+
+def close_position(order_id: str) -> bool:
+    """Mark position as closed"""
+    return db.close_position_in_db(order_id)
+
+def check_for_orphans() -> List[Dict]:
+    """Check for orphan positions from previous sessions"""
+    return db.check_orphan_positions()
+
+def recover_last_session_positions() -> List[Dict]:
+    """Get positions that may need recovery"""
+    return db.get_positions_from_last_session()
+
+def clear_positions() -> int:
+    """Clear all active positions"""
+    return db.clear_all_active_positions()
+
+def update_position(order_id: str, price: float, pnl: float) -> bool:
+    """Update position price and PnL"""
+    return db.update_position_price(order_id, price, pnl)

@@ -84,5 +84,11 @@ Thumbs.db
 # ─────────────────────────────────────────────────────────────────
 *.bak
 *.tmp
+*.backup
+*.old
+=
+AUDIT_REPORT.md
+FILE_STRUCTURE_GUIDE.md
+april3.md
 test_*.py
 !tests/test_*.py

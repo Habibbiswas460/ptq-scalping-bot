@@ -1,6 +1,6 @@
 """
 PTQ Scalping Bot - Core Module
-SMART SCALP v3.0
+SMART SCALP v3.4
 
 Organized into 4 sub-modules:
 ├── trading/  : Broker connection & order execution
