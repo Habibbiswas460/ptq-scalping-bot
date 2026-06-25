@@ -56,9 +56,17 @@ def is_data_valid(tick: Dict) -> Tuple[bool, str]:
         if spot < min_spot or spot > max_spot:
             return False, f"Invalid spot ₹{spot:.2f} (range: ₹{min_spot}-₹{max_spot})"
     
-    # Timestamp freshness (< 2000ms old - increased tolerance for WebSocket lag)
-    tick_age_ms = current_time_ms() - tick['timestamp']
-    if tick_age_ms > 2000:
+    # Timestamp freshness - use original tick arrival time when available
+    original_ts = tick.get('original_timestamp', tick['timestamp'])
+    tick_age_ms = current_time_ms() - original_ts
+    data_source = tick.get('data_source', '')
+    if data_source.startswith('WEBSOCKET'):
+        max_age_ms = 10000  # Allow slightly older WS ticks when no price change occurs
+    elif data_source in ('REST', 'REST_REFRESH'):
+        max_age_ms = 5000
+    else:
+        max_age_ms = 2000
+    if tick_age_ms > max_age_ms:
         return False, f"Stale tick ({tick_age_ms}ms old)"
     
     # Latency check - SKIP since timestamp freshness check above is more appropriate

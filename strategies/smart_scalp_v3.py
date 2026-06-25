@@ -27,7 +27,14 @@ from typing import Dict, Tuple, List, Optional
 from datetime import datetime
 import os
 
-from config.constants import SL_POINTS_FIXED, TP_POINTS_FIXED, CE_QUANTITY, PE_QUANTITY
+from config.constants import (
+    SL_POINTS_FIXED, TP_POINTS_FIXED,
+    CE_QUANTITY, PE_QUANTITY,
+    MIN_SCORE_TO_TRADE, MIN_CONFIDENCE,
+    MAX_CONFIDENCE_SCORE,
+    MIN_ENTRY_PREMIUM, MAX_ENTRY_PREMIUM,
+    TP_MULTIPLIER
+)
 
 # v3.1 Filter Constants
 VWAP_ENABLED = True
@@ -75,9 +82,9 @@ class SmartScalpV3:
         self.atr_period = self.indicators_config.get('atr_period', 14)
         
         # Scoring requirements
-        self.min_score = self.scoring_config.get('min_score_to_trade', 5)
-        self.min_confidence = self.scoring_config.get('min_confidence_pct', 60)
-        self.confidence_multiplier = self.scoring_config.get('confidence_multiplier', 12)
+        self.min_score = self.scoring_config.get('min_score_to_trade', MIN_SCORE_TO_TRADE)
+        self.min_confidence = self.scoring_config.get('min_confidence_pct', MIN_CONFIDENCE)
+        self.max_confidence_score = self.scoring_config.get('max_confidence_score', MAX_CONFIDENCE_SCORE)
         
         # Entry configs
         self.ce_config = self.strategy_config.get('ce_entry', {})
@@ -92,6 +99,7 @@ class SmartScalpV3:
         self._last_oi = None
         self._prev_oi = None
         self._oi_change_pct = 0.0
+        self._last_price = None
     
     def _get_greeks_calculator(self):
         """Lazy load Greeks calculator to avoid circular imports"""
@@ -166,37 +174,32 @@ class SmartScalpV3:
         if current_oi <= 0:
             return 0.0, "NEUTRAL"
         
-        # Initialize OI tracking
-        if self._last_oi is None or self._prev_oi is None:
+        # Initialize OI tracking on first tick
+        if self._last_oi is None:
             self._last_oi = current_oi
             self._prev_oi = current_oi
+            self._last_price = current_price
             return 0.0, "NEUTRAL"
         
-        # Calculate OI change (with safe division)
-        oi_change = current_oi - self._prev_oi
-        oi_change_pct = (oi_change / self._prev_oi * 100) if self._prev_oi and self._prev_oi > 0 else 0
+        # Use a stable previous price if available
+        prev_price = self._last_price if self._last_price is not None else current_price
+        oi_change = current_oi - self._last_oi
+        oi_change_pct = (oi_change / self._last_oi * 100) if self._last_oi > 0 else 0
         self._oi_change_pct = oi_change_pct
         
-        # Determine price direction (compare with previous tick)
-        price_up = current_price > tick.get('prev_price', current_price * 0.999)
+        price_up = current_price > prev_price
         
-        # OI Direction Analysis
         if oi_change_pct > 1:  # OI increasing
-            if price_up:
-                direction = "LONG_BUILDUP"  # Strong bullish
-            else:
-                direction = "SHORT_BUILDUP"  # Strong bearish
+            direction = "LONG_BUILDUP" if price_up else "SHORT_BUILDUP"
         elif oi_change_pct < -1:  # OI decreasing
-            if price_up:
-                direction = "SHORT_COVERING"  # Weak bullish
-            else:
-                direction = "LONG_UNWINDING"  # Weak bearish
+            direction = "SHORT_COVERING" if price_up else "LONG_UNWINDING"
         else:
             direction = "NEUTRAL"
         
-        # Update tracking
+        # Update tracking for the next tick
         self._prev_oi = self._last_oi
         self._last_oi = current_oi
+        self._last_price = current_price
         
         return oi_change_pct, direction
     
@@ -210,11 +213,11 @@ class SmartScalpV3:
         """
         premium = tick.get('ltp', 0)
         
-        if premium < PREMIUM_MIN:
-            return False, f"Premium too low ₹{premium:.0f} < ₹{PREMIUM_MIN:.0f}"
+        if premium < MIN_ENTRY_PREMIUM:
+            return False, f"Premium too low ₹{premium:.0f} < ₹{MIN_ENTRY_PREMIUM:.0f}"
         
-        if premium > PREMIUM_MAX:
-            return False, f"Premium too high ₹{premium:.0f} > ₹{PREMIUM_MAX:.0f}"
+        if premium > MAX_ENTRY_PREMIUM:
+            return False, f"Premium too high ₹{premium:.0f} > ₹{MAX_ENTRY_PREMIUM:.0f}"
         
         return True, f"Premium OK ₹{premium:.0f}"
     
@@ -662,6 +665,16 @@ class SmartScalpV3:
             return "BULLISH"
         else:
             return "BEARISH"
+
+    def _score_to_confidence(self, score: int) -> int:
+        """Convert raw score into a confidence percentage relative to max score.
+
+        Returns a normalized confidence metric for reporting and gating.
+        """
+        if self.max_confidence_score <= 0:
+            return 0
+        confidence = int((score / self.max_confidence_score) * 100)
+        return min(100, max(0, confidence))
     
     def generate_signal(self, ticks: List[Dict]) -> Tuple[int, str, int, Dict]:
         """
@@ -848,9 +861,9 @@ class SmartScalpV3:
                 ce_factors.append(f"OI_{oi_direction}")
                 ce_score += 1
             
-            # Signal if score >= 4 (v3.4: relaxed from 5 to reduce over-filtering)
+            # Signal if score >= configured threshold (default 4)
             # VWAP/OI/Volume boost confidence for position sizing, not gatekeeping
-            if ce_score >= 4:
+            if ce_score >= self.min_score:
                 ce_signal = True
         
         # ====== PULLBACK LOGIC FOR PE (BEARISH) ======
@@ -908,8 +921,8 @@ class SmartScalpV3:
                 pe_factors.append(f"OI_{oi_direction}")
                 pe_score += 1
             
-            # Signal if score >= 4 (v3.4: relaxed from 5 to reduce over-filtering)
-            if pe_score >= 4:
+            # Signal if score >= configured threshold (default 4)
+            if pe_score >= self.min_score:
                 pe_signal = True
         
         # ====== GENERATE SIGNAL ======
@@ -962,23 +975,29 @@ class SmartScalpV3:
                 pe_exhausted = True
                 details["exhaustion"] = pe_block_reason
         
-        # CE Signal: Score >= 4 in uptrend (with exhaustion check)
-        if ce_signal and ce_score >= 4 and not ce_exhausted:
-            confidence = min(100, ce_score * 12)  # v3.4: *12 so score 6=72% passes 70% gate
-            details["reason"] = f"📈 CE PULLBACK: Score {ce_score}/12, Conf {confidence}%"
+        # CE Signal: Score threshold met in uptrend (with exhaustion check)
+        if ce_signal and ce_score >= self.min_score and not ce_exhausted:
+            confidence = self._score_to_confidence(ce_score)
+            details["reason"] = f"📈 CE PULLBACK: Score {ce_score}/{self.max_confidence_score}, Conf {confidence}%"
             details["bull_score"] = ce_score
             details["bull_factors"] = ce_factors
+            if confidence < self.min_confidence:
+                details["reason"] = f"Low confidence {confidence}% < {self.min_confidence}%"
+                return 0, "", 0, details
             return 1, "CE", confidence, details
         elif ce_signal and ce_exhausted:
             details["reason"] = f"CE signal blocked: {details.get('exhaustion', 'Trend exhausted')}"
             return 0, "", 0, details
         
-        # PE Signal: Score >= 4 in downtrend (with exhaustion check)
-        if pe_signal and pe_score >= 4 and not pe_exhausted:
-            confidence = min(100, pe_score * 12)  # v3.4: *12 so score 6=72% passes 70% gate
-            details["reason"] = f"📉 PE PULLBACK: Score {pe_score}/12, Conf {confidence}%"
+        # PE Signal: Score threshold met in downtrend (with exhaustion check)
+        if pe_signal and pe_score >= self.min_score and not pe_exhausted:
+            confidence = self._score_to_confidence(pe_score)
+            details["reason"] = f"📉 PE PULLBACK: Score {pe_score}/{self.max_confidence_score}, Conf {confidence}%"
             details["bear_score"] = pe_score
             details["bear_factors"] = pe_factors
+            if confidence < self.min_confidence:
+                details["reason"] = f"Low confidence {confidence}% < {self.min_confidence}%"
+                return 0, "", 0, details
             return 1, "PE", confidence, details
         elif pe_signal and pe_exhausted:
             details["reason"] = f"PE signal blocked: {details.get('exhaustion', 'Trend exhausted')}"
@@ -986,9 +1005,9 @@ class SmartScalpV3:
         
         # No valid pullback signal
         if ce_score > pe_score:
-            details["reason"] = f"No CE pullback: Score {ce_score}/8, factors: {ce_factors}"
+            details["reason"] = f"No CE pullback: Score {ce_score}/{self.max_confidence_score}, factors: {ce_factors}"
         elif pe_score > ce_score:
-            details["reason"] = f"No PE pullback: Score {pe_score}/8, factors: {pe_factors}"
+            details["reason"] = f"No PE pullback: Score {pe_score}/{self.max_confidence_score}, factors: {pe_factors}"
         else:
             details["reason"] = f"No pullback: CE={ce_score}, PE={pe_score}"
         
@@ -1003,11 +1022,27 @@ class SmartScalpV3:
         """
         config = self.ce_config if direction == "CE" else self.pe_config
         
-        # SL/TP from .env via config.constants (FINAL FIX — was hardcoded)
-        sl_points = SL_POINTS_FIXED   # .env SL_POINTS (default 8)
-        tp_points = TP_POINTS_FIXED   # .env TP_POINTS (default 16)
+        sl_points = SL_POINTS_FIXED
+        tp_points = TP_POINTS_FIXED
         
-        # Quantity from .env via config.constants (FINAL FIX — was hardcoded)
+        # Dynamic adjustment based on local volatility and regime
+        atr = indicators.get('ATR', 0)
+        if atr:
+            if atr > 8:
+                sl_points += 1
+                tp_points += 2
+            elif atr < 4:
+                sl_points = max(4, sl_points - 1)
+                tp_points = max(10, tp_points - 2)
+        
+        # Ensure TP maintains a minimum R:R relative to SL
+        if TP_MULTIPLIER and sl_points > 0:
+            tp_points = max(tp_points, int(round(sl_points * TP_MULTIPLIER)))
+        
+        # Slightly wider targets for sideways regime to avoid chop exits
+        if self.get_market_regime(indicators) == "SIDEWAYS":
+            tp_points = max(tp_points, int(round(sl_points * 1.8)))
+        
         quantity = CE_QUANTITY if direction == "CE" else PE_QUANTITY
         
         return {

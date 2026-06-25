@@ -166,10 +166,10 @@ TRAILING_ATR_EXPIRY = 1.0
 
 STRATEGY_NAME = 'smart_scalp_institutional'
 STRATEGY_VERSION = '3.4'
-MIN_SCORE_TO_TRADE = env_int('MIN_SCORE', 5)
+MIN_SCORE_TO_TRADE = env_int('MIN_SCORE', 4)  # v3.4 entry gate lowered to 4
 MIN_CONFIDENCE = env_int('MIN_CONFIDENCE', 70)  # Balanced: 70% (was 80, too strict)
 MIN_CONFIDENCE_AFTER_3SL = env_int('MIN_CONFIDENCE_AFTER_3SL', 85)  # After 3 consecutive SL (was 92)
-CONFIDENCE_MULTIPLIER = env_int('CONFIDENCE_MULTIPLIER', 12)
+MAX_CONFIDENCE_SCORE = env_int('MAX_CONFIDENCE_SCORE', 11)  # 11-factor scoring model
 
 # Entry Price Filter (ATM nearby range)
 MIN_ENTRY_PREMIUM = env_float('MIN_ENTRY_PREMIUM', 90.0)   # Min ₹90

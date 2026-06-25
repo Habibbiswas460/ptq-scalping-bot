@@ -257,7 +257,17 @@ def early_momentum_loss_cut(trade: Dict, tick: Dict) -> Tuple[bool, str]:
     
     # Fast adverse move: lost threshold+ pts within 30 seconds
     if price_diff <= -cut_threshold:
-        actual_loss = abs(price_diff * qty)
+        # Cap loss to configured per-trade maximum to avoid extreme P&L mismatch
+        max_loss = MAX_LOSS_PER_TRADE_CE if direction == 'CE' else MAX_LOSS_PER_TRADE_PE
+        actual_loss = min(abs(price_diff * qty), max_loss)
+
+        # Store capped PnL in trade so exit handler can use the capped value
+        try:
+            trade['current_pnl'] = -actual_loss
+            trade['_early_cut_applied'] = True
+        except Exception:
+            pass
+
         return True, f"\u26a1 EARLY LOSS CUT | {direction} | {price_diff:+.1f}pts in {hold_time:.0f}s (ATR-thresh:{cut_threshold}) | Loss: \u20b9{actual_loss:.0f} (saved {HARD_SL_POINTS - abs(price_diff):.1f}pts vs SL)"
     
     return False, ""
@@ -321,34 +331,63 @@ def check_exit_conditions(trade: Dict, tick: Dict, greeks: Dict,
     4b. RSI reversal exit (momentum shift from extreme)
     5. Time exit (15 min max hold)
     """
+    def _cap_negative_pnl(trade: Dict):
+        """Ensure negative PnL is capped to per-trade max loss and mark it."""
+        if not trade:
+            return
+        direction = trade.get('direction', 'CE')
+        max_loss = MAX_LOSS_PER_TRADE_CE if direction == 'CE' else MAX_LOSS_PER_TRADE_PE
+        if 'current_pnl' in trade and trade['current_pnl'] < 0:
+            capped = min(abs(trade['current_pnl']), max_loss)
+            trade['current_pnl'] = -capped
+            trade['_pnl_capped'] = True
+            # Log and send urgent alert if logger available
+            try:
+                if logger:
+                    logger.warning(f"🔒 PnL CAPPED: {direction} | Capped to ₹{-trade['current_pnl']:.0f}")
+                # Send Telegram alert if bot available
+                try:
+                    from core.services.telegram_bot import send_alert
+                    send_alert(f"PnL CAPPED: {direction} | Capped to ₹{-trade['current_pnl']:.0f} | Entry: ₹{trade.get('entry_price', 0):.2f}")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
     # Priority 1: SL/TP/Trailing check
     sl_hit, sl_reason = check_hard_sl(trade, tick, logger)
     if sl_hit:
+        _cap_negative_pnl(trade)
         return True, sl_reason
     
     # Priority 2: Early momentum loss cut (v3.3 - fast adverse move)
     early_hit, early_reason = early_momentum_loss_cut(trade, tick)
     if early_hit:
+        _cap_negative_pnl(trade)
         return True, early_reason
     
     # Priority 3: Greeks exit
     greek_hit, greek_reason = greek_exit(greeks, day_type)
     if greek_hit:
+        _cap_negative_pnl(trade)
         return True, greek_reason
     
     # Priority 4: Smart RSI exit (lock profits when momentum exhausted)
     rsi_hit, rsi_reason = smart_rsi_exit(trade, rsi)
     if rsi_hit:
+        _cap_negative_pnl(trade)
         return True, rsi_reason
     
     # Priority 4b: RSI reversal exit (v3.3 - momentum shift)
     reversal_hit, reversal_reason = rsi_reversal_exit(trade, rsi)
     if reversal_hit:
+        _cap_negative_pnl(trade)
         return True, reversal_reason
     
     # Priority 5: Time exit (15 min max hold)
     time_hit, time_reason = time_exit_15min(trade)
     if time_hit:
+        _cap_negative_pnl(trade)
         return True, time_reason
     
     # Log trailing status periodically

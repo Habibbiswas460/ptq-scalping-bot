@@ -28,6 +28,7 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 # Method 3: Override the global logging config
 logging.basicConfig(level=logging.CRITICAL)
 
+from config.constants import PAPER_TRADING
 from config.validator import validate_config_quiet
 from core.main import run_with_auto_reconnect
 

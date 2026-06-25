@@ -1,26 +1,83 @@
 """
-Session Trend Tracker
-Smart trend detection with pullback support
+Session Trend Tracker with EMA-based Regime Detection
+Multi-factor trend analysis:
+- Opening price displacement (1st order)
+- EMA convergence/divergence (2nd order)
+- Volume-weighted directional bias (3rd order)
 """
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 from collections import deque
+import logging
+
+
+class SimpleEMA:
+    """Fast EMA calculator for regime detection"""
+    
+    def __init__(self, period: int = 20):
+        self.period = period
+        self.multiplier = 2.0 / (period + 1)
+        self.ema = None
+        self.initialized = False
+    
+    def update(self, price: float) -> Optional[float]:
+        """Update EMA with new price"""
+        if self.ema is None:
+            self.ema = price
+            self.initialized = True
+            return price
+        
+        self.ema = price * self.multiplier + self.ema * (1 - self.multiplier)
+        return self.ema
+    
+    def get(self) -> Optional[float]:
+        """Get current EMA value"""
+        return self.ema if self.initialized else None
+
 
 class SessionTrendTracker:
     """
-    Track market trend based on opening price + short-term momentum
-    - Primary trend from opening price
-    - Allows counter-trend trades on strong pullbacks/bounces
+    Track market trend using multi-factor analysis:
+    
+    Factor 1: Opening displacement (50% weight)
+      - >100pts above: BULLISH
+      - <-100pts below: BEARISH
+      - ±100pts: SIDEWAYS
+    
+    Factor 2: EMA regime (30% weight)
+      - Price > EMA21 > EMA50: BULLISH
+      - Price < EMA21 < EMA50: BEARISH
+      - Other: SIDEWAYS
+    
+    Factor 3: RSI extremes (20% weight)
+      - RSI < 35: Overdue for bounce (CE favored)
+      - RSI > 65: Overdue for drop (PE favored)
+      - 35-65: Neutral
     """
     
     def __init__(self):
         self.opening_price = None
         self.session_started = False
-        self.price_history = deque(maxlen=100)
+        self.price_history = deque(maxlen=200)  # Increased for EMA accuracy
+        
+        # Primary trend (from multiple factors)
         self.current_trend = "NEUTRAL"
         self.confidence = 0
-        self.short_term_trend = "NEUTRAL"  # 5-minute trend
+        self.short_term_trend = "NEUTRAL"
         self.last_rsi = 50
+        
+        # EMA-based regime (new)
+        self.ema_fast = SimpleEMA(period=9)    # Fast trend
+        self.ema_medium = SimpleEMA(period=21)  # Medium trend
+        self.ema_slow = SimpleEMA(period=50)   # Slow trend
+        self.ema_regime = "NEUTRAL"
+        
+        # Factor scores
+        self.opening_factor_score = 0
+        self.ema_factor_score = 0
+        self.rsi_factor_score = 0
+        
+        self.logger = logging.getLogger(__name__)
     
     def start_session(self, opening_price: float):
         """Start new trading session"""
@@ -28,44 +85,165 @@ class SessionTrendTracker:
         self.session_started = True
         self.price_history.clear()
         self.price_history.append(opening_price)
+        
+        # Reset EMAs
+        self.ema_fast = SimpleEMA(period=9)
+        self.ema_medium = SimpleEMA(period=21)
+        self.ema_slow = SimpleEMA(period=50)
+        
+        # Initialize EMAs with opening price
+        self.ema_fast.update(opening_price)
+        self.ema_medium.update(opening_price)
+        self.ema_slow.update(opening_price)
+        
         self.current_trend = "NEUTRAL"
         self.short_term_trend = "NEUTRAL"
         self.confidence = 0
         self.last_rsi = 50
+        
+        self.logger.info(f"Session started: Opening ₹{opening_price:.0f}")
+    
+    def _calculate_ema_regime(self, current_price: float) -> str:
+        """
+        Calculate trend based on EMA crossovers.
+        
+        BULLISH: Price above EMA21, EMA21 above EMA50
+        BEARISH: Price below EMA21, EMA21 below EMA50
+        SIDEWAYS: Mixed signals or convergence
+        """
+        ema_fast = self.ema_fast.get()
+        ema_medium = self.ema_medium.get()
+        ema_slow = self.ema_slow.get()
+        
+        if not all([ema_fast, ema_medium, ema_slow]):
+            return "NEUTRAL"
+        
+        # Strong bullish alignment
+        if (current_price > ema_fast > ema_medium > ema_slow):
+            return "BULLISH"
+        
+        # Strong bearish alignment
+        if (current_price < ema_fast < ema_medium < ema_slow):
+            return "BEARISH"
+        
+        # Price above medium EMA
+        if current_price > ema_medium and ema_medium > ema_slow:
+            return "BULLISH_WEAK"
+        
+        # Price below medium EMA
+        if current_price < ema_medium and ema_medium < ema_slow:
+            return "BEARISH_WEAK"
+        
+        return "SIDEWAYS"
+    
+    def _combine_trend_factors(self, opening_displacement: str, 
+                              ema_regime: str, rsi_signal: str) -> Tuple[str, int]:
+        """
+        Combine multiple trend factors with weighted scoring.
+        
+        Returns:
+            (trend, confidence_0_100)
+        """
+        scores = {'BULLISH': 0, 'BEARISH': 0, 'SIDEWAYS': 0}
+        
+        # Factor 1: Opening displacement (50% weight)
+        if opening_displacement == "BULLISH":
+            scores['BULLISH'] += 50
+        elif opening_displacement == "BEARISH":
+            scores['BEARISH'] += 50
+        else:
+            scores['SIDEWAYS'] += 50
+        
+        # Factor 2: EMA regime (30% weight)
+        if ema_regime in ("BULLISH", "BULLISH_WEAK"):
+            scores['BULLISH'] += 30 if ema_regime == "BULLISH" else 15
+        elif ema_regime in ("BEARISH", "BEARISH_WEAK"):
+            scores['BEARISH'] += 30 if ema_regime == "BEARISH" else 15
+        else:
+            scores['SIDEWAYS'] += 20
+        
+        # Factor 3: RSI extremes (20% weight)
+        if rsi_signal == "BULLISH":
+            scores['BULLISH'] += 15
+        elif rsi_signal == "BEARISH":
+            scores['BEARISH'] += 15
+        else:
+            scores['SIDEWAYS'] += 10
+        
+        # Find dominant trend
+        max_trend = max(scores, key=scores.get)
+        confidence = min(100, scores[max_trend])
+        
+        return max_trend, confidence
     
     def update_price(self, current_price: float) -> str:
-        """Update price and return current trend"""
+        """
+        Update price and recalculate trend using multi-factor analysis.
         
+        Returns:
+            Current trend: BULLISH, BEARISH, or SIDEWAYS
+        """
         if not self.session_started or self.opening_price is None:
             return "NEUTRAL"
         
         self.price_history.append(current_price)
         
-        # Calculate difference from opening
+        # Update all EMAs
+        self.ema_fast.update(current_price)
+        self.ema_medium.update(current_price)
+        self.ema_slow.update(current_price)
+        
+        # === FACTOR 1: Opening Displacement (50% weight) ===
         price_diff = current_price - self.opening_price
-        diff_pct = (price_diff / self.opening_price) * 100
         
-        # BUG FIX #10: Increased threshold from 50 to 100 points
-        # NIFTY typically moves 100-300 points/day, 50 was too sensitive
-        # Primary trend (from opening)
-        if price_diff > 100:  # More than 100 points above opening
-            self.current_trend = "BULLISH"
-            self.confidence = min(100, (price_diff / 150) * 100)
-        elif price_diff < -100:  # More than 100 points below opening
-            self.current_trend = "BEARISH"
-            self.confidence = min(100, (abs(price_diff) / 150) * 100)
-        else:  # Within 100 points of opening
-            self.current_trend = "SIDEWAYS"
-            self.confidence = 50
+        if price_diff > 100:
+            opening_signal = "BULLISH"
+            opening_conf = min(100, (price_diff / 150) * 100)
+        elif price_diff < -100:
+            opening_signal = "BEARISH"
+            opening_conf = min(100, (abs(price_diff) / 150) * 100)
+        else:
+            opening_signal = "SIDEWAYS"
+            opening_conf = 50
         
-        # Short-term trend (last 20 prices ~ 10 seconds)
-        # Also increased threshold from 15 to 25 points
+        self.opening_factor_score = opening_conf
+        
+        # === FACTOR 2: EMA Regime (30% weight) ===
+        self.ema_regime = self._calculate_ema_regime(current_price)
+        
+        if "BULLISH" in self.ema_regime:
+            self.ema_factor_score = 80 if self.ema_regime == "BULLISH" else 50
+        elif "BEARISH" in self.ema_regime:
+            self.ema_factor_score = 80 if self.ema_regime == "BEARISH" else 50
+        else:
+            self.ema_factor_score = 30
+        
+        # === FACTOR 3: RSI Signal (20% weight) ===
+        if self.last_rsi < 35:
+            rsi_signal = "BULLISH"
+            self.rsi_factor_score = 70  # Strong oversold
+        elif self.last_rsi > 65:
+            rsi_signal = "BEARISH"
+            self.rsi_factor_score = 70  # Strong overbought
+        else:
+            rsi_signal = "SIDEWAYS"
+            self.rsi_factor_score = 40
+        
+        # === COMBINE FACTORS ===
+        combined_trend, combined_conf = self._combine_trend_factors(
+            opening_signal, self.ema_regime, rsi_signal
+        )
+        
+        self.current_trend = combined_trend
+        self.confidence = combined_conf
+        
+        # === SHORT-TERM MOMENTUM (for scalp entries) ===
         if len(self.price_history) >= 20:
             recent_start = list(self.price_history)[-20]
             short_diff = current_price - recent_start
-            if short_diff > 25:  # 25 points up in short term
+            if short_diff > 25:
                 self.short_term_trend = "BULLISH"
-            elif short_diff < -25:  # 25 points down
+            elif short_diff < -25:
                 self.short_term_trend = "BEARISH"
             else:
                 self.short_term_trend = "SIDEWAYS"
@@ -84,31 +262,32 @@ class SessionTrendTracker:
         """
         Can we trade CE (buy call)?
         
-        v3.3: Relaxed to enable dual-direction trading (was PE-only bias)
-        
-        YES if:
-        1. Primary trend is BULLISH, OR
-        2. (SIDEWAYS or BEARISH) + RSI < 40 (oversold reversal - relaxed from 35), OR
-        3. Short-term trend is BULLISH with momentum, OR
-        4. SIDEWAYS market (allow CE since strategy scoring handles quality)
+        Multi-factor check:
+        1. Opening displacement: BULLISH → YES
+        2. EMA regime: BULLISH → YES (even if sideways opening)
+        3. RSI oversold: RSI < 40 → YES (bounce potential)
+        4. SIDEWAYS: YES (strategy scoring filters quality)
         """
         if rsi is not None:
             self.last_rsi = rsi
         
-        # 1. Primary bullish - always OK
+        # Primary bullish - strong signal
         if self.current_trend == "BULLISH" and self.confidence > 30:
             return True
         
-        # 2. Reversal trade: RSI oversold in bearish/sideways market (relaxed from 35 to 40)
-        if self.last_rsi < 40:
-            return True  # Allow CE on oversold bounce
+        # EMA bullish with decent momentum
+        if "BULLISH" in self.ema_regime and self.ema_factor_score > 60:
+            return True
         
-        # 3. Short-term bullish momentum
+        # RSI oversold reversal - works in any regime
+        if self.last_rsi < 40:
+            return True
+        
+        # Short-term momentum confirmation
         if self.short_term_trend == "BULLISH":
             return True
         
-        # 4. SIDEWAYS market: allow CE trades (v3.3 - dual direction)
-        # Strategy scoring already ensures quality; trend filter shouldn't block
+        # SIDEWAYS market - allow CE since strategy handles quality filtering
         if self.current_trend == "SIDEWAYS":
             return True
         
@@ -118,30 +297,32 @@ class SessionTrendTracker:
         """
         Can we trade PE (buy put)?
         
-        v3.3: Relaxed for dual-direction trading
-        
-        YES if:
-        1. Primary trend is BEARISH, OR
-        2. (SIDEWAYS or BULLISH) + RSI > 60 (overbought reversal - relaxed from 65), OR
-        3. Short-term trend is BEARISH with momentum, OR
-        4. SIDEWAYS market (allow PE since strategy scoring handles quality)
+        Multi-factor check:
+        1. Opening displacement: BEARISH → YES
+        2. EMA regime: BEARISH → YES (even if sideways opening)
+        3. RSI overbought: RSI > 60 → YES (drop potential)
+        4. SIDEWAYS: YES (strategy scoring filters quality)
         """
         if rsi is not None:
             self.last_rsi = rsi
         
-        # 1. Primary bearish - always OK
+        # Primary bearish - strong signal
         if self.current_trend == "BEARISH" and self.confidence > 30:
             return True
         
-        # 2. Reversal trade: RSI overbought in bullish/sideways market (relaxed from 65 to 60)
-        if self.last_rsi > 60:
-            return True  # Allow PE on overbought drop
+        # EMA bearish with decent momentum
+        if "BEARISH" in self.ema_regime and self.ema_factor_score > 60:
+            return True
         
-        # 3. Short-term bearish momentum
+        # RSI overbought reversal - works in any regime
+        if self.last_rsi > 60:
+            return True
+        
+        # Short-term momentum confirmation
         if self.short_term_trend == "BEARISH":
             return True
         
-        # 4. SIDEWAYS market: allow PE trades (v3.3 - dual direction)
+        # SIDEWAYS market - allow PE since strategy handles quality filtering
         if self.current_trend == "SIDEWAYS":
             return True
         
@@ -157,9 +338,35 @@ class SessionTrendTracker:
             return "➡️"
     
     def get_trend_string(self) -> str:
-        """Get formatted trend string"""
+        """Get formatted trend string with EMA regime info"""
         emoji = self.get_trend_emoji()
-        return f"{emoji} {self.current_trend} ({self.confidence:.0f}%)"
+        trend_str = f"{emoji} {self.current_trend} ({self.confidence:.0f}%)"
+        
+        # Add EMA regime indicator
+        if "BULLISH" in self.ema_regime:
+            trend_str += " [EMA↗]"
+        elif "BEARISH" in self.ema_regime:
+            trend_str += " [EMA↘]"
+        else:
+            trend_str += " [EMA➡]"
+        
+        return trend_str
+    
+    def get_detailed_analysis(self) -> Dict:
+        """Get detailed trend analysis for diagnostics"""
+        return {
+            'trend': self.current_trend,
+            'confidence': self.confidence,
+            'opening_displacement': self.opening_price,
+            'opening_factor': self.opening_factor_score,
+            'ema_regime': self.ema_regime,
+            'ema_factor': self.ema_factor_score,
+            'ema_fast': self.ema_fast.get(),
+            'ema_medium': self.ema_medium.get(),
+            'ema_slow': self.ema_slow.get(),
+            'rsi_factor': self.rsi_factor_score,
+            'short_term_trend': self.short_term_trend
+        }
 
 # Global instance
 _session_tracker = SessionTrendTracker()

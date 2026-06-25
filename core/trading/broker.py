@@ -677,8 +677,10 @@ class BrokerInterface:
                     # This tick is from old symbol, discard it
                     return
                 
+                tick_ts = current_time_ms()
                 new_tick = {
-                    'timestamp': current_time_ms(),
+                    'timestamp': tick_ts,
+                    'original_timestamp': tick_ts,
                     'ltp': round(ltp, 2),
                     'bid': round(bid, 2),
                     'ask': round(ask, 2),
@@ -741,10 +743,13 @@ class BrokerInterface:
                 exchange=EXCHANGE
             )
             if tick:
+                tick_ts = current_time_ms()
                 tick['spot_price'] = self.spot_price
                 tick['strike'] = self.current_strike
                 tick['direction'] = OPTION_TYPE
                 tick['symbol'] = self.current_symbol  # CRITICAL: Set symbol for verification
+                tick['timestamp'] = tick_ts
+                tick['original_timestamp'] = tick_ts
                 self._cached_option_tick = tick
                 self._last_option_fetch = time.time()
                 self.last_valid_tick_time = datetime.now()
@@ -821,6 +826,8 @@ class BrokerInterface:
             cached['spot_price'] = self.spot_price
             # Keep exact LTP from last REST fetch - no artificial noise
             cached['timestamp'] = current_time_ms()
+            if 'original_timestamp' not in cached:
+                cached['original_timestamp'] = self._last_option_fetch and int(self._last_option_fetch * 1000) or current_time_ms()
             self.last_valid_tick_time = datetime.now()
             return cached
 
@@ -866,11 +873,29 @@ class BrokerInterface:
                         return rest_tick
                     else:
                         self.logger.warning("⚠ REST refresh failed")
+                        return None
             
             with self._tick_lock:
                 tick = self.last_tick.copy()
                 # CRITICAL FIX: Refresh timestamp to NOW to prevent stale tick rejection
                 tick['timestamp'] = current_time_ms()
+
+            # Ensure tick symbol matches currently subscribed symbol
+            if tick.get('symbol') and self.current_symbol and tick.get('symbol') != self.current_symbol:
+                self.logger.warning(f"⚠ Tick symbol mismatch: cache {tick.get('symbol')} vs expected {self.current_symbol} — attempting REST refresh")
+                # Try one REST fetch to get correct symbol's price
+                rest_tick = self._fetch_option_tick_rest()
+                if rest_tick:
+                    with self._tick_lock:
+                        self.last_tick = rest_tick.copy()
+                        self._ws_original_tick_time = time.time()
+                    rest_tick['data_source'] = 'REST_REFRESH'
+                    self.last_valid_tick_time = datetime.now()
+                    self.logger.info(f"✅ REST refresh after symbol mismatch: LTP ₹{rest_tick.get('ltp', 0):.2f}")
+                    return rest_tick
+                else:
+                    # If refresh failed, skip returning a tick to avoid wrong-symbol actions
+                    return None
 
             # Track when we last successfully served a tick
             self.last_valid_tick_time = datetime.now()

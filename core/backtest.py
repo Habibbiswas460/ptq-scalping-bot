@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
+from config.constants import MIN_CONFIDENCE
+
 
 @dataclass
 class BacktestTrade:
@@ -196,27 +198,32 @@ class Backtester:
             strategy = self._get_strategy()
             signal, direction, confidence, details = strategy.generate_signal(ticks_history)
             
-            if signal == 1 and confidence >= 70:  # Min confidence threshold
-                return self._enter_trade(timestamp, current_price, direction, confidence, details)
+            if signal == 1 and confidence >= MIN_CONFIDENCE:  # Min confidence threshold
+                entry_params = strategy.get_entry_params(direction, confidence, strategy._indicators_cache)
+                return self._enter_trade(timestamp, current_price, direction, confidence, details, entry_params)
         
         return None
     
     def _enter_trade(self, timestamp: datetime, price: float, direction: str, 
-                     confidence: int, details: Dict) -> Optional[Dict]:
+                     confidence: int, details: Dict, entry_params: Dict) -> Optional[Dict]:
         """Enter a new trade"""
         entry_price = self._apply_slippage(price, 'BUY')
         
         self.trade_count += 1
         self.daily_trades += 1
         
+        sl_points = entry_params.get('sl_points', self.sl_points)
+        tp_points = entry_params.get('tp_points', self.tp_points)
+        qty = entry_params.get('quantity', self.lot_size)
+        
         self.current_trade = BacktestTrade(
             trade_id=self.trade_count,
             entry_time=timestamp,
             direction=direction,
             entry_price=entry_price,
-            qty=self.lot_size,
-            sl_price=entry_price - self.sl_points,
-            tp_price=entry_price + self.tp_points,
+            qty=qty,
+            sl_price=entry_price - sl_points,
+            tp_price=entry_price + tp_points,
             signal_details={'confidence': confidence, **details}
         )
         self._trade_high_water = entry_price  # Reset high-water for new trade

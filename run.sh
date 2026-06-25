@@ -750,7 +750,7 @@ menu_tests() {
     printf "    ${BCYAN}║${NC}  ${BWHITE}🧪 TEST SUITE${NC}                                            ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}╠══════════════════════════════════════════════════════════╣${NC}\n"
     printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[1]${NC} Run ALL Tests        ${DIM}Full 75-test suite${NC}          ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[1]${NC} Run ALL Tests        ${DIM}Full 103-test suite${NC}         ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[2]${NC} Greeks Calculation   ${DIM}test_greeks.py${NC}              ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[3]${NC} Greeks Caching       ${DIM}test_greeks_caching.py${NC}      ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[4]${NC} Market Data (Batch)  ${DIM}test_batch_market_data.py${NC}   ${BCYAN}║${NC}\n"
@@ -758,7 +758,8 @@ menu_tests() {
     printf "    ${BCYAN}║${NC}   ${BGREEN}[6]${NC} Phases 3-4-5         ${DIM}test_phases_3_4_5.py${NC}       ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[7]${NC} Analytics Module     ${DIM}test_analytics.py${NC}           ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[8]${NC} WebSocket            ${DIM}test_websocket.py${NC}           ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[9]${NC} Syntax Check Only    ${DIM}All critical .py files${NC}     ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[9]${NC} Validators           ${DIM}test_validators.py${NC}        ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${DIM}[0]${NC} ← Back                                             ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${DIM}[0]${NC} ← Back                                             ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
@@ -776,8 +777,8 @@ menu_tests() {
         6) python3 -m pytest tests/test_phases_3_4_5.py -v ;;
         7) python3 -m pytest tests/test_analytics.py -v ;;
         8) python3 -m pytest tests/test_websocket.py -v ;;
-        9) run_syntax_check ;;
-        0) show_main_menu; return ;;
+        9) python3 -m pytest tests/test_validators.py -v ;;
+        0) run_syntax_check ;;
         *) printf "    ${BRED}Invalid${NC}\n" ;;
     esac
     press_enter

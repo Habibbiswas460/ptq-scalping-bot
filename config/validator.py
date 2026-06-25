@@ -32,6 +32,8 @@ class ConfigValidator:
         'TOTAL_CAPITAL': ('30000', 'Capital should be set'),
         'SL_POINTS': ('6', 'Stop loss should be configured'),
         'TP_POINTS': ('12', 'Take profit should be configured'),
+        'MAX_TRADES_PER_DAY': ('15', 'Max trades per day recommended'),
+        'MAX_TRADES_PER_HOUR': ('10', 'Max trades per hour recommended'),
     }
     
     # Value ranges for validation
@@ -55,9 +57,9 @@ class ConfigValidator:
         
     def load_env(self):
         """Load environment variables"""
-        load_dotenv(self.env_path)
+        load_dotenv(self.env_path, override=True)
         
-        # Read .env file directly for modification
+        # Read .env file directly for validation and auto-fix
         if os.path.exists(self.env_path):
             with open(self.env_path, 'r') as f:
                 for line in f:
@@ -65,6 +67,11 @@ class ConfigValidator:
                     if line and not line.startswith('#') and '=' in line:
                         key, value = line.split('=', 1)
                         self._env_vars[key.strip()] = value.strip()
+                        os.environ[key.strip()] = value.strip()
+
+    def get_env_value(self, key: str, default: str = '') -> str:
+        """Get configuration value from parsed .env or from process environment."""
+        return self._env_vars.get(key, os.getenv(key, default))
     
     def validate(self, auto_fix: bool = False) -> Tuple[bool, List[str], List[str]]:
         """
@@ -103,12 +110,12 @@ class ConfigValidator:
     
     def _validate_required(self):
         """Validate required settings"""
-        paper = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
+        paper = self.get_env_value('PAPER_TRADING', 'true').lower() == 'true'
         if paper:
             return
 
         for key, message in self.REQUIRED_SETTINGS.items():
-            value = os.getenv(key, '')
+            value = self.get_env_value(key, '')
             if not value or value in (
                 '',
                 'your_api_key',
@@ -123,7 +130,7 @@ class ConfigValidator:
     def _validate_recommended(self, auto_fix: bool):
         """Validate recommended settings"""
         for key, (default, message) in self.RECOMMENDED_SETTINGS.items():
-            value = os.getenv(key, '')
+            value = self.get_env_value(key, '')
             if not value:
                 self.warnings.append(f"⚠️  MISSING: {key} - {message}")
                 if auto_fix:
@@ -133,7 +140,7 @@ class ConfigValidator:
     def _validate_ranges(self, auto_fix: bool):
         """Validate value ranges"""
         for key, (min_val, max_val, message) in self.VALUE_RANGES.items():
-            value_str = os.getenv(key, '')
+            value_str = self.get_env_value(key, '')
             if value_str:
                 try:
                     value = float(value_str)
@@ -153,21 +160,21 @@ class ConfigValidator:
     def _validate_consistency(self):
         """Validate logical consistency between settings"""
         # Paper trading with live credentials check
-        paper = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
-        has_creds = bool(os.getenv('ANGEL_API_KEY', ''))
+        paper = self.get_env_value('PAPER_TRADING', 'true').lower() == 'true'
+        has_creds = bool(self.get_env_value('ANGEL_API_KEY', ''))
         
         if not paper and not has_creds:
             self.errors.append("❌ Live trading enabled but no broker credentials configured!")
         
         # Stop loss vs take profit
-        sl = float(os.getenv('SL_POINTS', '6') or '6')
-        tp = float(os.getenv('TP_POINTS', '12') or '12')
+        sl = float(self.get_env_value('SL_POINTS', '6') or '6')
+        tp = float(self.get_env_value('TP_POINTS', '12') or '12')
         if tp <= sl:
             self.warnings.append(f"⚠️  Risk/Reward: TP ({tp}) should be greater than SL ({sl})")
         
         # Capital vs max loss
-        capital = float(os.getenv('TOTAL_CAPITAL', '30000') or '30000')
-        max_loss = float(os.getenv('MAX_DAILY_LOSS', '25000') or '25000')
+        capital = float(self.get_env_value('TOTAL_CAPITAL', '30000') or '30000')
+        max_loss = float(self.get_env_value('MAX_DAILY_LOSS', '25000') or '25000')
         if max_loss > capital * 0.5:
             self.warnings.append(
                 f"⚠️  Max daily loss (₹{max_loss:,.0f}) is more than 50% of capital (₹{capital:,.0f})"
