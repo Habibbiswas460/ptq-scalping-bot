@@ -4,53 +4,7 @@ SMART SCALP v3.4 - 4 Lot Configuration
 All settings from .env file ONLY (no JSON dependency)
 """
 
-import os
-from typing import List, Tuple
-from dotenv import load_dotenv
-
-# Load .env file
-load_dotenv()
-
-# =========================================================
-# ENVIRONMENT HELPERS
-# =========================================================
-
-def env_bool(key: str, default: bool = False) -> bool:
-    """Get boolean from environment"""
-    val = os.getenv(key, str(default)).lower()
-    return val in ('true', '1', 'yes', 'on')
-
-def env_int(key: str, default: int = 0) -> int:
-    """Get integer from environment"""
-    try:
-        return int(os.getenv(key, str(default)))
-    except (ValueError, TypeError):
-        return default
-
-def env_float(key: str, default: float = 0.0) -> float:
-    """Get float from environment"""
-    try:
-        return float(os.getenv(key, str(default)))
-    except (ValueError, TypeError):
-        return default
-
-def env_str(key: str, default: str = '') -> str:
-    """Get string from environment"""
-    return os.getenv(key, default)
-
-def parse_tsl_levels(levels_str: str) -> List[Tuple[int, int]]:
-    """Parse TSL levels from comma-separated string
-    Format: "8:4,12:7,16:11" -> [(8,4), (12,7), (16,11)]
-    """
-    if not levels_str:
-        return [(8, 4), (12, 7), (16, 11), (20, 15), (25, 20), (30, 25), (40, 35), (50, 45)]
-    
-    levels = []
-    for pair in levels_str.split(','):
-        if ':' in pair:
-            profit, lock = pair.strip().split(':')
-            levels.append((int(profit), int(lock)))
-    return levels if levels else [(8, 4), (12, 7), (16, 11), (20, 15)]
+from config.configuration import env_bool, env_float, env_int, env_str, parse_tsl_levels
 
 # =========================================================
 # 🔐 BROKER CREDENTIALS
@@ -93,6 +47,12 @@ EXCHANGE = env_str('EXCHANGE', 'NFO')
 OPTION_TYPE = env_str('OPTION_TYPE', 'CE')
 LOT_SIZE = env_int('LOT_SIZE', 65)
 NUM_LOTS = env_int('NUM_LOTS', 4)
+
+# Canonical India VIX contract (SmartAPI/OpenAPIScripMaster)
+INDIA_VIX_SYMBOL = 'INDIAVIX'
+INDIA_VIX_EXCHANGE = 'NSE'
+INDIA_VIX_TOKEN = '99926017'
+INDIA_VIX_INSTRUMENTTYPE = 'AMXIDX'
 
 # =========================================================
 # 🎯 POSITION SIZING (UPDATED v3.1 - Risk-Based)
@@ -267,6 +227,9 @@ TICK_TIMEOUT_SEC = env_int('TICK_TIMEOUT_SEC', 2)
 MIN_VOLUME = env_int('MIN_VOLUME', 100)
 MIN_OPTION_PRICE = env_int('MIN_OPTION_PRICE', 5)
 MAX_OPTION_PRICE = env_int('MAX_OPTION_PRICE', 500)
+STALE_THRESHOLD_MS_WEBSOCKET = env_int('WS_STALE_MS', 10000)
+STALE_THRESHOLD_MS_REST = env_int('REST_STALE_MS', 5000)
+STALE_THRESHOLD_MS_UNKNOWN = env_int('UNKNOWN_STALE_MS', 2000)
 
 # PTQ Validation
 VOLUME_EXPANSION_MIN = 0.8
@@ -422,6 +385,9 @@ CONFIG = {
         'min_volume': MIN_VOLUME,
         'min_option_price': MIN_OPTION_PRICE,
         'max_option_price': MAX_OPTION_PRICE,
+        'stale_threshold_ms_websocket': STALE_THRESHOLD_MS_WEBSOCKET,
+        'stale_threshold_ms_rest': STALE_THRESHOLD_MS_REST,
+        'stale_threshold_ms_unknown': STALE_THRESHOLD_MS_UNKNOWN,
         'min_spot_price': 15000,
         'max_spot_price': 35000,
     },

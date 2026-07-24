@@ -1,12 +1,24 @@
-"""Engines - Entry/Exit Logic & State Machine"""
-from core.engines.entry_engine import (
-    entry_signal, get_last_signal_params, 
-    get_signal_direction, get_signal_quantity,
-    get_signal_sl_points, get_signal_tp_points,
-    MAX_RECENT_TICKS
-)
-from core.engines.exit_engine import check_exit_conditions, get_step_trailing_sl
-from core.engines.state_machine import (
-    trading_state, state_idle, state_entry_ready,
-    state_in_trade, state_cooldown
-)
+"""Engines package (lazy exports).
+
+Importing this package should not eagerly load all engines, because some
+modules (like entry_engine) pull in runtime-only dependencies such as DB.
+"""
+
+from importlib import import_module
+from typing import Any
+
+
+def __getattr__(name: str) -> Any:
+    for module_name in (
+        "core.engines.entry_engine",
+        "core.engines.exit_engine",
+        "core.engines.state_machine",
+        "core.engines.position_size_engine",
+        "core.engines.market_quality_engine",
+        "core.engines.weighted_score_engine",
+        "core.engines.adaptive_confidence_engine",
+    ):
+        module = import_module(module_name)
+        if hasattr(module, name):
+            return getattr(module, name)
+    raise AttributeError(f"module 'core.engines' has no attribute '{name}'")

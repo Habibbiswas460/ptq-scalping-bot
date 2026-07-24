@@ -47,7 +47,7 @@ current_otp = totp.now()  # 6-digit code
 | Instrument | Token | Exchange | Description |
 |------------|-------|----------|-------------|
 | NIFTY 50 | 99926000 | NSE | NIFTY spot index |
-| India VIX | 26017 | NSE | Volatility index |
+| India VIX | 99926017 | NSE | Volatility index |
 | Bank NIFTY | 99926009 | NSE | Bank NIFTY spot |
 | NIFTY Options | Dynamic | NFO | Use `search_symbol` |
 
@@ -63,7 +63,7 @@ option_ltp = client.get_ltp("NFO", "NIFTY03FEB2625400CE", token)
 # Returns: 125.50
 
 # India VIX
-vix = client.get_ltp("NSE", "INDIAVIX", "26017")
+vix = client.get_ltp("NSE", "INDIAVIX", "99926017")
 # Returns: 14.32
 ```
 

@@ -23,10 +23,14 @@ Backtest Results (6 months):
 """
 
 import json
+from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 from datetime import datetime
 import os
 
+from core.engines.weighted_score_engine import WeightedScoreEngine
+from core.engines.adaptive_confidence_engine import AdaptiveConfidenceEngine
+from core.engines.market_quality_engine import MarketQualityEngine
 from config.constants import (
     SL_POINTS_FIXED, TP_POINTS_FIXED,
     CE_QUANTITY, PE_QUANTITY,
@@ -35,6 +39,11 @@ from config.constants import (
     MIN_ENTRY_PREMIUM, MAX_ENTRY_PREMIUM,
     TP_MULTIPLIER
 )
+
+try:
+    from core.runtime import runtime_state
+except Exception:
+    runtime_state = None
 
 # v3.1 Filter Constants
 VWAP_ENABLED = True
@@ -53,15 +62,24 @@ class SmartScalpV3:
     v3.4: Added VWAP, Delta, OI, Volume filters.
     Requires 4+ points and 70%+ confidence for entry.
     """
+
+    SCORE_CATEGORIES = [
+        (50, 'NO TRADE'),
+        (65, 'WEAK'),
+        (75, 'NORMAL'),
+        (85, 'STRONG'),
+        (100, 'INSTITUTIONAL'),
+    ]
     
     # Lazy import cache for circular import safety
     _trading_state = None
     _greeks_calculator = None
+    _project_root = Path(__file__).resolve().parent.parent
     
     def __init__(self, config_path: str = "config/bot_config.json"):
         """Initialize with config"""
         self.config = self._load_config(config_path)
-        self.strategy_config = self.config.get('strategy', {})
+        self.strategy_config = self._load_strategy_config()
         self.indicators_config = self.strategy_config.get('indicators', {})
         self.scoring_config = self.strategy_config.get('scoring_system', {})
         
@@ -85,13 +103,25 @@ class SmartScalpV3:
         self.min_score = self.scoring_config.get('min_score_to_trade', MIN_SCORE_TO_TRADE)
         self.min_confidence = self.scoring_config.get('min_confidence_pct', MIN_CONFIDENCE)
         self.max_confidence_score = self.scoring_config.get('max_confidence_score', MAX_CONFIDENCE_SCORE)
+        self.min_weighted_score_pct = self.scoring_config.get(
+            'min_weighted_score_pct',
+            int((self.min_score / max(1, self.max_confidence_score)) * 100)
+        )
         
         # Entry configs
         self.ce_config = self.strategy_config.get('ce_entry', {})
         self.pe_config = self.strategy_config.get('pe_entry', {})
+
+        self.weighted_score_engine = WeightedScoreEngine(
+            self.scoring_config.get('score_weights')
+        )
+        self.confidence_engine = AdaptiveConfidenceEngine(
+            self.scoring_config.get('confidence_weights')
+        )
+        self.market_quality_engine = MarketQualityEngine(
+            self.scoring_config.get('market_quality', {}).get('minimum_pct', 65)
+        )
         
-        # Cache for indicators
-        self._indicators_cache = {}
         self._last_calc_time = None
         
         # v3.1: Greeks and OI cache
@@ -110,6 +140,38 @@ class SmartScalpV3:
             except ImportError:
                 pass
         return SmartScalpV3._greeks_calculator
+
+    def calculate_weighted_score(self, indicators: Dict, latest_tick: Dict, direction: str, oi_direction: str) -> Tuple[int, Dict[str, int]]:
+        """Calculate weighted score using the modular weighted score engine."""
+        if 'regime' not in indicators or indicators.get('regime') == 'UNKNOWN':
+            indicators['regime'] = self.get_market_regime(indicators)
+        return self.weighted_score_engine.score(indicators, latest_tick, direction, oi_direction)
+
+    def calculate_adaptive_confidence(self, indicators: Dict, latest_tick: Dict, score_pct: int, direction: str, oi_direction: str) -> Tuple[int, Dict[str, int]]:
+        """Calculate adaptive confidence using the modular confidence engine."""
+        if 'regime' not in indicators or indicators.get('regime') == 'UNKNOWN':
+            indicators['regime'] = self.get_market_regime(indicators)
+        return self.confidence_engine.score(indicators, latest_tick, score_pct, direction, oi_direction)
+
+    def _score_to_confidence(self, score: int) -> int:
+        """Convert raw score into a normalized confidence percent."""
+        if self.max_confidence_score <= 0:
+            return 0
+        confidence = int((score / self.max_confidence_score) * 100)
+        return min(100, max(0, confidence))
+
+    def _load_strategy_config(self) -> Dict:
+        """Load strategy defaults from config/strategy.json and merge with bot config."""
+        strategy_defaults = self._load_config('config/strategy.json').get('strategy', {})
+        bot_strategy = self.config.get('strategy', {})
+
+        merged = strategy_defaults.copy()
+        for key, value in bot_strategy.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = {**merged[key], **value}
+            else:
+                merged[key] = value
+        return merged
     
     def get_option_delta(self, tick: Dict) -> Optional[float]:
         """
@@ -224,7 +286,15 @@ class SmartScalpV3:
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration file"""
         try:
-            with open(config_path, 'r') as f:
+            path = Path(config_path)
+            if not path.is_absolute():
+                path = self._project_root / path
+
+            if not path.exists():
+                # Optional config override file; defaults from constants/strategy are used.
+                return {}
+
+            with path.open('r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
             import logging
@@ -341,6 +411,17 @@ class SmartScalpV3:
         indicators['KC_Mid'] = kc_ema
         indicators['KC_Upper'] = kc_ema + self.kc_atr_mult * indicators['ATR']
         indicators['KC_Lower'] = kc_ema - self.kc_atr_mult * indicators['ATR']
+
+        # Lightweight supertrend proxy for runtime state continuity.
+        st_upper = indicators['EMA_21'] + (1.5 * indicators['ATR'])
+        st_lower = indicators['EMA_21'] - (1.5 * indicators['ATR'])
+        if prices[-1] > st_upper:
+            supertrend = "BULLISH"
+        elif prices[-1] < st_lower:
+            supertrend = "BEARISH"
+        else:
+            supertrend = "NEUTRAL"
+        indicators['Supertrend'] = supertrend
         
         # Squeeze Detection (BB inside KC)
         indicators['Squeeze'] = (
@@ -388,8 +469,9 @@ class SmartScalpV3:
         indicators['High'] = max(prices[-chunk_size:]) if chunk_size > 0 else prices[-1]
         indicators['Low'] = min(prices[-chunk_size:]) if chunk_size > 0 else prices[-1]
         
-        self._indicators_cache = indicators
         self._last_calc_time = datetime.now()
+        if runtime_state is not None:
+            runtime_state.set_indicators(indicators)
         
         return indicators
     
@@ -648,17 +730,17 @@ class SmartScalpV3:
             factors = ["❌Wrong_Trend"]
         
         return max(0, score), factors
-    
+
     def get_market_regime(self, indicators: Dict) -> str:
         """Determine market regime: BULLISH, BEARISH, or SIDEWAYS"""
         ema21 = indicators.get('EMA_21', 0)
         ema50 = indicators.get('EMA_50', 0)
-        
+
         if ema50 == 0:
             return "UNKNOWN"
-        
+
         diff_pct = abs(ema21 - ema50) / ema50
-        
+
         if diff_pct < 0.002:  # 0.2% difference
             return "SIDEWAYS"
         elif ema21 > ema50:
@@ -666,16 +748,6 @@ class SmartScalpV3:
         else:
             return "BEARISH"
 
-    def _score_to_confidence(self, score: int) -> int:
-        """Convert raw score into a confidence percentage relative to max score.
-
-        Returns a normalized confidence metric for reporting and gating.
-        """
-        if self.max_confidence_score <= 0:
-            return 0
-        confidence = int((score / self.max_confidence_score) * 100)
-        return min(100, max(0, confidence))
-    
     def generate_signal(self, ticks: List[Dict]) -> Tuple[int, str, int, Dict]:
         """
         Generate trading signal based on PULLBACK logic (not blind EMA crosses).
@@ -765,6 +837,41 @@ class SmartScalpV3:
             "oi_direction": oi_direction,
             "oi_change_pct": self._oi_change_pct
         }
+
+        market_quality = self.market_quality_engine.evaluate(
+            tick=latest_tick,
+            indicators=indicators,
+            greeks={'delta': self._last_delta} if self._last_delta is not None else {},
+            broker_status={
+                'ws_connected': not latest_tick.get('ws_disconnected', False),
+                'api_healthy': latest_tick.get('api_healthy', True),
+                'exchange_healthy': latest_tick.get('exchange_healthy', True),
+                'kill_switch_active': latest_tick.get('kill_switch_active', False),
+                'market_open': latest_tick.get('market_open', True),
+                'circuit_breaker_open': latest_tick.get('circuit_breaker_open', False),
+                'latency_ms': latest_tick.get('latency_ms', 0),
+                'recent_reconnects': latest_tick.get('recent_reconnects', 0),
+                'queue_depth': latest_tick.get('queue_depth', 0),
+            },
+            validator_result={
+                'is_valid': latest_tick.get('is_valid', True),
+                'reason': latest_tick.get('invalid_reason')
+            }
+        )
+        details['market_quality'] = market_quality
+        details['market_quality_pass'] = market_quality.get('passed', False)
+        details['market_quality_score'] = market_quality.get('quality_score', 0)
+        details['market_quality_grade'] = market_quality.get('grade', 'REJECT')
+        details['market_quality_components'] = market_quality.get('components', {})
+        details['hard_reject_reason'] = market_quality.get('hard_reject_reason')
+
+        if not market_quality.get('passed', False):
+            details["reason"] = (
+                market_quality.get('hard_reject_reason')
+                or market_quality.get('reason')
+                or f"Market quality gate failed: {market_quality.get('quality_score', 0)}"
+            )
+            return 0, "", 0, details
         
         # ═══════════════════════════════════════════════════════════════
         # PHASE 3: ENHANCED CHOP DETECTOR (v3.2)
@@ -937,6 +1044,78 @@ class SmartScalpV3:
         macd_hist = indicators.get('MACD_Hist', 0)
         macd_hist_prev = indicators.get('MACD_Hist_Prev', 0)
         
+        # Weighted score engine and trend exhaustion checks.
+        ce_weighted_pct = 0
+        pe_weighted_pct = 0
+
+        if ce_signal:
+            ce_weighted_pct, ce_components = self.calculate_weighted_score(
+                indicators, latest_tick, 'CE', oi_direction
+            )
+            ce_score_breakdown = {
+                'ema': ce_components.get('ema_trend', 0),
+                'vwap': ce_components.get('vwap', 0),
+                'delta': ce_components.get('delta', 0),
+                'volume': ce_components.get('volume', 0),
+                'oi': ce_components.get('oi', 0),
+                'rsi': ce_components.get('rsi', 0),
+                'macd': ce_components.get('macd', 0),
+                'atr': ce_components.get('atr_volatility', 0),
+                'premium': ce_components.get('premium_quality', 0),
+                'greeks': ce_components.get('greeks', 0),
+                'regime': ce_components.get('market_regime', 0),
+                'spread': ce_components.get('spread_quality', 0),
+                'raw_score': ce_components.get('_raw_score', 0),
+                'total_weight': ce_components.get('_total_weight', 0),
+                'normalized_score_pct': ce_components.get('_normalized_score_pct', ce_weighted_pct)
+            }
+            details["ce_weighted_score_pct"] = ce_weighted_pct
+            details["ce_score_components"] = ce_components
+            details["ce_score_breakdown"] = ce_score_breakdown
+            details["ce_score_trace"] = (
+                f"Raw Score {ce_score_breakdown['raw_score']}/{ce_score_breakdown['total_weight']}"
+                f" -> Normalized Score {ce_score_breakdown['normalized_score_pct']}%"
+            )
+            if ce_weighted_pct < self.min_weighted_score_pct:
+                ce_signal = False
+                details["ce_score_threshold_fail"] = (
+                    f"CE weighted score {ce_weighted_pct}% < {self.min_weighted_score_pct}%"
+                )
+
+        if pe_signal:
+            pe_weighted_pct, pe_components = self.calculate_weighted_score(
+                indicators, latest_tick, 'PE', oi_direction
+            )
+            pe_score_breakdown = {
+                'ema': pe_components.get('ema_trend', 0),
+                'vwap': pe_components.get('vwap', 0),
+                'delta': pe_components.get('delta', 0),
+                'volume': pe_components.get('volume', 0),
+                'oi': pe_components.get('oi', 0),
+                'rsi': pe_components.get('rsi', 0),
+                'macd': pe_components.get('macd', 0),
+                'atr': pe_components.get('atr_volatility', 0),
+                'premium': pe_components.get('premium_quality', 0),
+                'greeks': pe_components.get('greeks', 0),
+                'regime': pe_components.get('market_regime', 0),
+                'spread': pe_components.get('spread_quality', 0),
+                'raw_score': pe_components.get('_raw_score', 0),
+                'total_weight': pe_components.get('_total_weight', 0),
+                'normalized_score_pct': pe_components.get('_normalized_score_pct', pe_weighted_pct)
+            }
+            details["pe_weighted_score_pct"] = pe_weighted_pct
+            details["pe_score_components"] = pe_components
+            details["pe_score_breakdown"] = pe_score_breakdown
+            details["pe_score_trace"] = (
+                f"Raw Score {pe_score_breakdown['raw_score']}/{pe_score_breakdown['total_weight']}"
+                f" -> Normalized Score {pe_score_breakdown['normalized_score_pct']}%"
+            )
+            if pe_weighted_pct < self.min_weighted_score_pct:
+                pe_signal = False
+                details["pe_score_threshold_fail"] = (
+                    f"PE weighted score {pe_weighted_pct}% < {self.min_weighted_score_pct}%"
+                )
+
         # Get per-direction loss count from state machine
         try:
             # Lazy import with caching (avoids circular import issues)
@@ -975,12 +1154,20 @@ class SmartScalpV3:
                 pe_exhausted = True
                 details["exhaustion"] = pe_block_reason
         
-        # CE Signal: Score threshold met in uptrend (with exhaustion check)
-        if ce_signal and ce_score >= self.min_score and not ce_exhausted:
-            confidence = self._score_to_confidence(ce_score)
-            details["reason"] = f"📈 CE PULLBACK: Score {ce_score}/{self.max_confidence_score}, Conf {confidence}%"
-            details["bull_score"] = ce_score
+        # CE Signal: Weighted score and adaptive confidence
+        if ce_signal and not ce_exhausted:
+            confidence, confidence_components = self.calculate_adaptive_confidence(
+                indicators, latest_tick, ce_weighted_pct, 'CE', oi_direction
+            )
+            details["ce_confidence_components"] = confidence_components
+            details["score_breakdown"] = details.get("ce_score_breakdown", {})
+            details["confidence_breakdown"] = confidence_components
+            details["weighted_score"] = ce_weighted_pct
+            details["bull_score"] = ce_weighted_pct
             details["bull_factors"] = ce_factors
+            details["reason"] = (
+                f"📈 CE PULLBACK: Score {ce_weighted_pct}% | Conf {confidence}%"
+            )
             if confidence < self.min_confidence:
                 details["reason"] = f"Low confidence {confidence}% < {self.min_confidence}%"
                 return 0, "", 0, details
@@ -989,12 +1176,20 @@ class SmartScalpV3:
             details["reason"] = f"CE signal blocked: {details.get('exhaustion', 'Trend exhausted')}"
             return 0, "", 0, details
         
-        # PE Signal: Score threshold met in downtrend (with exhaustion check)
-        if pe_signal and pe_score >= self.min_score and not pe_exhausted:
-            confidence = self._score_to_confidence(pe_score)
-            details["reason"] = f"📉 PE PULLBACK: Score {pe_score}/{self.max_confidence_score}, Conf {confidence}%"
-            details["bear_score"] = pe_score
+        # PE Signal: Weighted score and adaptive confidence
+        if pe_signal and not pe_exhausted:
+            confidence, confidence_components = self.calculate_adaptive_confidence(
+                indicators, latest_tick, pe_weighted_pct, 'PE', oi_direction
+            )
+            details["pe_confidence_components"] = confidence_components
+            details["score_breakdown"] = details.get("pe_score_breakdown", {})
+            details["confidence_breakdown"] = confidence_components
+            details["weighted_score"] = pe_weighted_pct
+            details["bear_score"] = pe_weighted_pct
             details["bear_factors"] = pe_factors
+            details["reason"] = (
+                f"📉 PE PULLBACK: Score {pe_weighted_pct}% | Conf {confidence}%"
+            )
             if confidence < self.min_confidence:
                 details["reason"] = f"Low confidence {confidence}% < {self.min_confidence}%"
                 return 0, "", 0, details
@@ -1081,10 +1276,36 @@ def smart_scalp_signal(ticks: List[Dict]) -> Tuple[bool, str, Dict]:
     signal, direction, confidence, details = strategy.generate_signal(ticks)
     
     if signal == 0:
-        return False, details.get("reason", "No signal"), {}
+        if runtime_state is not None:
+            runtime_state.update_market_snapshot(
+                {
+                    "delta": details.get("delta"),
+                    "oi_direction": details.get("oi_direction"),
+                    "oi_change_pct": details.get("oi_change_pct"),
+                    "market_quality": details.get("market_quality"),
+                    "market_quality_grade": details.get("market_quality_grade"),
+                    "spread": (ticks[-1] or {}).get("spread") if ticks else None,
+                }
+            )
+            runtime_state.set_strategy_decision(
+                signal=False,
+                direction=direction or "",
+                score=details.get("weighted_score"),
+                confidence=confidence,
+                reject_reason=details.get("reason", "No signal"),
+                mq_grade=(details.get("market_quality") or {}).get("grade") if isinstance(details.get("market_quality"), dict) else details.get("market_quality_grade"),
+            )
+        return False, details.get("reason", "No signal"), {
+            "direction": direction or "",
+            "confidence": confidence,
+            "details": details,
+            "factors": []
+        }
     
     # Get entry parameters
-    indicators = strategy._indicators_cache
+    indicators = runtime_state.get_indicators() if runtime_state is not None else {}
+    if not indicators:
+        indicators = strategy.calculate_indicators(ticks)
     entry_params = strategy.get_entry_params(direction, confidence, indicators)
     
     # Build message
@@ -1096,13 +1317,34 @@ def smart_scalp_signal(ticks: List[Dict]) -> Tuple[bool, str, Dict]:
         f"Score: {details.get('bull_score' if direction == 'CE' else 'bear_score')} | "
         f"{factors_str}"
     )
+
+    if runtime_state is not None:
+        runtime_state.update_market_snapshot(
+            {
+                "delta": details.get("delta"),
+                "oi_direction": details.get("oi_direction"),
+                "oi_change_pct": details.get("oi_change_pct"),
+                "market_quality": details.get("market_quality"),
+                "market_quality_grade": details.get("market_quality_grade"),
+                "spread": (ticks[-1] or {}).get("spread") if ticks else None,
+                "strategy_regime": details.get("regime"),
+            }
+        )
+        runtime_state.set_strategy_decision(
+            signal=True,
+            direction=direction,
+            score=details.get("weighted_score"),
+            confidence=confidence,
+            reject_reason="",
+            mq_grade=(details.get("market_quality") or {}).get("grade") if isinstance(details.get("market_quality"), dict) else details.get("market_quality_grade"),
+        )
     
     return True, message, {
         "direction": direction,
+        "score": details.get('weighted_score'),
         "confidence": confidence,
         "sl_points": entry_params["sl_points"],
         "tp_points": entry_params["tp_points"],
-        "quantity": entry_params["quantity"],
         "regime": entry_params["regime"],
         "factors": factors,
         "details": details

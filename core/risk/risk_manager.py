@@ -112,8 +112,8 @@ class RiskManager:
     def get_vix(self) -> float:
         """Get India VIX value
         
-        Note: Angel One API doesn't support India VIX LTP fetch.
-        Using estimation from helpers module instead.
+        Uses real India VIX when available via helpers API path,
+        otherwise falls back to cached/estimated value.
         """
         global _fetch_real_vix_fn
         
@@ -485,6 +485,8 @@ class RiskManager:
         details = {
             'can_trade': True,
             'size_multiplier': 1.0,
+            'legacy_size_multiplier': 1.0,
+            'risk_budget': {},
             'reasons': [],
             'warnings': []
         }
@@ -555,8 +557,52 @@ class RiskManager:
         if locked:
             details['size_multiplier'] *= mult
             details['warnings'].append(reason)
+
+        details['legacy_size_multiplier'] = details['size_multiplier']
+        details['risk_budget'] = self.get_risk_budget()
+        details['risk_budget']['legacy_size_multiplier'] = round(details['size_multiplier'], 4)
+        details['risk_budget']['sizing_context'] = list(details['warnings'])
         
         return details['can_trade'], details
+
+    def get_risk_budget(self) -> Dict:
+        """Build a risk-budget payload for the position size engine."""
+        capital_cfg = self.config['capital']
+        trading_cfg = self.config['trading']
+        rm_cfg = self.config.get('risk_management', {})
+        recovery_cfg = self.config.get('recovery_mode', {})
+
+        current_equity = capital_cfg['total_capital'] + self.total_pnl
+        capital_utilization_pct = rm_cfg.get('capital_utilization_pct', 80) / 100
+        available_capital = max(0.0, current_equity * capital_utilization_pct)
+
+        per_trade_risk_amount = float(capital_cfg.get('risk_per_trade_amount', 0))
+        daily_risk_budget_amount = float(capital_cfg.get('max_daily_loss_amount', per_trade_risk_amount))
+        max_daily_loss_amount = float(capital_cfg.get('max_daily_loss_amount', 0))
+        consumed_daily_loss = max(0.0, -float(self.daily_pnl))
+        remaining_daily_loss_capacity = max(0.0, max_daily_loss_amount - consumed_daily_loss) if max_daily_loss_amount > 0 else daily_risk_budget_amount
+        remaining_risk_amount = max(0.0, min(per_trade_risk_amount, remaining_daily_loss_capacity, available_capital))
+
+        loss_utilization = (consumed_daily_loss / max_daily_loss_amount) if max_daily_loss_amount > 0 else 0.0
+        recovery_severity = (recovery_cfg.get('size_reduction_pct', 50) / 100) if self.recovery_mode else 0.0
+
+        return {
+            'capital': round(current_equity, 2),
+            'available_capital': round(available_capital, 2),
+            'per_trade_risk_amount': round(per_trade_risk_amount, 2),
+            'daily_risk_budget_amount': round(daily_risk_budget_amount, 2),
+            'daily_risk_budget_pct': round((daily_risk_budget_amount / current_equity), 6) if current_equity > 0 else 0.0,
+            'remaining_risk_amount': round(remaining_risk_amount, 2),
+            'remaining_risk_pct': round((remaining_risk_amount / current_equity), 6) if current_equity > 0 else 0.0,
+            'daily_loss_state': {
+                'loss_utilization': round(min(1.0, max(0.0, loss_utilization)), 4)
+            },
+            'recovery_mode': {
+                'active': bool(self.recovery_mode),
+                'severity': round(min(1.0, max(0.0, recovery_severity)), 4)
+            },
+            'lot_size': int(trading_cfg.get('lot_size', 1)),
+        }
     
     def get_final_position_size(self, entry_price: float = 100, spot_price: float = None) -> int:
         """Get final position size after all adjustments"""

@@ -48,6 +48,17 @@ EARLY_LOSS_CUT_TIME_SEC = 30 # Within 30 seconds of entry
 MAX_HOLD_TIME_SEC = 900
 
 
+def _audit_exit_event(logger, stage: str, trade: Dict, details: Dict):
+    """Emit lightweight audit logs for exit decisions without changing strategy behavior."""
+    if not logger:
+        return
+    try:
+        detail_text = " | ".join(f"{k}={v}" for k, v in details.items())
+        logger.info(f"EXIT_AUDIT | stage={stage} | direction={trade.get('direction', 'CE')} | {detail_text}")
+    except Exception:
+        pass
+
+
 def get_step_trailing_sl(trade: Dict, price_diff: float) -> Tuple[float, str]:
     """
     STEP TRAILING STOP LOSS - Pullback & Protect Strategy (OPTIMIZED)
@@ -150,7 +161,7 @@ def check_hard_sl(trade: Dict, tick: Dict, logger) -> Tuple[bool, str]:
     return False, ""
 
 
-def smart_rsi_exit(trade: Dict, rsi: float = None) -> Tuple[bool, str]:
+def smart_rsi_exit(trade: Dict, rsi: float = None, logger=None) -> Tuple[bool, str]:
     """
     PRIORITY 3: Smart RSI Exit
     
@@ -169,6 +180,11 @@ def smart_rsi_exit(trade: Dict, rsi: float = None) -> Tuple[bool, str]:
     
     # Only exit on RSI if we're in profit
     if price_diff < 2:
+        _audit_exit_event(logger, "RSI_EVAL", trade, {
+            "reason": "profit_threshold_not_met",
+            "price_diff": round(price_diff, 2),
+            "rsi": round(rsi, 2),
+        })
         return False, ""
     
     # CE trade: Exit on extreme overbought
@@ -182,7 +198,7 @@ def smart_rsi_exit(trade: Dict, rsi: float = None) -> Tuple[bool, str]:
     return False, ""
 
 
-def rsi_reversal_exit(trade: Dict, rsi: float = None) -> Tuple[bool, str]:
+def rsi_reversal_exit(trade: Dict, rsi: float = None, logger=None) -> Tuple[bool, str]:
     """
     PRIORITY 3b: RSI Reversal Exit (v3.3)
     
@@ -373,13 +389,13 @@ def check_exit_conditions(trade: Dict, tick: Dict, greeks: Dict,
         return True, greek_reason
     
     # Priority 4: Smart RSI exit (lock profits when momentum exhausted)
-    rsi_hit, rsi_reason = smart_rsi_exit(trade, rsi)
+    rsi_hit, rsi_reason = smart_rsi_exit(trade, rsi, logger)
     if rsi_hit:
         _cap_negative_pnl(trade)
         return True, rsi_reason
     
     # Priority 4b: RSI reversal exit (v3.3 - momentum shift)
-    reversal_hit, reversal_reason = rsi_reversal_exit(trade, rsi)
+    reversal_hit, reversal_reason = rsi_reversal_exit(trade, rsi, logger)
     if reversal_hit:
         _cap_negative_pnl(trade)
         return True, reversal_reason

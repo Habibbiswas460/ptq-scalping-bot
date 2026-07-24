@@ -9,11 +9,21 @@ Organized into 4 sub-modules:
 └── services/ : Dashboard, Database, Telegram, Session
 """
 
-# Main entry
-from core.main import main
+from importlib import import_module
+from typing import Any
 
-# Re-export from sub-modules for backwards compatibility
-from core.trading import *
-from core.engines import *
-from core.risk import *
-from core.services import *
+
+def main(*args: Any, **kwargs: Any):
+	"""Lazy proxy for core.main.main."""
+	from core.main import main as _main
+
+	return _main(*args, **kwargs)
+
+
+def __getattr__(name: str) -> Any:
+	"""Lazy lookup across core subpackages for backward compatibility."""
+	for module_name in ("core.trading", "core.engines", "core.risk", "core.services"):
+		module = import_module(module_name)
+		if hasattr(module, name):
+			return getattr(module, name)
+	raise AttributeError(f"module 'core' has no attribute '{name}'")

@@ -1,227 +1,103 @@
-# 📁 PTQ SCALPING BOT - PROJECT STRUCTURE
-## SMART SCALP v3.4 - File Organization
+# PTQ Scalping Bot Project Structure (RC2 Current)
 
-```
+## Top-Level
+
+```text
 PTQ-scalping bot/
-│
-├── 🚀 ENTRY POINT
-│   └── app.py                    # Main entry - Run: python app.py
-│
-├── ⚙️ CONFIG
-│   ├── .env                      # 🔐 All settings (credentials + config)
-│   └── config/
-│       ├── constants.py          # Loads .env → Python variables
-│       └── validator.py          # Startup config validation
-│
-├── 🧠 CORE (Trading Engine)
-│   ├── core/
-│   │   ├── __init__.py
-│   │   ├── main.py               # Main trading loop
-│   │   ├── backtest.py           # Backtesting engine
-│   │   │
-│   │   ├── 📁 engines/           # Signal Engines
-│   │   │   ├── __init__.py
-│   │   │   ├── entry_engine.py   # Entry signal logic
-│   │   │   ├── exit_engine.py    # Exit signal logic
-│   │   │   └── state_machine.py  # Bot state management
-│   │   │
-│   │   ├── 📁 risk/              # Risk Management
-│   │   │   ├── __init__.py
-│   │   │   ├── risk_manager.py   # VIX filter, drawdown, sizing
-│   │   │   ├── kill_switch.py    # Emergency stop (thread-safe)
-│   │   │   ├── validators.py     # Data & PTQ validation
-│   │   │   ├── greeks_calc.py    # Greeks from API
-│   │   │   └── session_trend.py  # Session trend tracking
-│   │   │
-│   │   ├── 📁 services/          # Services
-│   │   │   ├── __init__.py
-│   │   │   ├── database.py       # SQLite trade logging
-│   │   │   ├── telegram_bot.py   # Telegram notifications
-│   │   │   ├── mode_switch.py    # Adaptive mode switching
-│   │   │   └── session_manager.py# Session management
-│   │   │
-│   │   ├── 📁 trading/           # Trade Execution
-│   │   │   ├── __init__.py
-│   │   │   ├── broker.py         # Angel One interface + WebSocket
-│   │   │   └── trade_manager.py  # Trade execution wrapper
-│   │   │
-│   │   └── 📁 data/              # Runtime Data
-│   │       └── trades.db         # SQLite database
-│
-├── 📈 STRATEGIES
-│   └── strategies/
-│       ├── __init__.py
-│       └── smart_scalp_v3.py     # 🏆 SMART SCALP v3.4 (10+10 factors)
-│
-├── 🔌 BROKERS
-│   └── brokers/
-│       └── angel_one/
-│           ├── __init__.py
-│           ├── client.py          # SmartAPI client
-│           ├── exceptions.py      # Custom exceptions
-│           └── DOCUMENTATION.md   # API reference
-│
-├── 🛠️ UTILITIES
-│   └── utils/
-│       ├── __init__.py
-│       ├── helpers.py             # Helper functions
-│       ├── logger.py              # Logging system
-│       ├── greeks.py              # BSM calculator (cached)
-│       ├── analytics.py           # Performance analytics
-│       └── monitoring.py          # Health monitoring (BotMonitor)
-│
-├── 🧪 TESTS (75 tests)
-│   └── tests/
-│       ├── __init__.py
-│       ├── test_greeks.py
-│       ├── test_greeks_caching.py
-│       ├── test_kill_switch.py
-│       ├── test_batch_market_data.py
-│       ├── test_phases_3_4_5.py
-│       ├── test_analytics.py
-│       └── test_websocket.py
-│
-├── 💾 DATA & LOGS
-│   ├── data/
-│   │   └── trades.db             # SQLite database
-│   └── logs/
-│       └── YYYY-MM-DD/           # Daily logs
-│           ├── trades.csv
-│           ├── trades.json
-│           ├── summary.json
-│           └── events.json
-│
-└── 📚 DOCUMENTATION
-    ├── README.md                  # Project overview
-    ├── DOCUMENTATION.md           # Technical docs index
-    ├── PROJECT_STRUCTURE.md       # THIS FILE
-    └── FILE_STRUCTURE_GUIDE.md    # Detailed reading guide
+├── app.py
+├── run.sh
+├── README.md
+├── DOCUMENTATION.md
+├── PROJECT_STRUCTURE.md
+├── requirements.txt
+├── config/
+├── core/
+├── strategies/
+├── brokers/
+├── utils/
+├── tests/
+├── logs/
+├── data/
+└── archive/
 ```
 
----
+## Config
+- [config/configuration.py](config/configuration.py): env helper and root resolution
+- [config/constants.py](config/constants.py): runtime constants from env
+- [config/validator.py](config/validator.py): startup validation
+- [config/strategy.json](config/strategy.json): scoring and position-size config
 
-## 📋 FILE CATEGORIES
+## Core Runtime
+- [core/main.py](core/main.py): main loop
+- [core/runtime/state.py](core/runtime/state.py): shared RuntimeState
+- [core/trading/broker.py](core/trading/broker.py): broker interface and execution
+- [core/services/database.py](core/services/database.py): sqlite persistence
 
-### 🔐 Configuration (2 files)
-| File | Purpose |
-|------|---------|
-| `.env` | All settings: credentials, capital, SL/TP, indicators |
-| `config/constants.py` | Loads .env into Python constants |
-| `config/validator.py` | Validates config at startup |
+## Engines
+- [core/engines/entry_engine.py](core/engines/entry_engine.py)
+- [core/engines/exit_engine.py](core/engines/exit_engine.py)
+- [core/engines/state_machine.py](core/engines/state_machine.py)
+- [core/engines/market_quality_engine.py](core/engines/market_quality_engine.py)
+- [core/engines/position_size_engine.py](core/engines/position_size_engine.py)
+- [core/engines/weighted_score_engine.py](core/engines/weighted_score_engine.py)
+- [core/engines/adaptive_confidence_engine.py](core/engines/adaptive_confidence_engine.py)
 
-### 🧠 Core - Engines (3 files)
-| File | Purpose |
-|------|---------|
-| `core/engines/entry_engine.py` | Entry signal (score ≥ 5, confidence ≥ 70%) |
-| `core/engines/exit_engine.py` | Exit: SL -6, TP +12, breakeven, TSL |
-| `core/engines/state_machine.py` | States: IDLE → IN_TRADE → COOLDOWN |
+## Risk and Mode
+- [core/risk/risk_manager.py](core/risk/risk_manager.py)
+- [core/risk/validators.py](core/risk/validators.py)
+- [core/risk/kill_switch.py](core/risk/kill_switch.py)
+- [core/services/mode_switch.py](core/services/mode_switch.py)
 
-### 🧠 Core - Risk (5 files)
-| File | Purpose |
-|------|---------|
-| `core/risk/risk_manager.py` | VIX filter, drawdown, position sizing |
-| `core/risk/kill_switch.py` | Emergency stop (₹450 kill / ₹1.5K max loss / 3 consec SL) |
-| `core/risk/validators.py` | Data hygiene & PTQ validation |
-| `core/risk/greeks_calc.py` | Options Greeks (Delta, Gamma, Theta) |
-| `core/risk/session_trend.py` | Session trend & CE/PE gates |
+## Strategy
+- [strategies/smart_scalp_v3.py](strategies/smart_scalp_v3.py)
 
-### 🧠 Core - Services (4 files)
-| File | Purpose |
-|------|---------|
-| `core/services/database.py` | SQLite trade logging |
-| `core/services/telegram_bot.py` | Telegram alerts & send_alert() |
-| `core/services/mode_switch.py` | AGGRESSIVE → SAFE → LOCKDOWN |
-| `core/services/session_manager.py` | Trading session control |
+## Broker Integration
+- [brokers/angel_one/client.py](brokers/angel_one/client.py)
+- [brokers/angel_one/DOCUMENTATION.md](brokers/angel_one/DOCUMENTATION.md)
 
-### 🧠 Core - Trading (2 files)
-| File | Purpose |
-|------|---------|
-| `core/trading/broker.py` | Angel One interface, WebSocket, orders |
-| `core/trading/trade_manager.py` | Trade execution wrapper |
+India VIX canonical contract used by runtime:
+- NSE / INDIAVIX / 99926017
 
-### 📈 Strategy (1 file)
-| File | Purpose |
-|------|---------|
-| `strategies/smart_scalp_v3.py` | 🏆 Multi-factor scoring (10 bull + 10 bear) |
+## Validation (DVF)
+- [core/validation/signal_logger.py](core/validation/signal_logger.py)
+- [core/validation/paper_executor.py](core/validation/paper_executor.py)
+- [core/validation/decision_replay.py](core/validation/decision_replay.py)
+- [core/validation/calibration_engine.py](core/validation/calibration_engine.py)
+- [core/validation/analytics.py](core/validation/analytics.py)
+- [core/validation/validation_report.py](core/validation/validation_report.py)
+- [core/validation/exporter.py](core/validation/exporter.py)
 
-### 🔌 Broker (2 files)
-| File | Purpose |
-|------|---------|
-| `brokers/angel_one/client.py` | SmartAPI wrapper |
-| `brokers/angel_one/exceptions.py` | Error handling |
+## Utilities
+- [utils/helpers.py](utils/helpers.py)
+- [utils/market_readiness_checker.py](utils/market_readiness_checker.py)
+- [utils/mq_validation_report.py](utils/mq_validation_report.py)
+- plus analytics, logger, monitoring helpers
 
-### 🛠️ Utilities (5 files)
-| File | Purpose |
-|------|---------|
-| `utils/helpers.py` | Common helper functions |
-| `utils/logger.py` | Logging system |
-| `utils/greeks.py` | BSM calculator (cached) |
-| `utils/analytics.py` | Performance analytics |
-| `utils/monitoring.py` | Health monitoring (BotMonitor) |
+## Tests
+The suite includes legacy and RC2 coverage groups.
 
----
+RC2-focused examples:
+- [tests/test_smart_scalp_confidence.py](tests/test_smart_scalp_confidence.py)
+- [tests/test_websocket.py](tests/test_websocket.py)
+- [tests/test_dvf_pipeline.py](tests/test_dvf_pipeline.py)
+- [tests/test_dvf_signal_logger.py](tests/test_dvf_signal_logger.py)
+- [tests/test_position_size_engine.py](tests/test_position_size_engine.py)
+- [tests/test_position_size_integration.py](tests/test_position_size_integration.py)
+- [tests/test_readiness_policy.py](tests/test_readiness_policy.py)
+- [tests/test_validator_config.py](tests/test_validator_config.py)
 
-## 🚀 HOW TO RUN
+RC2 Freeze verification snapshot:
+- 151 passed
+- 1 skipped
 
-```bash
-# 1. Activate virtual environment
-source venv/bin/activate
+## Archive
+Historical reports and freeze records:
+- [archive/reports](archive/reports)
+- [archive/audits](archive/audits)
+- [archive/freeze](archive/freeze)
+- [archive/root_cause](archive/root_cause)
 
-# 2. Run the bot
-python app.py
-
-# 3. Run tests
-python -m pytest tests/ -v
-```
-
----
-
-## 📊 CONFIG FLOW
-
-```
-.env (all settings)
-    ↓
-config/constants.py (load to Python)
-    ↓
-config/validator.py (validate at startup)
-    ↓
-All core modules import from constants
-```
-
----
-
-## 📈 TRADING FLOW
-
-```
-app.py
-    ↓
-core/main.py (main loop)
-    ↓
-core/engines/state_machine.py (state management)
-    ↓
-├── core/engines/entry_engine.py + strategies/smart_scalp_v3.py
-├── core/trading/broker.py (orders + slippage guard)
-├── core/engines/exit_engine.py (SL/TP/TSL)
-├── core/risk/risk_manager.py + core/risk/kill_switch.py
-└── core/services/telegram_bot.py + core/services/database.py
-```
-
----
-
-## 💡 KEY FEATURES
-
-| Feature | Location |
-|---------|----------|
-| 🏆 SMART SCALP v3.4 | `strategies/smart_scalp_v3.py` |
-| 📊 Multi-factor Scoring | Score ≥ 5, Confidence ≥ 70% |
-| 🛡️ TSL Step Levels | 10 profit lock steps |
-| 🚨 Kill Switch | `core/risk/kill_switch.py` |
-| 📈 Greeks Filter | `core/risk/greeks_calc.py` |
-| 📱 Telegram Alerts | `core/services/telegram_bot.py` |
-| 💾 Trade History | `core/services/database.py` (SQLite) |
-| 🔄 Adaptive Modes | AGGRESSIVE → SAFE → LOCKDOWN |
-| 🧪 Test Suite | 75 tests passing |
-
----
-
-**Total: ~30 Python files | 8 folders | Fully .env configured | v3.4**
+## Freeze Status
+- RC1 technical verification completed.
+- RC2 operational verification completed (pre-release).
+- Freeze Candidate documentation aligned for RC2 commit preparation.

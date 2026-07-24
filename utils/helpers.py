@@ -5,9 +5,15 @@ Utility functions used across the bot
 
 import time
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 
-from config.constants import TEST_MODE, LOT_SIZE
+from config.constants import (
+    TEST_MODE,
+    LOT_SIZE,
+    INDIA_VIX_EXCHANGE,
+    INDIA_VIX_SYMBOL,
+    INDIA_VIX_TOKEN,
+)
 
 
 def current_time_ms() -> int:
@@ -124,8 +130,14 @@ def calculate_trade_pnl(trade: Dict, tick: Dict) -> float:
 _vix_cache = {
     'value': 15.0,
     'last_fetch': None,
-    'broker_client': None
+    'broker_client': None,
+    'last_error_code': None,
+    'last_error_at': None,
+    'last_attempt': None,
 }
+
+_VIX_FETCH_INTERVAL_SEC = 60
+_VIX_ERROR_RETRY_SEC = 300
 
 
 def set_vix_broker_client(broker_client):
@@ -136,31 +148,66 @@ def set_vix_broker_client(broker_client):
 
 def fetch_real_vix() -> float:
     """Fetch real India VIX from Angel One API
-    
-    India VIX Token: 999920005 on NSE
+
+    Uses canonical India VIX contract from config.constants.
+    """
+    value, _meta = fetch_real_vix_with_meta()
+    return value if value is not None else _vix_cache['value']
+
+
+def fetch_real_vix_with_meta() -> Tuple[Optional[float], Dict[str, Any]]:
+    """Fetch real India VIX with source metadata.
+
+    Returns:
+        (value, meta) where meta contains:
+        - source: real | cache | error
+        - error_code: broker error code when available (e.g., AB4046)
     """
     global _vix_cache
-    from datetime import datetime
-    
-    # Check if we have broker client and cache is stale (> 60 seconds)
+
     broker_client = _vix_cache.get('broker_client')
     last_fetch = _vix_cache.get('last_fetch')
-    
-    # Try to fetch real VIX if cache is stale
-    if broker_client:
+    now = datetime.now()
+
+    last_attempt = _vix_cache.get('last_attempt')
+
+    # Do not hammer API after repeated failures.
+    if last_attempt is not None:
+        retry_wait = _VIX_ERROR_RETRY_SEC if _vix_cache.get('last_error_code') else _VIX_FETCH_INTERVAL_SEC
+        if (now - last_attempt).total_seconds() < retry_wait:
+            if _vix_cache.get('last_fetch') is not None:
+                return _vix_cache['value'], {'source': 'cache', 'error_code': _vix_cache.get('last_error_code')}
+            return None, {'source': 'error', 'error_code': _vix_cache.get('last_error_code')}
+
+    # Try real fetch when cache is stale.
+    if broker_client and (last_fetch is None or (now - last_fetch).total_seconds() > _VIX_FETCH_INTERVAL_SEC):
+        _vix_cache['last_attempt'] = now
         try:
-            now = datetime.now()
-            if last_fetch is None or (now - last_fetch).total_seconds() > 60:
-                # India VIX token on NSE
-                vix_ltp = broker_client.get_ltp("NSE", "INDIAVIX", "999920005")
-                if vix_ltp and 5 <= vix_ltp <= 100:  # Valid VIX range
-                    _vix_cache['value'] = vix_ltp
-                    _vix_cache['last_fetch'] = now
-                    return vix_ltp
-        except Exception:
-            pass  # Fall back to cached value
-    
-    return _vix_cache['value']
+            vix_ltp = broker_client.get_ltp(INDIA_VIX_EXCHANGE, INDIA_VIX_SYMBOL, INDIA_VIX_TOKEN)
+            if vix_ltp and 5 <= vix_ltp <= 100:
+                _vix_cache['value'] = vix_ltp
+                _vix_cache['last_fetch'] = now
+                _vix_cache['last_error_code'] = None
+                _vix_cache['last_error_at'] = None
+                return vix_ltp, {'source': 'real', 'error_code': None}
+
+            # Explicitly mark unsuccessful fetch to activate retry throttle.
+            _vix_cache['last_error_code'] = _vix_cache.get('last_error_code') or 'NO_DATA'
+            _vix_cache['last_error_at'] = now
+        except Exception as e:
+            err_text = str(e)
+            error_code = None
+            if "AB4046" in err_text:
+                error_code = "AB4046"
+            _vix_cache['last_error_code'] = error_code
+            _vix_cache['last_error_at'] = now
+
+    # If we have a previously fetched real value, use cache.
+    if _vix_cache.get('last_fetch') is not None:
+        return _vix_cache['value'], {'source': 'cache', 'error_code': _vix_cache.get('last_error_code')}
+
+    # No real value available yet.
+    return None, {'source': 'error', 'error_code': _vix_cache.get('last_error_code')}
 
 
 def estimate_vix_from_ticks(ticks: list, current_vix: float = 15.0) -> float:

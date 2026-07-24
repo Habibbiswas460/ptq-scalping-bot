@@ -1,7 +1,7 @@
 #!/bin/bash
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║                    PTQ SCALPING BOT - CONTROL CENTER v5.0                    ║
-# ║                        SMART SCALP v3.4 ENGINE                               ║
+# ║                    PTQ SCALPING BOT - CONTROL CENTER v5.1                    ║
+# ║                        SMART SCALP v3.5 ENGINE                               ║
 # ║                                                                              ║
 # ║  MENU-ONLY LAUNCHER | ENTIRE PROJECT MANAGEMENT | ANIMATED UI               ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -43,6 +43,42 @@ G10='\033[38;5;21m'; G11='\033[38;5;93m'; G12='\033[38;5;201m'
 # ═══════════════════════════════════════════════════════════════════════════════
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
+
+BOT_VERSION="v5.1"
+ENGINE_VERSION="v3.5"
+READINESS_VERSION="v2.0.0"
+RUN_MODE="menu"
+NO_ANIMATION="false"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --version)
+            RUN_MODE="version"
+            ;;
+        --readiness)
+            RUN_MODE="readiness"
+            ;;
+        --health)
+            RUN_MODE="health"
+            ;;
+        --no-animation)
+            NO_ANIMATION="true"
+            ;;
+        *)
+            printf "Unknown option: %s\n" "$1"
+            printf "Usage: ./run.sh [--version|--readiness|--health|--no-animation]\n"
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+PYTHON_BIN="python3"
+PIP_BIN="pip"
+if [ -x "$SCRIPT_DIR/venv/bin/python" ]; then
+    PYTHON_BIN="$SCRIPT_DIR/venv/bin/python"
+    PIP_BIN="$SCRIPT_DIR/venv/bin/pip"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPER: Read .env value safely
@@ -93,6 +129,142 @@ press_enter() {
     read -r
 }
 
+run_market_readiness_check() {
+    local profile="${1:-standard}"
+    local sample_seconds="${2:-35}"
+    local tick_interval="${3:-0.5}"
+    local min_ticks="${4:-60}"
+    local out_json="logs/readiness/latest_readiness.json"
+    local out_md="logs/readiness/latest_readiness.md"
+
+    mkdir -p "logs/readiness"
+
+    # Toggle pre-open launch policy from environment/.env.
+    STRICT_PREOPEN_GATE="${STRICT_PREOPEN_GATE:-$(get_env "STRICT_PREOPEN_GATE" "false")}"
+    export STRICT_PREOPEN_GATE
+
+    printf "\n    ${BWHITE}▶ Running Market Readiness Check...${NC}\n\n"
+    "$PYTHON_BIN" utils/market_readiness_checker.py \
+        --profile "$profile" \
+        --sample-seconds "$sample_seconds" \
+        --tick-interval "$tick_interval" \
+        --min-ticks "$min_ticks" \
+        --json-out "$out_json" \
+        --md-out "$out_md"
+
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        printf "\n    ${BRED}✗ Readiness checker failed to run (exit: ${rc})${NC}\n"
+        return 1
+    fi
+
+    local readiness_note
+    readiness_note=$("$PYTHON_BIN" - <<'PY'
+import json
+from pathlib import Path
+
+p = Path('logs/readiness/latest_readiness.json')
+if not p.exists():
+    print('')
+else:
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+        checks = data.get('checks', [])
+        has_preopen_defer = any('pre-open' in str(item.get('detail', '')).lower() for item in checks)
+        print('preopen_deferred' if has_preopen_defer else '')
+    except Exception:
+        print('')
+PY
+)
+
+    if [ "$readiness_note" = "preopen_deferred" ]; then
+        printf "\n    ${BYELLOW}ℹ Pre-open detected: live feed checks deferred until market open.${NC}\n"
+    fi
+
+    local readiness_status
+    local launch_allowed
+    read -r readiness_status launch_allowed <<EOF
+$("$PYTHON_BIN" - <<'PY'
+import json
+from pathlib import Path
+p = Path('logs/readiness/latest_readiness.json')
+if not p.exists():
+    print('NOT_READY false')
+else:
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+        status = str(data.get('overall_status') or ('READY' if data.get('overall_ready') else 'NOT_READY'))
+        allowed = bool(data.get('launch_allowed'))
+        print(f"{status} {'true' if allowed else 'false'}")
+    except Exception:
+        print('NOT_READY false')
+PY
+)
+EOF
+
+    if [ "$launch_allowed" = "true" ] && [ "$readiness_status" = "READY" ]; then
+        printf "\n    ${BGREEN}✓ Readiness PASS — Safe to launch${NC}\n"
+        return 0
+    fi
+
+    if [ "$launch_allowed" = "true" ] && [ "$readiness_status" = "DEFERRED" ]; then
+        printf "\n    ${BYELLOW}ℹ Readiness DEFERRED (pre-open) — launch allowed, live feed checks continue after market open.${NC}\n"
+        return 0
+    fi
+
+    if [ "$readiness_status" = "DEFERRED" ]; then
+        printf "\n    ${BRED}✗ Readiness DEFERRED but STRICT_PREOPEN_GATE=true — Launch blocked${NC}\n"
+        printf "    ${DIM}Set STRICT_PREOPEN_GATE=false to allow pre-open deferred launch.${NC}\n"
+        return 1
+    fi
+
+    printf "\n    ${BRED}✗ Readiness FAIL — Launch blocked${NC}\n"
+    printf "    ${DIM}See: logs/readiness/latest_readiness.json / .md${NC}\n"
+    return 1
+}
+
+run_technical_startup_check() {
+    printf "\n    ${BWHITE}▶ Running Technical Startup Check...${NC}\n"
+
+    local api_key client_id password totp_secret
+    api_key=$(get_env "ANGEL_API_KEY" "")
+    client_id=$(get_env "ANGEL_CLIENT_ID" "")
+    password=$(get_env "ANGEL_PASSWORD" "")
+    totp_secret=$(get_env "ANGEL_TOTP_SECRET" "")
+
+    if [ -z "$api_key" ] || [ -z "$client_id" ] || [ -z "$password" ] || [ -z "$totp_secret" ]; then
+        printf "    ${BRED}✗ Technical FAIL — Missing credentials in .env${NC}\n"
+        return 1
+    fi
+
+    if ! timeout 20 "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import importlib
+
+importlib.import_module('config.constants')
+importlib.import_module('config.validator')
+importlib.import_module('core.services.database')
+
+from core.services.database import db
+
+with db._get_connection() as conn:
+    conn.execute('SELECT 1')
+PY
+    then
+        printf "    ${BRED}✗ Technical FAIL — Config/Import/Database check failed${NC}\n"
+        return 1
+    fi
+
+    # Filesystem sanity (no network): ensure logs/readiness path is writable.
+    if ! mkdir -p logs/readiness 2>/dev/null || ! : > logs/readiness/.startup_probe 2>/dev/null; then
+        printf "    ${BRED}✗ Technical FAIL — File system not writable (logs/readiness)${NC}\n"
+        return 1
+    fi
+    rm -f logs/readiness/.startup_probe 2>/dev/null
+
+    printf "    ${BGREEN}✓ Technical PASS — Startup health validated${NC}\n"
+    return 0
+}
+
 get_market_status() {
     local hour=$(date +%H)
     local minute=$(date +%M)
@@ -113,11 +285,93 @@ get_time_to_market() {
     else echo "0m"; fi
 }
 
+discover_test_files() {
+    find tests -maxdepth 1 -type f -name 'test_*.py' 2>/dev/null | sort
+}
+
+run_full_project_check() {
+    echo ""
+    printf "    ${BWHITE}▶ FULL PROJECT CHECK${NC}\n"
+    draw_line "─" 70 "$CYAN"
+
+    local py_bin="$PYTHON_BIN"
+    local checks_passed=0
+    local checks_failed=0
+    local temp_log="/tmp/ptq_preflight.log"
+
+    printf "      ${CYAN}├─${NC} Critical files : "
+    for f in app.py core/main.py core/risk/validators.py core/engines/exit_engine.py config/constants.py config/validator.py strategies/smart_scalp_v3.py brokers/angel_one/client.py; do
+        if [ -f "$f" ]; then
+            :
+        else
+            printf "${BRED}✗${NC}\n"
+            printf "      ${BRED}   Missing file: %s${NC}\n" "$f"
+            checks_failed=$((checks_failed + 1))
+            return 1
+        fi
+    done
+    printf "${BGREEN}✓${NC}\n"
+    checks_passed=$((checks_passed + 1))
+
+    printf "      ${CYAN}├─${NC} Syntax check   : "
+    if "$py_bin" -m py_compile app.py core/main.py core/risk/validators.py core/engines/exit_engine.py config/constants.py config/validator.py >/dev/null 2>&1; then
+        printf "${BGREEN}✓${NC}\n"
+        checks_passed=$((checks_passed + 1))
+    else
+        printf "${BRED}✗${NC}\n"
+        checks_failed=$((checks_failed + 1))
+    fi
+
+    printf "      ${CYAN}├─${NC} Imports        : "
+    if "$py_bin" -c "import config.constants; import config.validator; import utils.logger; import brokers.angel_one.client" >/dev/null 2>&1; then
+        printf "${BGREEN}✓${NC}\n"
+        checks_passed=$((checks_passed + 1))
+    else
+        printf "${BYELLOW}⚠${NC}\n"
+        checks_failed=$((checks_failed + 1))
+    fi
+
+    printf "      ${CYAN}├─${NC} Config check   : "
+    if "$py_bin" -m config.validator >/dev/null 2>&1; then
+        printf "${BGREEN}✓${NC}\n"
+        checks_passed=$((checks_passed + 1))
+    else
+        printf "${BYELLOW}⚠${NC}\n"
+        checks_failed=$((checks_failed + 1))
+    fi
+
+    printf "      ${CYAN}├─${NC} Test discovery : "
+    local discovered_tests=()
+    while IFS= read -r f; do
+        [ -n "$f" ] && discovered_tests+=("$f")
+    done < <(discover_test_files)
+    if [ ${#discovered_tests[@]} -gt 0 ]; then
+        printf "${BGREEN}✓ ${#discovered_tests[@]} files (quick)${NC}\n"
+        checks_passed=$((checks_passed + 1))
+    else
+        printf "${BYELLOW}⚠ no tests found${NC}\n"
+        checks_failed=$((checks_failed + 1))
+    fi
+
+    printf "      ${CYAN}└─${NC} Summary        : "
+    if [ $checks_failed -eq 0 ]; then
+        printf "${BGREEN}✓ ${checks_passed} checks passed${NC}\n"
+    else
+        printf "${BYELLOW}⚠ ${checks_failed} issues found${NC}\n"
+    fi
+
+    echo ""
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # BOOT SEQUENCE
 # ═══════════════════════════════════════════════════════════════════════════════
 boot_sequence() {
     clear
+
+    if [ "$NO_ANIMATION" = "true" ]; then
+        return
+    fi
 
     # Matrix rain intro
     printf "\033[?25l"
@@ -182,7 +436,7 @@ boot_sequence() {
     echo -e "    ${G11}║${NC}                                                                   ${G11}║${NC}"
 
     # Subtitle pulse
-    pulse_text "⚡ SMART SCALP v3.4 │ CONTROL CENTER v5.0 ⚡"
+    pulse_text "⚡ SMART SCALP v3.5 │ CONTROL CENTER v5.1 ⚡"
     printf "              ${G11}║${NC}"
     printf "\n"
 
@@ -198,7 +452,7 @@ boot_sequence() {
     draw_line "─" 70 "$DIM"
 
     printf "      ${CYAN}├─${NC} Python         : "
-    PYTHON_VER=$(python3 --version 2>&1 | awk '{print $2}')
+    PYTHON_VER=$("$PYTHON_BIN" --version 2>&1 | awk '{print $2}')
     printf "${BGREEN}✓ ${PYTHON_VER}${NC}\n"
 
     printf "      ${CYAN}├─${NC} Virtual Env    : "
@@ -206,7 +460,11 @@ boot_sequence() {
         printf "${BGREEN}✓ Active${NC}\n"
     else
         printf "${BYELLOW}Creating...${NC}\n"
-        python3 -m venv venv 2>/dev/null
+        "$PYTHON_BIN" -m venv venv 2>/dev/null
+        if [ -x "$SCRIPT_DIR/venv/bin/python" ]; then
+            PYTHON_BIN="$SCRIPT_DIR/venv/bin/python"
+            PIP_BIN="$SCRIPT_DIR/venv/bin/pip"
+        fi
         printf "\r      ${CYAN}├─${NC} Virtual Env    : ${BGREEN}✓ Created${NC}\n"
     fi
 
@@ -217,7 +475,7 @@ boot_sequence() {
         printf "${BGREEN}✓ Ready${NC}\n"
     else
         printf "${BYELLOW}Installing...${NC}"
-        pip install -r requirements.txt -q 2>/dev/null
+        "$PIP_BIN" install -r requirements.txt -q 2>/dev/null
         touch venv/.installed
         printf "\r      ${CYAN}├─${NC} Dependencies   : ${BGREEN}✓ Installed${NC}    \n"
     fi
@@ -232,11 +490,13 @@ boot_sequence() {
     fi
 
     printf "      ${CYAN}├─${NC} Core Files     : "
-    if python3 -c "import ast; ast.parse(open('app.py').read()); ast.parse(open('core/main.py').read())" 2>/dev/null; then
+    if "$PYTHON_BIN" -c "import ast; ast.parse(open('app.py').read()); ast.parse(open('core/main.py').read())" 2>/dev/null; then
         printf "${BGREEN}✓ Syntax OK${NC}\n"
     else
         printf "${BRED}✗ Syntax Error${NC}\n"
     fi
+
+    run_full_project_check
 
     printf "      ${CYAN}└─${NC} Market         : "
     MSTATUS=$(get_market_status)
@@ -251,6 +511,19 @@ boot_sequence() {
     sleep 0.5
 }
 
+print_version_panel() {
+    echo ""
+    printf "    ${BWHITE}🧾 VERSION & STATUS${NC}\n"
+    draw_line "═" 62 "$BPURPLE"
+    printf "    ${BCYAN}Project:${NC}         ${BWHITE}PTQ Scalping Bot${NC}\n"
+    printf "    ${BCYAN}Control Center:${NC}  ${BWHITE}%s${NC}\n" "$BOT_VERSION"
+    printf "    ${BCYAN}Strategy Engine:${NC} ${BWHITE}%s${NC}\n" "$ENGINE_VERSION"
+    printf "    ${BCYAN}Readiness Pro:${NC}   ${BWHITE}%s${NC}\n" "$READINESS_VERSION"
+    printf "    ${BCYAN}Paper Trading:${NC}   ${BWHITE}%s${NC}\n" "$(get_env "PAPER_TRADING" "true")"
+    printf "    ${BCYAN}Live Data:${NC}       ${BWHITE}%s${NC}\n" "$(get_env "USE_LIVE_DATA" "true")"
+    echo ""
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ███  LEVEL 1: MAIN MENU  ███
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -259,18 +532,19 @@ show_main_menu() {
     echo ""
     printf "${BCYAN}"
     echo "    ╔══════════════════════════════════════════════════════════════════╗"
-    printf "    ║     ${BWHITE}PTQ SCALPING BOT ─ CONTROL CENTER v5.0${BCYAN}                       ║\n"
-    printf "    ║     ${DIM}SMART SCALP v3.4 │ $(date '+%Y-%m-%d %H:%M') │ Menu Mode${BCYAN}         ║\n"
+    printf "    ║     ${BWHITE}PTQ SCALPING BOT ─ CONTROL CENTER v5.1${BCYAN}                       ║\n"
+    printf "    ║     ${DIM}SMART SCALP v3.5 │ $(date '+%Y-%m-%d %H:%M') │ Menu Mode${BCYAN}         ║\n"
     echo "    ╠══════════════════════════════════════════════════════════════════╣"
     echo "    ║                                                                  ║"
     printf "    ║   ${G8}[1]${BCYAN} 🚀 Start Trading        ${DIM}Paper or Live mode${BCYAN}                ║\n"
     printf "    ║   ${BYELLOW}[2]${BCYAN} 📊 Analytics & Reports  ${DIM}PnL, win rate, calendar${BCYAN}            ║\n"
     printf "    ║   ${BPURPLE}[3]${BCYAN} 📈 Backtest Engine      ${DIM}Historical strategy test${BCYAN}           ║\n"
-    printf "    ║   ${G12}[4]${BCYAN} 🧪 Test Suite           ${DIM}75 unit tests + syntax${BCYAN}              ║\n"
+    printf "    ║   ${G12}[4]${BCYAN} 🧪 Test Suite           ${DIM}Pytest files in tests/${BCYAN}             ║\n"
     printf "    ║   ${BWHITE}[5]${BCYAN} ⚙️  Configuration        ${DIM}View & validate .env${BCYAN}              ║\n"
     printf "    ║   ${G7}[6]${BCYAN} 📋 Log Viewer           ${DIM}Browse daily trade logs${BCYAN}             ║\n"
     printf "    ║   ${G9}[7]${BCYAN} 🩺 System Health        ${DIM}Full diagnostic check${BCYAN}               ║\n"
     printf "    ║   ${G1}[8]${BCYAN} 🔧 Project Tools        ${DIM}Cleanup, structure, docs${BCYAN}            ║\n"
+    printf "    ║   ${G9}[9]${BCYAN} 🧾 Version & Changelog  ${DIM}Build info and recent updates${BCYAN}       ║\n"
     printf "    ║   ${DIM}[0]${BCYAN} 🚪 Exit                                                  ║\n"
     echo "    ║                                                                  ║"
     echo "    ╚══════════════════════════════════════════════════════════════════╝"
@@ -294,7 +568,7 @@ show_main_menu() {
     esac
     printf "${NC}\n\n"
 
-    printf "    ${BWHITE}Select [0-8]: ${NC}"
+    printf "    ${BWHITE}Select [0-9]: ${NC}"
     read -r choice
 
     case $choice in
@@ -306,6 +580,7 @@ show_main_menu() {
         6) menu_logs ;;
         7) menu_health ;;
         8) menu_tools ;;
+        9) menu_version ;;
         0)
             echo ""
             printf "    ${BGREEN}Goodbye! Happy Trading! 📈${NC}\n\n"
@@ -348,6 +623,17 @@ menu_trading() {
     case $tchoice in
         1)
             printf "\n    ${BGREEN}✓ Paper Trading Mode${NC}\n"
+            # Paper mode with live market data (orders remain paper/simulated).
+            export PAPER_TRADING=true
+            export USE_LIVE_DATA=true
+            export STARTUP_READINESS_PROFILE=standard
+            export READINESS_ENFORCE_LAUNCH_ALLOWED=false
+            if ! run_technical_startup_check; then
+                printf "\n    ${BRED}✗ Startup blocked due to technical failure.${NC}\n"
+                press_enter
+                menu_trading
+                return
+            fi
             sleep 0.5
             launch_bot "true"
             ;;
@@ -361,6 +647,14 @@ menu_trading() {
                 ACTUAL_ID=$(get_env "ANGEL_CLIENT_ID" "")
                 if [ -n "$ACTUAL_ID" ] && [ "$confirm_id" = "$ACTUAL_ID" ]; then
                     printf "    ${BRED}💰 LIVE TRADING ACTIVATED${NC}\n"
+                    export STARTUP_READINESS_PROFILE=strict
+                    export READINESS_ENFORCE_LAUNCH_ALLOWED=true
+                    if ! run_technical_startup_check; then
+                        printf "\n    ${BRED}✗ Live mode blocked due to technical startup failure.${NC}\n"
+                        press_enter
+                        menu_trading
+                        return
+                    fi
                     sleep 1
                     launch_bot "false"
                 else
@@ -382,7 +676,13 @@ menu_trading() {
 launch_bot() {
     local paper_mode="$1"
     export PAPER_TRADING="$paper_mode"
-    export USE_LIVE_DATA=true
+    # Keep runtime mode aligned with readiness decision.
+    # Paper mode can still use live data; live mode always uses live data.
+    if [ "$paper_mode" = "true" ]; then
+        export USE_LIVE_DATA=true
+    else
+        export USE_LIVE_DATA=true
+    fi
 
     clear
     echo ""
@@ -418,10 +718,16 @@ launch_bot() {
 
     # Auto-restart loop
     RESTART_COUNT=0
-    MAX_RESTARTS=5
+    APP_OWNS_RECONNECT="${APP_OWNS_RECONNECT:-true}"
+    if [ "$APP_OWNS_RECONNECT" = "true" ]; then
+        MAX_RESTARTS=1
+        printf "    ${DIM}Launcher note: APP_OWNS_RECONNECT=true (using app-level reconnect controller)${NC}\n"
+    else
+        MAX_RESTARTS=5
+    fi
 
     while [ $RESTART_COUNT -lt $MAX_RESTARTS ]; do
-        python3 app.py
+        "$PYTHON_BIN" app.py
         EXIT_CODE=$?
 
         if [ $EXIT_CODE -eq 0 ]; then
@@ -473,11 +779,11 @@ menu_analytics() {
 
     echo ""
     case $achoice in
-        1) python3 -c "from utils.analytics import analyze_today; analyze_today()" ;;
-        2) python3 utils/analytics.py --weekly ;;
-        3) python3 utils/analytics.py --monthly ;;
-        4) python3 -c "from utils.analytics import print_trading_calendar; print_trading_calendar(30)" ;;
-        5) python3 -c "
+        1) "$PYTHON_BIN" -c "from utils.analytics import analyze_today; analyze_today()" ;;
+        2) "$PYTHON_BIN" utils/analytics.py --weekly ;;
+        3) "$PYTHON_BIN" utils/analytics.py --monthly ;;
+        4) "$PYTHON_BIN" -c "from utils.analytics import print_trading_calendar; print_trading_calendar(30)" ;;
+        5) "$PYTHON_BIN" -c "
 from utils.analytics import get_best_worst_hours
 h = get_best_worst_hours()
 if h:
@@ -490,7 +796,7 @@ if h:
 else:
     print('  No hourly data available yet')
 " 2>/dev/null || printf "    ${DIM}No hourly data available yet${NC}\n" ;;
-        6) python3 utils/analytics.py --interactive ;;
+        6) "$PYTHON_BIN" utils/analytics.py --interactive ;;
         0) show_main_menu; return ;;
         *) printf "    ${BRED}Invalid${NC}\n" ;;
     esac
@@ -568,7 +874,7 @@ run_quick_backtest() {
     printf "    ${BCYAN}📈 Running backtest on: ${BWHITE}${selected}${NC}\n"
     printf "    ${DIM}Using defaults: Capital=₹$(get_env TOTAL_CAPITAL 30000) SL=$(get_env SL_POINTS 6) TP=$(get_env TP_POINTS 12)${NC}\n\n"
 
-    python3 core/backtest.py \
+    "$PYTHON_BIN" core/backtest.py \
         --data "$selected" \
         --capital "$(get_env TOTAL_CAPITAL 30000)" \
         --sl "$(get_env SL_POINTS 6)" \
@@ -666,7 +972,7 @@ run_custom_backtest() {
         printf "    ${BCYAN}📈 Starting backtest engine...${NC}\n\n"
         mkdir -p "$bt_output" 2>/dev/null
 
-        python3 core/backtest.py \
+        "$PYTHON_BIN" core/backtest.py \
             --data "$bt_data" \
             --capital "$bt_capital" \
             --sl "$bt_sl" \
@@ -750,36 +1056,42 @@ menu_tests() {
     printf "    ${BCYAN}║${NC}  ${BWHITE}🧪 TEST SUITE${NC}                                            ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}╠══════════════════════════════════════════════════════════╣${NC}\n"
     printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[1]${NC} Run ALL Tests        ${DIM}Full 103-test suite${NC}         ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[2]${NC} Greeks Calculation   ${DIM}test_greeks.py${NC}              ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[3]${NC} Greeks Caching       ${DIM}test_greeks_caching.py${NC}      ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[4]${NC} Market Data (Batch)  ${DIM}test_batch_market_data.py${NC}   ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[5]${NC} Kill Switch          ${DIM}test_kill_switch.py${NC}         ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[6]${NC} Phases 3-4-5         ${DIM}test_phases_3_4_5.py${NC}       ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[7]${NC} Analytics Module     ${DIM}test_analytics.py${NC}           ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[8]${NC} WebSocket            ${DIM}test_websocket.py${NC}           ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[9]${NC} Validators           ${DIM}test_validators.py${NC}        ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${DIM}[0]${NC} ← Back                                             ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${DIM}[0]${NC} ← Back                                             ${BCYAN}║${NC}\n"
+
+    local test_files=()
+    while IFS= read -r f; do
+        [ -n "$f" ] && test_files+=("$f")
+    done < <(discover_test_files)
+
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[1]${NC} Run ALL Tests        ${DIM}Full pytest suite${NC}       ${BCYAN}║${NC}\n"
+    local idx=2
+    for f in "${test_files[@]}"; do
+        local base
+        base=$(basename "$f")
+        printf "    ${BCYAN}║${NC}   ${BGREEN}[%2d]${NC} %-22s ${DIM}%s${NC}\n" "$idx" "$base" "$f"
+        idx=$((idx + 1))
+    done
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[0]${NC} ← Check syntax file                                            ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${DIM}[99]${NC} ← Back Main Menu                                 ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
     echo ""
-    printf "    ${BWHITE}Select [0-9]: ${NC}"
+    printf "    ${BWHITE}Select [0-%d]: ${NC}" "$(( ${#test_files[@]} + 1 ))"
     read -r tchoice
 
     echo ""
     case $tchoice in
-        1) printf "    ${BCYAN}🧪 Running full test suite...${NC}\n\n"; python3 -m pytest tests/ -v ;;
-        2) python3 -m pytest tests/test_greeks.py -v ;;
-        3) python3 -m pytest tests/test_greeks_caching.py -v ;;
-        4) python3 -m pytest tests/test_batch_market_data.py -v ;;
-        5) python3 -m pytest tests/test_kill_switch.py -v ;;
-        6) python3 -m pytest tests/test_phases_3_4_5.py -v ;;
-        7) python3 -m pytest tests/test_analytics.py -v ;;
-        8) python3 -m pytest tests/test_websocket.py -v ;;
-        9) python3 -m pytest tests/test_validators.py -v ;;
+        1) printf "    ${BCYAN}🧪 Running full test suite...${NC}\n\n"; "$PYTHON_BIN" -m pytest tests -v ;;
         0) run_syntax_check ;;
-        *) printf "    ${BRED}Invalid${NC}\n" ;;
+        99) show_main_menu; return ;;
+        *)
+            if [[ "$tchoice" =~ ^[0-9]+$ ]] && [ "$tchoice" -ge 2 ] && [ "$tchoice" -le $(( ${#test_files[@]} + 1 )) ]; then
+                local selected="${test_files[$((tchoice-2))]}"
+                printf "    ${BCYAN}🧪 Running %s...${NC}\n\n" "$selected"
+                "$PYTHON_BIN" -m pytest "$selected" -v
+            else
+                printf "    ${BRED}Invalid${NC}\n"
+            fi
+            ;;
     esac
     press_enter
     menu_tests
@@ -801,7 +1113,7 @@ run_syntax_check() {
              brokers/angel_one/client.py brokers/angel_one/exceptions.py; do
         total=$((total + 1))
         if [ -f "$f" ]; then
-            if python3 -c "import ast; ast.parse(open('$f').read())" 2>/dev/null; then
+            if "$PYTHON_BIN" -c "import ast; ast.parse(open('$f').read())" 2>/dev/null; then
                 printf "      ${BGREEN}✓${NC} %s\n" "$f"
             else
                 printf "      ${BRED}✗${NC} %s ${BRED}SYNTAX ERROR${NC}\n" "$f"
@@ -826,7 +1138,7 @@ menu_config() {
     clear
     echo ""
     printf "    ${BCYAN}══════════════════════════════════════════════════════${NC}\n"
-    printf "    ${BWHITE}⚙️  CONFIGURATION (SMART SCALP v3.4)${NC}\n"
+    printf "    ${BWHITE}⚙️  CONFIGURATION (SMART SCALP v3.5)${NC}\n"
     printf "    ${BCYAN}══════════════════════════════════════════════════════${NC}\n"
     echo ""
 
@@ -920,8 +1232,8 @@ menu_config() {
     read -r cchoice
 
     case $cchoice in
-        1) echo ""; python3 config/validator.py ;;
-        2) echo ""; python3 config/validator.py --fix ;;
+        1) echo ""; "$PYTHON_BIN" -m config.validator ;;
+        2) echo ""; "$PYTHON_BIN" -m config.validator --fix ;;
         0) show_main_menu; return ;;
         *) printf "    ${BRED}Invalid${NC}\n" ;;
     esac
@@ -958,7 +1270,7 @@ menu_logs() {
         day=$(date -d "$dt" '+%A' 2>/dev/null || echo "")
         info=""
         if [ -f "${LOG_DIRS[$i]}summary.json" ]; then
-            info=$(python3 -c "
+            info=$("$PYTHON_BIN" -c "
 import json
 d = json.load(open('${LOG_DIRS[$i]}summary.json'))
 t=d.get('total_trades',0); w=d.get('winning_trades',0); l=d.get('losing_trades',0)
@@ -996,7 +1308,7 @@ view_log_detail() {
     if [ -f "${dir}summary.json" ]; then
         echo ""
         printf "    ${BYELLOW}Summary:${NC}\n"
-        python3 -c "
+        "$PYTHON_BIN" -c "
 import json
 d = json.load(open('${dir}summary.json'))
 print(f\"      Trades    : {d.get('total_trades',0)} ({d.get('winning_trades',0)}W / {d.get('losing_trades',0)}L)\")
@@ -1039,7 +1351,7 @@ if d.get('kill_switch_count', 0) > 0:
         echo ""
         printf "    ${BCYAN}── ${FILES[$((fchoice-1))]} ──${NC}\n\n"
         if [[ "$sel" == *.json ]]; then
-            python3 -c "import json; print(json.dumps(json.load(open('$sel')), indent=2))" 2>/dev/null | head -80
+            "$PYTHON_BIN" -c "import json; print(json.dumps(json.load(open('$sel')), indent=2))" 2>/dev/null | head -80
         elif [[ "$sel" == *.csv ]]; then
             column -t -s',' "$sel" 2>/dev/null | head -40 || head -40 "$sel"
         else
@@ -1066,7 +1378,7 @@ menu_health() {
 
     # Python
     printf "    ${BYELLOW}System:${NC}\n"
-    PYVER=$(python3 --version 2>&1 | awk '{print $2}')
+    PYVER=$("$PYTHON_BIN" --version 2>&1 | awk '{print $2}')
     printf "      Python            : ${BGREEN}✓ ${PYVER}${NC}\n"
 
     # Venv
@@ -1087,7 +1399,7 @@ menu_health() {
 
     # SmartAPI
     printf "      SmartAPI Package  : "
-    if python3 -c "from SmartApi import SmartConnect" 2>/dev/null; then
+    if "$PYTHON_BIN" -c "from SmartApi import SmartConnect" 2>/dev/null; then
         printf "${BGREEN}✓ Installed${NC}\n"
     else
         printf "${BRED}✗ Missing${NC}\n"
@@ -1100,7 +1412,7 @@ menu_health() {
     for f in app.py core/main.py core/engines/entry_engine.py core/engines/exit_engine.py \
              core/engines/state_machine.py core/trading/broker.py core/risk/kill_switch.py \
              strategies/smart_scalp_v3.py config/constants.py config/validator.py; do
-        if python3 -c "import ast; ast.parse(open('$f').read())" 2>/dev/null; then
+        if "$PYTHON_BIN" -c "import ast; ast.parse(open('$f').read())" 2>/dev/null; then
             sok=$((sok + 1))
         else
             printf "      ${BRED}✗${NC} $f\n"
@@ -1117,10 +1429,13 @@ menu_health() {
     # Tests
     printf "    ${BYELLOW}Test Suite:${NC}\n"
     printf "      Running..."
-    TEST_R=$(python3 -m pytest tests/ -q --tb=no 2>&1 | tail -1)
+    TEST_OUT=$("$PYTHON_BIN" -m pytest tests/ -q --tb=no 2>&1)
+    TEST_R=$(printf "%s\n" "$TEST_OUT" | tail -1)
     printf "\r                \r"
-    if echo "$TEST_R" | grep -q "passed"; then
+    if printf "%s\n" "$TEST_R" | grep -q "passed"; then
         printf "      ${BGREEN}✓ ${TEST_R}${NC}\n"
+    elif printf "%s\n" "$TEST_OUT" | grep -qi "database is locked"; then
+        printf "      ${BYELLOW}⚠ Interrupted: database is locked (likely bot process using SQLite)${NC}\n"
     else
         printf "      ${BRED}✗ ${TEST_R}${NC}\n"
     fi
@@ -1128,7 +1443,7 @@ menu_health() {
 
     # Config validation
     printf "    ${BYELLOW}Config Validation:${NC}\n"
-    VRES=$(python3 config/validator.py 2>&1 | tail -3)
+    VRES=$("$PYTHON_BIN" -m config.validator 2>&1 | tail -3)
     if echo "$VRES" | grep -qi "pass\|ok\|valid\|success"; then
         printf "      ${BGREEN}✓ Configuration valid${NC}\n"
     else
@@ -1139,16 +1454,28 @@ menu_health() {
     # API
     printf "    ${BYELLOW}API Connectivity:${NC}\n"
     printf "      Angel One API     : "
-    API_R=$(timeout 15 python3 -c "
+    local api_key client_id password totp_secret
+    api_key=$(get_env "ANGEL_API_KEY" "")
+    client_id=$(get_env "ANGEL_CLIENT_ID" "")
+    password=$(get_env "ANGEL_PASSWORD" "")
+    totp_secret=$(get_env "ANGEL_TOTP_SECRET" "")
+
+    if [ -z "$api_key" ] || [ -z "$client_id" ] || [ -z "$password" ] || [ -z "$totp_secret" ]; then
+        API_R="SKIP:Missing credentials in .env"
+    else
+    API_R=$(timeout 15 "$PYTHON_BIN" -c "
 try:
     from brokers.angel_one.client import AngelOneClient
-    c = AngelOneClient()
+    c = AngelOneClient('${api_key}', '${client_id}', '${password}', '${totp_secret}')
     print('OK' if c.login() else 'FAIL')
 except Exception as e:
     print(f'ERR:{e}')
 " 2>/dev/null)
+    fi
     if [ "$API_R" = "OK" ]; then
         printf "${BGREEN}✓ Connected${NC}\n"
+    elif echo "$API_R" | grep -q "^SKIP:"; then
+        printf "${BYELLOW}⚠ ${API_R}${NC}\n"
     else
         printf "${BRED}✗ ${API_R:-No response}${NC}\n"
     fi
@@ -1168,7 +1495,7 @@ except Exception as e:
     if [ -n "$LATEST" ] && [ -f "${LATEST}summary.json" ]; then
         local ldate
         ldate=$(basename "$LATEST")
-        python3 -c "
+        "$PYTHON_BIN" -c "
 import json
 d = json.load(open('${LATEST}summary.json'))
 print(f'      Date      : ${ldate}')
@@ -1202,11 +1529,14 @@ menu_tools() {
     printf "    ${BCYAN}║${NC}   ${BGREEN}[5]${NC} Run Cleanup Script   ${DIM}cleanup.sh${NC}                  ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[6]${NC} View Documentation   ${DIM}README / DOCS${NC}               ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[7]${NC} Bot Monitor Status   ${DIM}Live monitor snapshot${NC}       ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[8]${NC} Market Readiness Pro ${DIM}Pre-open gate + report${NC}      ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[8]${NC} Market Readiness Pro ${DIM}Pre-open gate + report${NC}      ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[9]${NC} Version & Changelog  ${DIM}Build info and recent updates${NC}  ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${DIM}[0]${NC} ← Back                                             ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
     echo ""
-    printf "    ${BWHITE}Select [0-7]: ${NC}"
+    printf "    ${BWHITE}Select [0-9]: ${NC}"
     read -r pchoice
 
     echo ""
@@ -1276,13 +1606,19 @@ menu_tools() {
             ;;
         7)
             printf "    ${BWHITE}Bot Monitor Status:${NC}\n\n"
-            python3 -c "
+            "$PYTHON_BIN" -c "
 from utils.monitoring import get_monitor
 m = get_monitor()
 s = m.get_status()
 for k, v in s.items():
     print(f'      {k:20s}: {v}')
 " 2>/dev/null || printf "    ${DIM}Monitor not available (bot not running)${NC}\n"
+            ;;
+        8)
+            run_market_readiness_check standard 35 0.5 60
+            ;;
+        9)
+            menu_version
             ;;
         0) show_main_menu; return ;;
         *) printf "    ${BRED}Invalid${NC}\n" ;;
@@ -1291,8 +1627,61 @@ for k, v in s.items():
     menu_tools
 }
 
+menu_version() {
+    clear
+    echo ""
+    printf "    ${BWHITE}🧾 VERSION & CHANGELOG${NC}\n"
+    draw_line "═" 62 "$BPURPLE"
+    echo ""
+
+    printf "    ${BCYAN}Project:${NC}      ${BWHITE}PTQ Scalping Bot${NC}\n"
+    printf "    ${BCYAN}Control Center:${NC} ${BWHITE}%s${NC}\n" "$BOT_VERSION"
+    printf "    ${BCYAN}Strategy Engine:${NC} ${BWHITE}%s${NC}\n" "$ENGINE_VERSION"
+    printf "    ${BCYAN}Readiness Pro:${NC}   ${BWHITE}%s${NC}\n" "$READINESS_VERSION"
+    printf "    ${BCYAN}Mode:${NC}         ${BWHITE}%s${NC}\n" "PAPER_TRADING=$(get_env "PAPER_TRADING" "true") | USE_LIVE_DATA=$(get_env "USE_LIVE_DATA" "true")"
+    echo ""
+
+    printf "    ${BYELLOW}Recent Updates:${NC}\n"
+    printf "      ${BGREEN}•${NC} Market Readiness checker added with quick/standard/strict profiles\n"
+    printf "      ${BGREEN}•${NC} run.sh now gates paper/live launch on readiness verdict\n"
+    printf "      ${BGREEN}•${NC} JSON + markdown readiness reports are generated automatically\n"
+    printf "      ${BGREEN}•${NC} Pre-open strategy checks now include data source quality and circuit breaker\n"
+    printf "      ${BGREEN}•${NC} UI version labels updated to v5.1 / v3.5 / v2.0.0\n"
+    echo ""
+
+    printf "    ${BYELLOW}Quick Commands:${NC}\n"
+    printf "      ${DIM}•${NC} ${BWHITE}Market Readiness${NC} -> menu ${BWHITE}8${NC}\n"
+    printf "      ${DIM}•${NC} ${BWHITE}Paper Trading${NC} -> menu ${BWHITE}1${NC}\n"
+    printf "      ${DIM}•${NC} ${BWHITE}Health Check${NC} -> menu ${BWHITE}7${NC}\n"
+    echo ""
+
+    press_enter
+    show_main_menu
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ███  ENTRY POINT  ███
 # ═══════════════════════════════════════════════════════════════════════════════
+if [ "$RUN_MODE" = "version" ]; then
+    print_version_panel
+    exit 0
+fi
+
+if [ "$RUN_MODE" = "readiness" ]; then
+    run_market_readiness_check standard 35 0.5 60
+    exit $?
+fi
+
+if [ "$RUN_MODE" = "health" ]; then
+    run_full_project_check
+    exit $?
+fi
+
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+    print_version_panel
+    printf "    ${DIM}Interactive menu skipped because no TTY was detected.${NC}\n"
+    exit 0
+fi
+
 boot_sequence
 show_main_menu

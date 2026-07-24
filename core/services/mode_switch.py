@@ -7,6 +7,7 @@ Professional prop-style trading control
 from datetime import datetime
 from typing import Dict, List, Tuple
 import threading
+from core.runtime import runtime_state
 
 from config.constants import CONFIG, MAX_DAILY_LOSS_AMOUNT
 
@@ -272,7 +273,7 @@ def should_lockdown(daily_pnl: float) -> Tuple[bool, str]:
 # =============================================================================
 
 def update_trading_mode(tick: Dict, greeks: Dict, day_type: str, 
-                        daily_pnl: float, recent_ticks: List[Dict] = None) -> str:
+                        daily_pnl: float) -> str:
     """
     Update trading mode based on market conditions.
     Call this ONCE per loop, before state_idle().
@@ -282,7 +283,6 @@ def update_trading_mode(tick: Dict, greeks: Dict, day_type: str,
         greeks: Current Greeks
         day_type: "NORMAL" or "EXPIRY"
         daily_pnl: Current daily PnL in ₹
-        recent_ticks: List of recent ticks for calculations
         
     Returns:
         Current mode string
@@ -290,6 +290,7 @@ def update_trading_mode(tick: Dict, greeks: Dict, day_type: str,
     global _current_mode, active_thresholds, _mode_state
     
     with _mode_lock:
+        recent_ticks = runtime_state.get_recent_ticks(max_items=120)
         # Update rolling observations
         if recent_ticks and len(recent_ticks) > 5:
             # Calculate volume ratio

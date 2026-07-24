@@ -92,3 +92,9 @@ FILE_STRUCTURE_GUIDE.md
 april3.md
 test_*.py
 !tests/test_*.py
+
+# ─────────────────────────────────────────────────────────────────
+# LOCAL DATASET / ARTIFACT EXCLUSIONS
+# ─────────────────────────────────────────────────────────────────
+core/data/scripmaster_nifty_nfo.json
+data/historical/v3_5_0/*.csv

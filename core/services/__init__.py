@@ -1,17 +1,21 @@
-"""Services - Database, Telegram, Session, Mode"""
-from core.services.database import (
-    DatabaseManager, db,
-    log_trade_entry, log_trade_exit,
-    get_todays_summary, get_todays_trades,
-    save_state, load_state
-)
-from core.services.telegram_bot import (
-    TelegramBot, init_telegram, get_telegram,
-    notify_entry, notify_exit, notify_kill_switch, notify_daily_summary
-)
-from core.services.session_manager import is_trading_session_allowed, is_session_allowed
-from core.services.mode_switch import (
-    ModeState, update_trading_mode, get_current_mode,
-    get_mode_emoji, is_entries_allowed, record_trade_result, reset_mode,
-    get_threshold, get_active_thresholds
-)
+"""Services package (lazy exports).
+
+Avoid eager imports here so importing ``core.services.*`` modules does not
+automatically initialize heavyweight services like SQLite database.
+"""
+
+from importlib import import_module
+from typing import Any
+
+
+def __getattr__(name: str) -> Any:
+    for module_name in (
+        "core.services.database",
+        "core.services.telegram_bot",
+        "core.services.session_manager",
+        "core.services.mode_switch",
+    ):
+        module = import_module(module_name)
+        if hasattr(module, name):
+            return getattr(module, name)
+    raise AttributeError(f"module 'core.services' has no attribute '{name}'")

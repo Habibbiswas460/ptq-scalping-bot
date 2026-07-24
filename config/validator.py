@@ -4,8 +4,10 @@ Validates .env settings at startup with warnings and auto-fixes
 """
 
 import os
-from typing import Dict, List, Tuple, Optional
-from dotenv import load_dotenv
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+from config.configuration import ROOT_DIR
 
 
 class ConfigValidationError(Exception):
@@ -49,7 +51,10 @@ class ConfigValidator:
     }
     
     def __init__(self, env_path: str = '.env'):
-        self.env_path = env_path
+        env_candidate = Path(env_path)
+        if not env_candidate.is_absolute():
+            env_candidate = ROOT_DIR / env_candidate
+        self.env_path = str(env_candidate)
         self.errors: List[str] = []
         self.warnings: List[str] = []
         self.fixes_applied: List[str] = []
@@ -57,8 +62,6 @@ class ConfigValidator:
         
     def load_env(self):
         """Load environment variables"""
-        load_dotenv(self.env_path, override=True)
-        
         # Read .env file directly for validation and auto-fix
         if os.path.exists(self.env_path):
             with open(self.env_path, 'r') as f:

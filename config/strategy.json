@@ -1,0 +1,100 @@
+{
+  "strategy": {
+    "indicators": {
+      "ema_fast": 5,
+      "ema_signal": 9,
+      "ema_medium": 21,
+      "ema_slow": 50,
+      "rsi_period": 14,
+      "macd_fast": 12,
+      "macd_slow": 26,
+      "macd_signal": 9,
+      "bb_period": 20,
+      "bb_std": 2.0,
+      "kc_period": 20,
+      "kc_atr_mult": 1.5,
+      "volume_sma": 20,
+      "atr_period": 14
+    },
+    "scoring_system": {
+      "min_score_to_trade": 4,
+      "min_confidence_pct": 70,
+      "max_confidence_score": 11,
+      "min_weighted_score_pct": 36,
+      "score_weights": {
+        "ema_trend": 20,
+        "vwap": 15,
+        "volume": 10,
+        "delta": 10,
+        "oi": 10,
+        "rsi": 8,
+        "macd": 8,
+        "atr_volatility": 5,
+        "premium_quality": 5,
+        "greeks": 5,
+        "market_regime": 4,
+        "spread_quality": 5
+      },
+      "confidence_weights": {
+        "score": 30,
+        "market_regime": 15,
+        "market_quality": 10,
+        "spread": 8,
+        "volume": 8,
+        "greeks": 8,
+        "oi": 6,
+        "vwap": 5,
+        "session": 5,
+        "freshness": 5
+      },
+      "market_quality": {
+        "minimum_pct": 65
+      },
+      "position_size_engine": {
+        "base": {
+          "default_risk_budget_pct": 0.01,
+          "min_risk_budget_pct": 0.002,
+          "max_risk_budget_pct": 0.02
+        },
+        "soft_adjustment": {
+          "weights": {
+            "score": 0.18,
+            "confidence": 0.18,
+            "market_quality": 0.18,
+            "regime": 0.12,
+            "volatility": 0.14,
+            "recovery": 0.10,
+            "daily_loss": 0.10
+          },
+          "final_allocation_clamp": [0.40, 1.10]
+        },
+        "ranges": {
+          "score": [0.80, 1.10],
+          "confidence": [0.80, 1.10],
+          "market_quality": [0.75, 1.10],
+          "regime": [0.85, 1.05],
+          "volatility": [0.70, 1.00],
+          "recovery": [0.50, 1.00],
+          "daily_loss": [0.40, 1.00]
+        },
+        "safety_caps": {
+          "max_capital_allocation_pct": 0.20,
+          "max_symbol_daily_risk_pct": 0.40,
+          "max_lots": 8,
+          "min_executable_quantity": 1,
+          "enforce_lot_rounding": true,
+          "daily_risk_cap_pct": 0.03,
+          "recovery_mode_cap_pct": 0.50
+        },
+        "allocation_grades": {
+          "A+": 1.02,
+          "A": 0.95,
+          "B": 0.85,
+          "C": 0.70
+        }
+      }
+    },
+    "ce_entry": {},
+    "pe_entry": {}
+  }
+}

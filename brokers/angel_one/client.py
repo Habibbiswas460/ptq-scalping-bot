@@ -217,8 +217,13 @@ class AngelOneClient:
         self._ws_lock = threading.RLock()  # Reentrant lock for WebSocket
         self.ws = None  # WebSocketApp instance
         self.ws_thread: Optional[threading.Thread] = None
+        self._ws_threads: List[threading.Thread] = []
         self.ws_connected = False
+        self._manual_ws_stop = False
         self.subscriptions = {}  # Active subscriptions {token: mode}
+        self._pending_ack_events: Dict[str, threading.Event] = {}
+        self._pending_ack_results: Dict[str, bool] = {}
+        self._pending_ack_lock = threading.Lock()
         
         # Phase 5: WebSocket Redundancy (3 concurrent connections)
         self.ws_connections = []  # List of WebSocket connections for failover
@@ -1268,6 +1273,12 @@ class AngelOneClient:
         if self.ws_connected:
             self.logger.warning("WebSocket already connected")
             return
+
+        with self._ws_lock:
+            self._manual_ws_stop = False
+            self._ws_threads = []
+            self.ws_connections = []
+            self.ws_primary_index = 0
         
         # Phase 5: Validate num_connections
         num_connections = min(max(1, num_connections), self.ws_max_connections)
@@ -1285,18 +1296,33 @@ class AngelOneClient:
                     daemon=True,
                     name=f"WebSocket-{i}"
                 )
+                self._ws_threads.append(ws_thread)
                 ws_thread.start()
         else:
             # Original single connection mode
             self.ws_thread = threading.Thread(target=self._ws_connect, args=(0,), daemon=True)
+            self._ws_threads.append(self.ws_thread)
             self.ws_thread.start()
     
     def stop_websocket(self):
         """Stop WebSocket connection (RACE CONDITION FIX v3.1: Thread-safe)"""
         with self._ws_lock:
+            self._manual_ws_stop = True
             self.ws_connected = False  # Set first to prevent races
             ws_ref = self.ws  # Capture reference
+            ws_connections_ref = list(self.ws_connections)
+            ws_thread_ref = self.ws_thread
+            ws_threads_ref = list(self._ws_threads)
             self.ws = None  # Clear reference immediately
+            self.ws_thread = None
+            self._ws_threads = []
+            self.ws_connections = []
+            self.ws_primary_index = 0
+            self.subscriptions.clear()
+            self.ws_subscriptions.clear()
+
+        self._clear_pending_ack_state()
+        self.logger.info("🧹 Cache Cleared | subscriptions, ws_subscriptions, pending_ack")
         
         # Close outside lock to avoid deadlock
         if ws_ref:
@@ -1306,33 +1332,177 @@ class AngelOneClient:
                     ws_ref.close()
             except Exception as e:
                 self.logger.debug(f"WebSocket close ignored: {e}")
+
+        for ws_conn in ws_connections_ref:
+            if ws_conn is ws_ref:
+                continue
+            try:
+                if hasattr(ws_conn, 'close') and callable(ws_conn.close):
+                    ws_conn.close()
+            except Exception as e:
+                self.logger.debug(f"Secondary WebSocket close ignored: {e}")
+
+        if ws_thread_ref and ws_thread_ref.is_alive():
+            ws_thread_ref.join(timeout=1.0)
+        for thread_ref in ws_threads_ref:
+            if thread_ref is ws_thread_ref:
+                continue
+            if thread_ref and thread_ref.is_alive():
+                thread_ref.join(timeout=1.0)
         
         self.logger.info("WebSocket stopped")
+
+    def _clear_pending_ack_state(self):
+        """Clear pending ACK waiters/results to avoid stale wait state."""
+        with self._pending_ack_lock:
+            self._pending_ack_events.clear()
+            self._pending_ack_results.clear()
+
+    def _register_ack_waiter(self, correlation_id: str) -> threading.Event:
+        """Register waiter before send to avoid ACK race (ACK arriving too early)."""
+        event = threading.Event()
+        with self._pending_ack_lock:
+            self._pending_ack_events[correlation_id] = event
+            self._pending_ack_results[correlation_id] = False
+        return event
+
+    def _sanitize_tokens(self, tokens: List[tuple]) -> List[tuple]:
+        """Normalize token tuples and remove duplicates while preserving order."""
+        unique_tokens: List[tuple] = []
+        seen = set()
+        for exchange, token, mode in tokens:
+            key = (str(exchange), str(token), int(mode))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_tokens.append(key)
+        return unique_tokens
+
+    def _sync_subscription_cache(self, tokens: List[tuple], source: str):
+        """Keep both local caches in sync after subscribe fallback/success."""
+        with self._ws_lock:
+            for exchange, token, mode in tokens:
+                self.subscriptions[token] = mode
+                self.ws_subscriptions[f"{exchange}:{token}:{mode}"] = {
+                    "exchange": exchange,
+                    "token": token,
+                    "mode": mode,
+                    "updated_at": int(time.time() * 1000),
+                    "source": source,
+                }
+        self.logger.info(f"🗂 Cache Rebuilt | source={source} | tokens={len(tokens)}")
+
+    def _remove_from_subscription_cache(self, tokens: List[tuple], source: str):
+        """Remove token entries from both subscription caches safely."""
+        with self._ws_lock:
+            for exchange, token, mode in tokens:
+                self.subscriptions.pop(token, None)
+                self.ws_subscriptions.pop(f"{exchange}:{token}:{mode}", None)
+                stale_keys = [
+                    key for key in self.ws_subscriptions
+                    if key.split(":", 2)[1] == token
+                ]
+                for stale_key in stale_keys:
+                    self.ws_subscriptions.pop(stale_key, None)
+        self.logger.info(f"🧹 Cache Cleared | source={source} | tokens={len(tokens)}")
     
-    def subscribe(self, tokens: List[tuple]):
+    def _set_ack_result(self, correlation_id: str, success: bool) -> bool:
+        with self._pending_ack_lock:
+            if correlation_id in self._pending_ack_events:
+                self._pending_ack_results[correlation_id] = success
+                self._pending_ack_events[correlation_id].set()
+                return True
+        return False
+
+    def _wait_for_ack(self, correlation_id: str, timeout: float = 5.0) -> bool:
+        event = None
+        with self._pending_ack_lock:
+            event = self._pending_ack_events.get(correlation_id)
+            if event is None:
+                event = threading.Event()
+                self._pending_ack_events[correlation_id] = event
+                self._pending_ack_results[correlation_id] = False
+
+        success = event.wait(timeout)
+
+        with self._pending_ack_lock:
+            result = self._pending_ack_results.pop(correlation_id, False)
+            self._pending_ack_events.pop(correlation_id, None)
+
+        if not success:
+            self.logger.warning(
+                f"⚠ ACK Timeout | correlation={correlation_id} | "
+                f"reason=No matching SmartAPI ACK within {timeout:.1f}s"
+            )
+            return False
+        return result
+
+    def _ws_is_usable(self, ws_ref) -> bool:
+        """WebSocket is usable only when object and underlying socket are alive."""
+        if ws_ref is None:
+            return False
+        try:
+            return getattr(ws_ref, 'sock', None) is not None
+        except Exception:
+            return False
+
+    def _request_ws_reconnect(self, reason: str) -> None:
+        """Ask broker layer to reconnect WS without raising from client layer."""
+        with self._ws_lock:
+            self.ws_connected = False
+        cb = getattr(self, '_broker_ws_disconnect_cb', None)
+        self.logger.warning(f"🔄 Reconnecting | reason={reason}")
+        if cb:
+            try:
+                cb(reason)
+            except Exception as e:
+                self.logger.debug(f"WS reconnect callback error ignored: {e}")
+
+    def subscribe(self, tokens: List[tuple]) -> bool:
         """
         Subscribe to market data (RACE CONDITION FIX v3.1: Thread-safe)
         
         Args:
             tokens: List of (exchange, token, mode) tuples
                 Example: [("NFO", "12345", WS_MODE_LTP)]
+
+        Returns:
+            True if subscribe message was sent, False otherwise.
         """
+        tokens = self._sanitize_tokens(tokens)
+        if not tokens:
+            self.logger.info("Subscribe skipped: empty token list after normalization")
+            return True
+
         with self._ws_lock:
             if not self.ws_connected or not self.ws:
                 self.logger.warning("WebSocket not connected or not initialized")
-                return
+                self._request_ws_reconnect("subscribe requested while websocket is None")
+                return False
             ws_ref = self.ws  # Capture reference while locked
+            if not self._ws_is_usable(ws_ref):
+                self.logger.warning("WebSocket socket unavailable during subscribe")
+                self._request_ws_reconnect("subscribe requested while websocket.sock is None")
+                return False
+
+            pending_tokens = [
+                token_row for token_row in tokens
+                if self.subscriptions.get(token_row[1]) != token_row[2]
+            ]
+            if not pending_tokens:
+                self.logger.info("Subscribe skipped: no new token/mode pairs")
+                return True
             
             # Group by exchange
             exchange_tokens = {}
-            for exchange, token, mode in tokens:
+            for exchange, token, mode in pending_tokens:
                 ws_exchange = self._get_ws_exchange_type(exchange)
                 if ws_exchange not in exchange_tokens:
                     exchange_tokens[ws_exchange] = []
                 exchange_tokens[ws_exchange].append(token)
-                self.subscriptions[token] = mode
         
         # Build subscribe message (outside lock - just data manipulation)
+        correlation_id = f"sub_{int(time.time() * 1000)}"
         token_list = []
         for exchange_type, token_ids in exchange_tokens.items():
             token_list.append({
@@ -1341,45 +1511,79 @@ class AngelOneClient:
             })
         
         subscribe_msg = {
-            "correlationID": f"sub_{int(time.time())}",
+            "correlationID": correlation_id,
             "action": 1,  # Subscribe
             "params": {
                 "mode": tokens[0][2] if tokens else WS_MODE_LTP,
                 "tokenList": token_list
             }
         }
+        self._register_ack_waiter(correlation_id)
         
         # Send outside lock to avoid holding lock during I/O
         try:
-            if ws_ref and hasattr(ws_ref, 'send') and callable(ws_ref.send):
+            if self._ws_is_usable(ws_ref) and hasattr(ws_ref, 'send') and callable(ws_ref.send):
                 ws_ref.send(json.dumps(subscribe_msg))
-                self.logger.info(f"Subscribed to {len(tokens)} tokens")
+                ack_ok = self._wait_for_ack(correlation_id, timeout=5.0)
+                if ack_ok:
+                    self._sync_subscription_cache(pending_tokens, source="ack")
+                    self.logger.info(f"✅ Subscribe Success | tokens={len(pending_tokens)} | correlation={correlation_id}")
+                    return True
+                self.logger.warning(
+                    f"⚠ Subscribe Failed ACK | correlation={correlation_id} | "
+                    "fallback=local-cache"
+                )
+                self._sync_subscription_cache(pending_tokens, source="ack-timeout-fallback")
+                return True
             else:
                 self.logger.warning("WebSocket not ready for subscribe")
+                self._clear_pending_ack_state()
+                self._request_ws_reconnect("subscribe send blocked: websocket.sock is None")
+                return False
         except Exception as e:
             self.logger.warning(f"Subscribe failed: {e}")
+            self._clear_pending_ack_state()
+            self._request_ws_reconnect(f"subscribe exception: {e}")
+            return False
     
-    def unsubscribe(self, tokens: List[tuple]):
+    def unsubscribe(self, tokens: List[tuple]) -> bool:
         """
         Unsubscribe from market data (RACE CONDITION FIX v3.1: Thread-safe)
         
         Args:
             tokens: List of (exchange, token, mode) tuples
+
+        Returns:
+            True if unsubscribe message was sent, False otherwise.
         """
+        tokens = self._sanitize_tokens(tokens)
+        if not tokens:
+            self.logger.info("Unsubscribe skipped: empty token list after normalization")
+            return True
+
         with self._ws_lock:
             if not self.ws_connected or not self.ws:
-                return
+                self._request_ws_reconnect("unsubscribe requested while websocket is None")
+                return False
             ws_ref = self.ws  # Capture reference while locked
+            if not self._ws_is_usable(ws_ref):
+                self._request_ws_reconnect("unsubscribe requested while websocket.sock is None")
+                return False
+
+            pending_tokens = [token_row for token_row in tokens if token_row[1] in self.subscriptions]
+            if not pending_tokens:
+                self.logger.info("Unsubscribe skipped: tokens not present in cache")
+                return True
             
             # Build unsubscribe message
             exchange_tokens = {}
-            for exchange, token, mode in tokens:
+            for exchange, token, mode in pending_tokens:
                 ws_exchange = self._get_ws_exchange_type(exchange)
                 if ws_exchange not in exchange_tokens:
                     exchange_tokens[ws_exchange] = []
                 exchange_tokens[ws_exchange].append(token)
-                self.subscriptions.pop(token, None)
         
+        correlation_id = f"unsub_{int(time.time() * 1000)}"
         token_list = []
         for exchange_type, token_ids in exchange_tokens.items():
             token_list.append({
@@ -1388,19 +1592,37 @@ class AngelOneClient:
             })
         
         unsubscribe_msg = {
-            "correlationID": f"unsub_{int(time.time())}",
+            "correlationID": correlation_id,
             "action": 0,  # Unsubscribe
             "params": {
                 "mode": tokens[0][2] if tokens else WS_MODE_LTP,
                 "tokenList": token_list
             }
         }
+        self._register_ack_waiter(correlation_id)
         
         try:
-            if ws_ref and hasattr(ws_ref, 'send') and callable(ws_ref.send):
+            if self._ws_is_usable(ws_ref) and hasattr(ws_ref, 'send') and callable(ws_ref.send):
                 ws_ref.send(json.dumps(unsubscribe_msg))
+                ack_ok = self._wait_for_ack(correlation_id, timeout=5.0)
+                if ack_ok:
+                    self._remove_from_subscription_cache(pending_tokens, source="ack")
+                    self.logger.info(f"✅ Unsubscribe Success | tokens={len(pending_tokens)} | correlation={correlation_id}")
+                    return True
+                self.logger.warning(
+                    f"⚠ Unsubscribe ACK Timeout | correlation={correlation_id} | "
+                    "fallback=local-cache"
+                )
+                self._remove_from_subscription_cache(pending_tokens, source="ack-timeout-fallback")
+                return True
+            self._clear_pending_ack_state()
+            self._request_ws_reconnect("unsubscribe send blocked: websocket.sock is None")
+            return False
         except Exception as e:
             self.logger.debug(f"Unsubscribe failed: {e}")
+            self._clear_pending_ack_state()
+            self._request_ws_reconnect(f"unsubscribe exception: {e}")
+            return False
     
     def _ws_connect(self, connection_id: int = 0):
         """Internal: Connect to WebSocket"""
@@ -1411,7 +1633,7 @@ class AngelOneClient:
             "x-feed-token": self.feed_token
         }
         
-        self.ws = websocket.WebSocketApp(
+        ws_app = websocket.WebSocketApp(
             WEBSOCKET_URL,
             header=headers,
             on_open=self._on_ws_open,
@@ -1421,15 +1643,23 @@ class AngelOneClient:
             on_ping=lambda ws, msg: None,  # Handle ping from server
             on_pong=self._on_ws_pong  # Track pong responses
         )
+
+        with self._ws_lock:
+            if connection_id == 0:
+                self.ws = ws_app
+            if ws_app not in self.ws_connections:
+                self.ws_connections.append(ws_app)
         
         # Use protocol-level pings every 25s to prevent idle timeout
         # Angel One closes connections after ~60s of inactivity
-        self.ws.run_forever(ping_interval=25, ping_timeout=10)
+        ws_app.run_forever(ping_interval=25, ping_timeout=10)
     
     def _on_ws_open(self, ws):
         """WebSocket opened"""
-        self.ws_connected = True
-        self.logger.info("🔌 WebSocket connected")
+        with self._ws_lock:
+            self.ws_connected = True
+            self._manual_ws_stop = False
+        self.logger.info("✅ Connected | websocket opened")
         
         # Start heartbeat thread
         self._start_heartbeat()
@@ -1441,14 +1671,31 @@ class AngelOneClient:
             if isinstance(message, str):
                 if message == "pong":
                     return
-                # Try to parse as JSON (error message)
+                # Try to parse as JSON (error message or ack)
                 try:
                     data = json.loads(message)
+                    correlation_id = data.get('correlationID') or data.get('correlationId') or data.get('correlation_id')
+                    if correlation_id:
+                        status = True
+                        if 'errorCode' in data and data.get('errorCode') not in (None, 0, '0', '00'):
+                            status = False
+                        if 'status' in data and data.get('status') is False:
+                            status = False
+                        matched = self._set_ack_result(correlation_id, status)
+                        if matched:
+                            self.logger.info(f"✅ ACK Received | correlation={correlation_id} | status={status}")
+                        else:
+                            self.logger.debug(f"ACK received without pending waiter | correlation={correlation_id} | payload={data}")
+                        if not status:
+                            self.logger.warning(f"WebSocket NACK for correlation {correlation_id}: {data}")
+                        return
                     if 'errorCode' in data:
                         self.logger.error(f"WebSocket error: {data.get('errorMessage')}")
                     return
-                except:
+                except json.JSONDecodeError:
                     pass
+                except Exception as e:
+                    self.logger.debug(f"WebSocket JSON parse warning: {e}")
             
             # Binary message - parse tick data
             if isinstance(message, bytes):
@@ -1461,15 +1708,48 @@ class AngelOneClient:
     
     def _on_ws_error(self, ws, error):
         """WebSocket error"""
-        self.logger.error(f"WebSocket error: {error}")
+        error_text = str(error)
+        lowered = error_text.lower()
+        is_conn_limit = (
+            "429" in lowered
+            or "connection limit exceeded" in lowered
+            or "too many requests" in lowered
+        )
+
+        if is_conn_limit:
+            now_ts = time.time()
+            last_ts = getattr(self, '_last_ws_429_log_ts', 0.0)
+            if now_ts - last_ts >= 30:
+                self.logger.warning("⚠ WebSocket rejected by broker (HTTP 429 connection limit exceeded)")
+                self._last_ws_429_log_ts = now_ts
+        else:
+            self.logger.error(f"WebSocket error: {error}")
+
         # Notify BrokerInterface that WebSocket is no longer reliable
         if hasattr(self, '_broker_ws_disconnect_cb') and self._broker_ws_disconnect_cb:
-            self._broker_ws_disconnect_cb(f"WS error: {error}")
+            self._broker_ws_disconnect_cb(f"WS error: {error_text}")
     
     def _on_ws_close(self, ws, close_status_code, close_msg):
         """WebSocket closed"""
-        self.ws_connected = False
-        self.logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+        with self._ws_lock:
+            is_manual = self._manual_ws_stop
+            is_active_ws = ws is self.ws
+            if is_active_ws:
+                self.ws_connected = False
+            if ws in self.ws_connections:
+                try:
+                    self.ws_connections.remove(ws)
+                except ValueError:
+                    pass
+
+        self.logger.info(f"❌ Disconnected | code={close_status_code} | msg={close_msg}")
+
+        if not is_active_ws:
+            self.logger.debug("Ignoring close callback from non-primary websocket")
+            return
+        if is_manual:
+            self.logger.info("Manual websocket stop acknowledged; reconnect not requested")
+            return
         # Notify BrokerInterface that WebSocket disconnected
         if hasattr(self, '_broker_ws_disconnect_cb') and self._broker_ws_disconnect_cb:
             self._broker_ws_disconnect_cb(f"WS closed: {close_status_code} - {close_msg}")

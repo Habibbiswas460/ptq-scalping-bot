@@ -4,7 +4,12 @@ from unittest.mock import MagicMock
 
 broker_module = importlib.import_module('core.trading.broker')
 from core.trading.broker import BrokerInterface
-from core.risk.validators import is_data_valid
+from core.risk.validators import (
+    is_data_valid,
+    reset_validation_stats,
+    get_validation_stats,
+    format_validation_stats_summary,
+)
 
 
 def _mock_broker_logger(broker: BrokerInterface):
@@ -150,3 +155,38 @@ def test_rest_tick_freshness_allows_recent_rest_ticks():
     valid, reason = is_data_valid(rest_tick)
     assert valid is True
     assert reason == 'OK'
+
+
+def test_validation_stats_record_stale_rejections():
+    reset_validation_stats()
+    stale_tick = {
+        'symbol': 'NIFTY25000CE',
+        'ltp': 100.0,
+        'bid': 99.5,
+        'ask': 100.5,
+        'timestamp': int(time.time() * 1000) - 6000,
+        'original_timestamp': int(time.time() * 1000) - 6000,
+        'data_source': 'REST',
+    }
+    valid, reason = is_data_valid(stale_tick)
+    assert valid is False
+    assert 'Stale tick' in reason
+    stats = get_validation_stats()
+    assert stats['stale'] == 1
+    assert stats['spread'] == 0
+
+
+def test_validation_stats_summary_format():
+    reset_validation_stats()
+    stats = {
+        'stale': 3,
+        'spread': 1,
+        'bid_ask': 1,
+        'price': 0,
+        'volume': 0,
+        'other': 0,
+    }
+    summary = format_validation_stats_summary(stats, total_rejections=5)
+    assert 'Stale: 60.0%' in summary
+    assert 'Spread: 20.0%' in summary
+    assert 'Bid/Ask: 20.0%' in summary

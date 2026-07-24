@@ -6,7 +6,10 @@ With Auto-Reconnect, Telegram, Dashboard & Database
 
 import time
 import socket
+import os
+import json
 from datetime import datetime
+from pathlib import Path
 
 # Import configuration
 from config.constants import (
@@ -19,7 +22,12 @@ from config.constants import (
 
 # Import core modules (new organized paths)
 from core.trading.broker import broker
-from core.risk.validators import is_data_valid, detect_day_type
+from core.risk.validators import (
+    is_data_valid,
+    detect_day_type,
+    get_validation_stats,
+    format_validation_stats_summary,
+)
 from core.engines.entry_engine import entry_signal, MAX_RECENT_TICKS
 from core.engines.exit_engine import check_exit_conditions
 from core.engines.state_machine import (
@@ -33,8 +41,17 @@ from core.services.mode_switch import (
     update_trading_mode, get_current_mode, get_mode_emoji,
     is_entries_allowed, record_trade_result, reset_mode
 )
-from utils.helpers import now, market_open, estimate_vix_from_ticks, wait_for_market_open, set_vix_broker_client
+from utils.helpers import (
+    now,
+    market_open,
+    estimate_vix_from_ticks,
+    wait_for_market_open,
+    set_vix_broker_client,
+    fetch_real_vix_with_meta,
+)
 from utils.logger import BotLogger
+from utils.market_readiness_checker import run_readiness_check, _resolve_profile, _write_markdown_report, CheckResult
+from core.runtime import runtime_state
 
 # New feature imports
 try:
@@ -103,10 +120,6 @@ def wait_for_internet(logger, max_wait_minutes=30):
     
     logger.error(f"✗ Internet not restored within {max_wait_minutes} minutes")
     return False
-
-
-# Recent ticks for analysis
-recent_ticks = []
 
 
 def init_features(logger, state):
@@ -179,7 +192,6 @@ def close_current_trade(state, reason, logger, current_tick=None) -> bool:
 
 def main():
     """Main trading loop - SMART SCALP v3.4"""
-    global recent_ticks
     
     # ════════════════════════════════════════════════════════════════════════
     # PRE-MARKET STANDBY MODE
@@ -252,6 +264,61 @@ def main():
     
     logger = broker.logger
     state = trading_state
+    runtime_state.update_broker_session(
+        {
+            "connected": True,
+            "paper_trading": bool(CONFIG.get("broker", {}).get("paper_trading", True)),
+            "connected_at": datetime.now().isoformat(),
+        }
+    )
+
+    # Run readiness once per process using the already-authenticated broker session.
+    startup_profile = (os.getenv("STARTUP_READINESS_PROFILE") or "standard").strip().lower()
+    p_sample, p_interval, p_min_ticks, p_strict = _resolve_profile(startup_profile)
+    enforce_launch_allowed = (os.getenv("READINESS_ENFORCE_LAUNCH_ALLOWED") or "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    readiness_result = run_readiness_check(
+        sample_seconds=p_sample,
+        tick_interval=p_interval,
+        min_ticks=p_min_ticks,
+        strict_engines=p_strict,
+        broker_instance=broker,
+        assume_connected=True,
+        close_broker_on_finish=False,
+        shared_state=runtime_state,
+    )
+
+    try:
+        readiness_dir = Path("logs") / "readiness"
+        readiness_dir.mkdir(parents=True, exist_ok=True)
+        readiness_json = readiness_dir / "latest_readiness.json"
+        readiness_md = readiness_dir / "latest_readiness.md"
+        readiness_json.write_text(json.dumps(readiness_result, indent=2), encoding="utf-8")
+        _write_markdown_report(
+            readiness_md,
+            [CheckResult(**item) for item in readiness_result.get("checks", [])],
+            bool(readiness_result.get("overall_ready", False)),
+            str(readiness_result.get("overall_status", "NOT_READY")),
+            bool(readiness_result.get("launch_allowed", False)),
+            bool(readiness_result.get("strict_preopen_gate", False)),
+            datetime.fromisoformat(str(readiness_result["generated_at"])),
+            readiness_result.get("summary", {}),
+        )
+        logger.info(f"✓ Startup readiness report saved: {readiness_json.as_posix()}")
+    except Exception as e:
+        logger.warning(f"⚠ Could not save startup readiness report: {e}")
+
+    if enforce_launch_allowed and not bool(readiness_result.get("launch_allowed", False)):
+        logger.error(
+            f"✗ Startup blocked by readiness gate | status={readiness_result.get('overall_status')}"
+        )
+        return "STARTUP_BLOCKED"
+
+    # Reuse readiness warm-up ticks to avoid rebuilding startup buffers from scratch.
+    warmed_ticks = runtime_state.get_recent_ticks(max_items=MAX_RECENT_TICKS)
+    if warmed_ticks:
+        logger.info(f"✓ Warm buffer reused from readiness: {len(warmed_ticks)} ticks")
     
     # ════════════════════════════════════════════════════════════════════════
     # RESTORE PnL FROM TODAY'S TRADES (on bot restart)
@@ -319,6 +386,7 @@ def main():
             # Heartbeat — compact one-liner every 30s (~300 loops)
             if state.loop_count % 300 == 0:
                 tick_now = broker.get_tick()
+                buffer_ticks = runtime_state.get_recent_ticks(max_items=MAX_RECENT_TICKS)
                 ltp_str = f"₹{tick_now['ltp']:.2f}" if tick_now else "--"
                 spot_str = f"₹{broker.spot_price:,.0f}" if broker.spot_price > 1000 else "--"
                 wr = f"{(state.winning_trades/(state.winning_trades+state.losing_trades)*100):.0f}%" if (state.winning_trades+state.losing_trades) > 0 else "--"
@@ -329,7 +397,7 @@ def main():
                     f"LTP {ltp_str} │ "
                     f"PnL ₹{state.daily_pnl_inr:+.0f} │ "
                     f"Trades {state.total_trades_today} ({state.winning_trades}W/{state.losing_trades}L {wr}) │ "
-                    f"Ticks {len(recent_ticks)}/{MAX_RECENT_TICKS} │ "
+                    f"Ticks {len(buffer_ticks)}/{MAX_RECENT_TICKS} │ "
                     f"{get_current_mode()} │ "
                     f"{datetime.now().strftime('%H:%M:%S')}"
                 )
@@ -403,7 +471,15 @@ def main():
             if not is_valid:
                 state.invalid_ticks = getattr(state, 'invalid_ticks', 0) + 1
                 if state.loop_count % 100 == 0:
-                    logger.tick_rejected(validation_msg, tick)
+                    logger.warning(
+                        f"INVALID_TICK | reason={validation_msg} | source={tick.get('data_source')} | "
+                        f"ltp={tick.get('ltp')} | bid={tick.get('bid')} | ask={tick.get('ask')} | "
+                        f"spread={tick.get('spread')} | age={tick.get('original_timestamp')}"
+                    )
+                if state.loop_count % 500 == 0:
+                    stats = get_validation_stats()
+                    logger.warning(format_validation_stats_summary(stats, state.invalid_ticks))
+                logger.tick_rejected(validation_msg, tick)
                 
                 # FIX: Track consecutive rejected ticks — stale data kill switch
                 stale_kill, stale_reason, stale_details = track_rejected_tick()
@@ -444,10 +520,10 @@ def main():
                 time.sleep(0.5)
                 continue
             
-            # Update recent ticks
-            recent_ticks.append(tick)
-            if len(recent_ticks) > MAX_RECENT_TICKS:
-                recent_ticks.pop(0)
+            # Update shared tick/candle state.
+            runtime_state.add_tick(tick, max_ticks=MAX_RECENT_TICKS * 2)
+            runtime_state.rebuild_candles()
+            buffer_ticks = runtime_state.get_recent_ticks(max_items=MAX_RECENT_TICKS)
             
             # Track ticks processed
             state.ticks_processed = getattr(state, 'ticks_processed', 0) + 1
@@ -518,13 +594,42 @@ def main():
             # Detect day type
             state.day_type = detect_day_type(greeks, greeks['tte'])
             
-            # Update VIX
-            state.estimated_vix = estimate_vix_from_ticks(recent_ticks, state.estimated_vix)
+            # Update VIX: prefer real feed/cache, fallback to estimator.
+            vix_value, vix_meta = fetch_real_vix_with_meta()
+            vix_source = vix_meta.get('source', 'estimate')
+            vix_error_code = vix_meta.get('error_code')
+
+            if vix_value is not None and 5 <= vix_value <= 100 and vix_source in ("real", "cache"):
+                state.estimated_vix = vix_value
+                state.vix_source = vix_source
+            else:
+                state.estimated_vix = estimate_vix_from_ticks(buffer_ticks, state.estimated_vix)
+                state.vix_source = "estimate"
+
+            runtime_state.update_market_snapshot(
+                {
+                    "spot_price": broker.spot_price,
+                    "option_ltp": tick.get("ltp") if isinstance(tick, dict) else None,
+                    "vix": state.estimated_vix,
+                    "vix_source": state.vix_source,
+                    "day_type": state.day_type,
+                }
+            )
+
+            # Rate-limited warning for known VIX token failures.
+            if vix_error_code:
+                now_ts = time.time()
+                last_warn = getattr(state, '_last_vix_error_warn_ts', 0.0)
+                if now_ts - last_warn >= 300:
+                    logger.warning(
+                        f"⚠ India VIX real fetch failed ({vix_error_code}) - using {state.vix_source} value"
+                    )
+                    state._last_vix_error_warn_ts = now_ts
             
             # 🎛 UPDATE TRADING MODE (Aggressive ↔ Safe)
             current_mode = update_trading_mode(
                 tick, greeks, state.day_type, 
-                state.daily_pnl_inr, recent_ticks
+                state.daily_pnl_inr
             )
             
             # Check if entries allowed (not in LOCKDOWN)
@@ -534,11 +639,14 @@ def main():
             if state.state == "IDLE":
                 if entries_allowed:
                     def entry_func(t):
-                        return entry_signal(t, recent_ticks, state.day_type)
+                        return entry_signal(t, state.day_type)
                     
                     # Tick buffer progress — every 50s (~500 loops)
                     if state.loop_count % 500 == 0:
-                        logger.info(f"📊 Buffer: {len(recent_ticks)}/{MAX_RECENT_TICKS} ticks | VIX: {state.estimated_vix:.1f}%")
+                        logger.info(
+                            f"📊 Buffer: {len(buffer_ticks)}/{MAX_RECENT_TICKS} ticks | "
+                            f"VIX: {state.estimated_vix:.1f}% ({getattr(state, 'vix_source', 'estimate')})"
+                        )
                     
                     state.state = state_idle(tick, greeks, state, entry_func, logger)
                 else:
@@ -552,7 +660,7 @@ def main():
             elif state.state == "IN_TRADE":
                 state.state = state_in_trade(
                     tick, greeks, state, check_exit_conditions, 
-                    broker, TOTAL_CAPITAL, logger, recent_ticks
+                    broker, TOTAL_CAPITAL, logger
                 )
             
             elif state.state == "COOLDOWN":
@@ -570,7 +678,7 @@ def main():
                     f"  Mode: {mode_info}  │  Day: {day_info}  │  State: {state.state}\n"
                     f"  PnL: ₹{state.daily_pnl_inr:+.2f} ({state.daily_pnl_pct:+.2f}%)\n"
                     f"  Trades: {trades_h}/{MAX_TRADES_PER_HOUR} this hour, {trades_d}/{MAX_TRADES_PER_DAY} today\n"
-                    f"  VIX: {state.estimated_vix:.1f}% │ Consec Losses: {state.consecutive_losses}\n"
+                    f"  VIX: {state.estimated_vix:.1f}% ({getattr(state, 'vix_source', 'estimate')}) │ Consec Losses: {state.consecutive_losses}\n"
                     f"────────────────────────────────────────────────────"
                 )
             
@@ -621,6 +729,23 @@ def main():
             'ticks_valid': valid_ticks,
             'ticks_invalid': invalid_ticks
         })
+
+        # Auto archive P0-3 validation evidence for historical comparison.
+        try:
+            from utils.mq_validation_report import (
+                generate_report,
+                render_report_text,
+                save_report,
+                save_text_report,
+            )
+
+            report = generate_report(days=30)
+            day_dir = Path('logs') / datetime.now().strftime('%Y-%m-%d')
+            save_report(report, day_dir / 'mq_validation.json')
+            save_text_report(render_report_text(report), day_dir / 'mq_validation.txt')
+            logger.info(f"✓ MQ validation archived: {day_dir / 'mq_validation.json'}")
+        except Exception as e:
+            logger.warning(f"⚠ MQ validation archive skipped: {e}")
         
         # Cleanup
         broker.logout()
@@ -687,14 +812,17 @@ def run_with_auto_reconnect():
                 time.sleep(RECONNECT_WAIT_SECONDS)
                 
                 # Reset global state for fresh start
-                global recent_ticks
-                recent_ticks = []
+                runtime_state.clear_ticks()
                 
                 temp_logger.info("🔄 Attempting to reconnect...")
                 continue
             
             elif result == "ERROR":
                 temp_logger.error("✗ Fatal error occurred")
+                break
+
+            elif result == "STARTUP_BLOCKED":
+                temp_logger.error("✗ Startup blocked by readiness gate")
                 break
             
             else:

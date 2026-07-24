@@ -19,6 +19,7 @@ from config.constants import (
     MIN_CONFIDENCE, MIN_CONFIDENCE_AFTER_3SL,
     MIN_ENTRY_PREMIUM, MAX_ENTRY_PREMIUM
 )
+from core.runtime import runtime_state
 
 # Import SMART SCALP v3.4 Strategy
 try:
@@ -36,8 +37,73 @@ MAX_RECENT_TICKS = 120  # 2 minutes of data
 # Last signal params (for use by other modules)
 last_signal_params = {}
 
+try:
+    from core.services.database import db
+    HAS_DB = True
+except ImportError:
+    HAS_DB = False
 
-def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str, instrument_type: str = "") -> Tuple[bool, str]:
+try:
+    from core.validation.signal_logger import log_decision_event
+    HAS_DVF = True
+except ImportError:
+    HAS_DVF = False
+
+
+def _log_signal_snapshot(params: Dict, was_taken: bool, result_message: str) -> None:
+    """Persist signal snapshot for market-quality analytics when DB is available."""
+    if HAS_DVF:
+        try:
+            log_decision_event(params if isinstance(params, dict) else {}, was_taken, result_message)
+        except Exception:
+            pass
+
+    if not HAS_DB:
+        return
+
+    details = params.get('details', {}) if isinstance(params, dict) else {}
+    direction = params.get('direction') if isinstance(params, dict) else None
+    confidence = params.get('confidence', 0) if isinstance(params, dict) else 0
+    weighted_score = details.get('weighted_score')
+    bull_score = details.get('bull_score')
+    bear_score = details.get('bear_score')
+    factors = params.get('factors', []) if isinstance(params, dict) else []
+
+    if not factors and details:
+        if direction == 'CE':
+            factors = details.get('bull_factors', [])
+        elif direction == 'PE':
+            factors = details.get('bear_factors', [])
+
+    try:
+        db.log_signal({
+            'direction': direction,
+            'weighted_score': weighted_score,
+            'score': weighted_score,
+            'confidence': confidence,
+            'market_quality_pass': details.get('market_quality_pass', False),
+            'market_quality_pct': details.get('market_quality_score'),
+            'market_quality_score': details.get('market_quality_score'),
+            'market_quality_grade': details.get('market_quality_grade'),
+            'market_quality_components': details.get('market_quality_components', {}),
+            'hard_reject_reason': details.get('hard_reject_reason'),
+            'bull_score': bull_score,
+            'bear_score': bear_score,
+            'factors': factors,
+            'regime': params.get('regime') if isinstance(params, dict) else details.get('regime'),
+            'rsi': details.get('rsi'),
+            'macd_hist': details.get('macd_hist'),
+            'score_breakdown': details.get('score_breakdown', {}),
+            'confidence_breakdown': details.get('confidence_breakdown', {}),
+            'was_taken': was_taken,
+            'result': result_message
+        })
+    except Exception:
+        # Signal logging is analytics-only and must never block trading.
+        pass
+
+
+def entry_signal(tick: Dict, day_type: str, instrument_type: str = "") -> Tuple[bool, str]:
     """
     Entry Signal Generator - SMART SCALP v3.4 + Session Trend + PTQ validation
     
@@ -52,9 +118,11 @@ def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str, instrument
     - If price ≈ opening: SIDEWAYS (both allowed v3.3)
     """
     global last_signal_params
+    recent_ticks = runtime_state.get_recent_ticks(max_items=MAX_RECENT_TICKS)
     
     # Need minimum history - reduced since strategy uses Yahoo data
     if len(recent_ticks) < 10:
+        _log_signal_snapshot({}, False, "Warming up...")
         return False, "Warming up..."
     
     # Update session trend with current price
@@ -84,6 +152,7 @@ def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str, instrument
             required_conf = MIN_CONFIDENCE_AFTER_3SL if consecutive_losses >= 3 else MIN_CONFIDENCE
             
             if confidence < required_conf:
+                _log_signal_snapshot(params, False, f"Low confidence {confidence}% < {required_conf}%")
                 if consecutive_losses >= 3:
                     return False, f"Low conf {confidence}% < {required_conf}% (3+ SL streak)"
                 return False, f"Low confidence {confidence}% < {required_conf}%"
@@ -93,8 +162,10 @@ def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str, instrument
             # ═══════════════════════════════════════════════════════════════
             current_premium = tick.get('ltp', 0)
             if current_premium < MIN_ENTRY_PREMIUM:
+                _log_signal_snapshot(params, False, f"Premium too low ₹{current_premium:.0f} < ₹{MIN_ENTRY_PREMIUM:.0f}")
                 return False, f"Premium too low ₹{current_premium:.0f} < ₹{MIN_ENTRY_PREMIUM:.0f}"
             if current_premium > MAX_ENTRY_PREMIUM:
+                _log_signal_snapshot(params, False, f"Premium too high ₹{current_premium:.0f} > ₹{MAX_ENTRY_PREMIUM:.0f}")
                 return False, f"Premium too high ₹{current_premium:.0f} > ₹{MAX_ENTRY_PREMIUM:.0f}"
             
             # Get RSI from strategy details for reversal detection
@@ -105,10 +176,12 @@ def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str, instrument
             if instrument == 'CE':
                 ce_ok, ce_msg = can_trade_ce(rsi)
                 if not ce_ok:
+                    _log_signal_snapshot(params, False, ce_msg)
                     return False, f"{ce_msg}"
             else:  # PE
                 pe_ok, pe_msg = can_trade_pe(rsi)
                 if not pe_ok:
+                    _log_signal_snapshot(params, False, pe_msg)
                     return False, f"{pe_msg}"
             
             # Add trend info to message
@@ -123,20 +196,26 @@ def entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str, instrument
                 greeks = _calculate_greeks(tick)
                 time_ok, time_msg = validate_time_ptq(greeks)
                 if not time_ok:
+                    _log_signal_snapshot(params, False, f"Time: {time_msg}")
                     return False, f"Time: {time_msg}"
                 
                 # Greeks gate
                 greek_pass, greek_msg = greek_gate(greeks, day_type)
                 if not greek_pass:
+                    _log_signal_snapshot(params, False, f"Greeks: {greek_msg}")
                     return False, f"Greeks: {greek_msg}"
             
+            _log_signal_snapshot(params, True, full_message)
             return True, full_message
         else:
             last_signal_params = {}
+            _log_signal_snapshot(params, False, message)
             return False, message
     
     # === FALLBACK: Original PTQ Strategy ===
-    return _ptq_entry_signal(tick, recent_ticks, day_type)
+    should_enter, message = _ptq_entry_signal(tick, day_type)
+    _log_signal_snapshot({'details': {'reason': message}}, should_enter, message)
+    return should_enter, message
 
 
 def _calculate_greeks(tick: Dict) -> Dict:
@@ -160,11 +239,12 @@ def _calculate_greeks(tick: Dict) -> Dict:
     )
 
 
-def _ptq_entry_signal(tick: Dict, recent_ticks: List[Dict], day_type: str) -> Tuple[bool, str]:
+def _ptq_entry_signal(tick: Dict, day_type: str) -> Tuple[bool, str]:
     """
     Fallback PTQ Entry Signal - Original PROVEN PROFITABLE STRATEGY
     Price + Time + Quantity validation - ALL must pass
     """
+    recent_ticks = runtime_state.get_recent_ticks(max_items=MAX_RECENT_TICKS)
     greeks = _calculate_greeks(tick)
     
     # === PTQ Validation Flow ===

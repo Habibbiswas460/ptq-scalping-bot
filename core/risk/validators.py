@@ -4,7 +4,7 @@ Data hygiene, PTQ validation, Greeks filtering
 """
 
 from datetime import datetime
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Any
 
 from config.constants import (
     CONFIG, LATENCY_LIMIT_MS, SPREAD_LIMIT_PCT,
@@ -27,17 +27,93 @@ except ImportError:
 # DATA VALIDATION
 # =========================================================
 
+_VALIDATION_STATS: Dict[str, int] = {
+    "stale": 0,
+    "spread": 0,
+    "bid_ask": 0,
+    "price": 0,
+    "volume": 0,
+    "other": 0,
+}
+
+
+def reset_validation_stats() -> None:
+    """Reset validator rejection counters for a new analysis period."""
+    global _VALIDATION_STATS
+    _VALIDATION_STATS = {
+        "stale": 0,
+        "spread": 0,
+        "bid_ask": 0,
+        "price": 0,
+        "volume": 0,
+        "other": 0,
+    }
+
+
+def get_validation_stats() -> Dict[str, int]:
+    """Return current validator rejection statistics."""
+    return dict(_VALIDATION_STATS)
+
+
+def _record_validation_rejection(reason: str) -> None:
+    """Increment the counter matching the rejection category."""
+    global _VALIDATION_STATS
+    if not reason:
+        _VALIDATION_STATS["other"] += 1
+        return
+
+    normalized = reason.lower()
+    if "stale" in normalized:
+        _VALIDATION_STATS["stale"] += 1
+    elif "spread" in normalized or "wide spread" in normalized:
+        _VALIDATION_STATS["spread"] += 1
+    elif "bid" in normalized and "ask" in normalized:
+        _VALIDATION_STATS["bid_ask"] += 1
+    elif "price" in normalized:
+        _VALIDATION_STATS["price"] += 1
+    elif "volume" in normalized or "low volume" in normalized:
+        _VALIDATION_STATS["volume"] += 1
+    else:
+        _VALIDATION_STATS["other"] += 1
+
+
+def format_validation_stats_summary(stats: Dict[str, int], total_rejections: int) -> str:
+    """Create a readable percent-based summary for validator rejection stats."""
+    if total_rejections <= 0:
+        return "Rejected: none"
+
+    lines = ["Rejected:"]
+    for key, label in [("stale", "Stale"), ("spread", "Spread"), ("bid_ask", "Bid/Ask"), ("price", "Price"), ("volume", "Volume"), ("other", "Other")]:
+        count = int(stats.get(key, 0))
+        pct = (count / total_rejections) * 100 if total_rejections else 0.0
+        lines.append(f"{label}: {pct:.1f}%")
+    return "\n".join(lines)
+
+
+def _get_stale_threshold_ms(data_source: str) -> int:
+    """Resolve stale-tick threshold from config with fallback defaults."""
+    hygiene_cfg = CONFIG.get('data_hygiene', {})
+    if data_source.startswith('WEBSOCKET') or data_source in {'WS', 'WEBSOCKET_REFRESH', 'WS_REFRESH'}:
+        return int(hygiene_cfg.get('stale_threshold_ms_websocket', 10000))
+    if data_source in {'REST', 'REST_REFRESH'}:
+        return int(hygiene_cfg.get('stale_threshold_ms_rest', 5000))
+    return int(hygiene_cfg.get('stale_threshold_ms_unknown', 2000))
+
+
 def is_data_valid(tick: Dict) -> Tuple[bool, str]:
     """Validate tick data - STAGE-3: Data Hygiene"""
     if tick is None:
+        _record_validation_rejection("Tick is None")
         return False, "Tick is None"
     
     # Basic sanity
     if tick['bid'] <= 0 or tick['ask'] <= 0:
+        _record_validation_rejection("Invalid bid/ask prices")
         return False, "Invalid bid/ask prices"
     
     # Bid must be < Ask
     if tick['bid'] >= tick['ask']:
+        _record_validation_rejection("Bid >= Ask (inverted market)")
         return False, "Bid >= Ask (inverted market)"
     
     # PRICE VALIDATION
@@ -46,6 +122,7 @@ def is_data_valid(tick: Dict) -> Tuple[bool, str]:
     max_price = CONFIG['data_hygiene']['max_option_price']
     
     if ltp < min_price or ltp > max_price:
+        _record_validation_rejection(f"Invalid price ₹{ltp:.2f} (range: ₹{min_price}-₹{max_price})")
         return False, f"Invalid price ₹{ltp:.2f} (range: ₹{min_price}-₹{max_price})"
     
     # Spot price validation
@@ -54,19 +131,16 @@ def is_data_valid(tick: Dict) -> Tuple[bool, str]:
         min_spot = CONFIG['data_hygiene']['min_spot_price']
         max_spot = CONFIG['data_hygiene']['max_spot_price']
         if spot < min_spot or spot > max_spot:
+            _record_validation_rejection(f"Invalid spot ₹{spot:.2f} (range: ₹{min_spot}-₹{max_spot})")
             return False, f"Invalid spot ₹{spot:.2f} (range: ₹{min_spot}-₹{max_spot})"
     
     # Timestamp freshness - use original tick arrival time when available
     original_ts = tick.get('original_timestamp', tick['timestamp'])
     tick_age_ms = current_time_ms() - original_ts
-    data_source = tick.get('data_source', '')
-    if data_source.startswith('WEBSOCKET'):
-        max_age_ms = 10000  # Allow slightly older WS ticks when no price change occurs
-    elif data_source in ('REST', 'REST_REFRESH'):
-        max_age_ms = 5000
-    else:
-        max_age_ms = 2000
+    data_source = str(tick.get('data_source', '') or '').strip().upper()
+    max_age_ms = _get_stale_threshold_ms(data_source)
     if tick_age_ms > max_age_ms:
+        _record_validation_rejection(f"Stale tick ({tick_age_ms}ms old)")
         return False, f"Stale tick ({tick_age_ms}ms old)"
     
     # Latency check - SKIP since timestamp freshness check above is more appropriate
@@ -78,22 +152,25 @@ def is_data_valid(tick: Dict) -> Tuple[bool, str]:
     # Spread check
     spread = spread_pct(tick)
     if spread > SPREAD_LIMIT_PCT:
+        _record_validation_rejection(f"Wide spread ({spread:.3f}%)")
         return False, f"Wide spread ({spread:.3f}%)"
     
     # Volume sanity - Skip if volume data not available (WebSocket may not send volume)
     # Volume check is optional - many WebSocket feeds don't include accurate volume
     min_volume = CONFIG['data_hygiene'].get('min_volume', 0)
     tick_volume = tick.get('volume', -1)  # -1 means no volume data
+    is_rest_source = data_source.startswith('REST')
     
     # Only reject if volume is explicitly 0 AND min_volume is set high
     # If volume is -1 (not provided) or min_volume is 0, skip this check
-    if tick_volume == 0 and min_volume > 0:
+    if tick_volume == 0 and min_volume > 0 and not is_rest_source:
         # Check if we're in first 30 min - volume often 0 at market open
         current_time = datetime.now()
         market_start = current_time.replace(hour=9, minute=15, second=0)
         time_since_open = (current_time - market_start).total_seconds()
         
         if time_since_open > 1800:  # After first 30 minutes
+            _record_validation_rejection("Low volume")
             return False, "Low volume"
     
     return True, "OK"

@@ -11,6 +11,45 @@ All logic is in core/main.py
 import logging
 import sys
 import os
+import re
+
+
+class _RedactingStream:
+    """Redact known sensitive fields from any SDK/std streams."""
+
+    _PATTERNS = [
+        re.compile(r"(?i)(password['\"]?\s*[:=]\s*['\"]?)([^'\",}\s]+)"),
+        re.compile(r"(?i)(totp['\"]?\s*[:=]\s*['\"]?)([^'\",}\s]+)"),
+        re.compile(r"(?i)(api[_-]?key['\"]?\s*[:=]\s*['\"]?)([^'\",}\s]+)"),
+        re.compile(r"(?i)(refresh[_-]?token['\"]?\s*[:=]\s*['\"]?)([^'\",}\s]+)"),
+        re.compile(r"(?i)(jwt[_-]?token['\"]?\s*[:=]\s*['\"]?)([^'\",}\s]+)"),
+        re.compile(r"(?i)(X-PrivateKey['\"]?\s*[:=]\s*['\"]?)([^'\",}\s]+)"),
+    ]
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    def write(self, data):
+        if not isinstance(data, str):
+            return self._wrapped.write(data)
+        redacted = data
+        for pat in self._PATTERNS:
+            redacted = pat.sub(r"\1[REDACTED]", redacted)
+        return self._wrapped.write(redacted)
+
+    def flush(self):
+        return self._wrapped.flush()
+
+    def isatty(self):
+        return self._wrapped.isatty()
+
+    def fileno(self):
+        return self._wrapped.fileno()
+
+
+# Install stream redaction first so third-party SDK stderr prints are scrubbed.
+sys.stdout = _RedactingStream(sys.stdout)
+sys.stderr = _RedactingStream(sys.stderr)
 
 # Method 1: Disable all SDK loggers
 for logger_name in ['SmartApi', 'smartConnect', 'smartapi', 'SmartApi.smartConnect', 

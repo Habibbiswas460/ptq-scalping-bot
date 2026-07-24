@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 from config.constants import MIN_CONFIDENCE
+from core.runtime import runtime_state
 
 
 @dataclass
@@ -199,7 +200,10 @@ class Backtester:
             signal, direction, confidence, details = strategy.generate_signal(ticks_history)
             
             if signal == 1 and confidence >= MIN_CONFIDENCE:  # Min confidence threshold
-                entry_params = strategy.get_entry_params(direction, confidence, strategy._indicators_cache)
+                indicators = runtime_state.get_indicators()
+                if not indicators:
+                    indicators = strategy.calculate_indicators(ticks_history)
+                entry_params = strategy.get_entry_params(direction, confidence, indicators)
                 return self._enter_trade(timestamp, current_price, direction, confidence, details, entry_params)
         
         return None

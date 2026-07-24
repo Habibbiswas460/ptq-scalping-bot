@@ -21,6 +21,7 @@ from config.constants import (
     TRADING_START_TIME
 )
 from utils.helpers import now, calculate_position_size
+from core.runtime import runtime_state
 
 # Strike rotation interval (seconds)
 STRIKE_ROTATION_INTERVAL = 60
@@ -170,6 +171,7 @@ class TradingState:
         
         # VIX tracking
         self.estimated_vix = 15.0
+        self.vix_source = "estimate"
         
         # Loop counter
         self.loop_count = 0
@@ -582,6 +584,7 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
     # ── RISK MANAGER CHECK (FINAL FIX) ──
     try:
         from core.risk.risk_manager import get_risk_manager
+        from core.engines.position_size_engine import PositionSizeEngine
         rm = get_risk_manager()
         can_trade, risk_details = rm.can_trade(spot_price=tick.get('spot_price'))
         
@@ -590,49 +593,98 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
             logger.warning(f"⚠ RISK BLOCKED: {', '.join(reasons)}")
             logger.state_change("ENTRY_READY", "COOLDOWN", f"Risk: {reasons[0]}")
             return "COOLDOWN"
-        
-        size_multiplier = risk_details.get('size_multiplier', 1.0)
-        if size_multiplier != 1.0:
-            logger.info(f"📊 Risk size multiplier: {size_multiplier:.2f}")
+
+        risk_budget = risk_details.get('risk_budget', {})
+        for warning in risk_details.get('warnings', []):
+            logger.info(f"📊 Risk sizing context: {warning}")
     except Exception as e:
         logger.warning(f"⚠ RiskManager check error: {e} — proceeding with default")
-        size_multiplier = 1.0
+        risk_budget = {}
     
     # Get SMART SCALP v3.4 signal params
     try:
-        from core.engines.entry_engine import get_last_signal_params, get_signal_direction, get_signal_quantity
+        from core.engines.entry_engine import get_last_signal_params, get_signal_direction
         signal_params = get_last_signal_params()
         direction = get_signal_direction()
-        signal_qty = get_signal_quantity()
     except ImportError:
         signal_params = {}
         direction = "CE"
-        signal_qty = CONFIG['trading']['quantity']
-    
-    # Use signal quantity or calculate from VIX
-    if signal_params and 'quantity' in signal_params:
-        adjusted_qty = signal_params['quantity']
-        logger.info(f"🎯 SMART SCALP: {direction} | Qty: {adjusted_qty} | Conf: {signal_params.get('confidence', 0)}%")
-    else:
-        position_multiplier = calculate_position_size(state.estimated_vix)
-        base_qty = CONFIG['trading']['quantity']
-        adjusted_qty = int(base_qty * position_multiplier)
-        if position_multiplier != 1.0:
-            logger.info(f"📊 Position adjusted: {base_qty} → {adjusted_qty}")
-    
-    # Apply risk manager size multiplier
-    if size_multiplier != 1.0:
-        original_qty = adjusted_qty
-        adjusted_qty = max(1, int(adjusted_qty * size_multiplier))
-        logger.info(f"📊 Risk adjusted qty: {original_qty} → {adjusted_qty} (×{size_multiplier:.2f})")
+
+    details = signal_params.get('details', {}) if isinstance(signal_params, dict) else {}
+    weighted_score = signal_params.get('score', details.get('weighted_score', 0)) if isinstance(signal_params, dict) else 0
+    confidence = signal_params.get('confidence', 0) if isinstance(signal_params, dict) else 0
+    market_quality = details.get('market_quality', details.get('market_quality_score', 0))
+    regime = signal_params.get('regime', details.get('regime', 'UNKNOWN')) if isinstance(signal_params, dict) else details.get('regime', 'UNKNOWN')
+    sl_points = signal_params.get('sl_points', CONFIG['risk_management'].get('stop_loss_amount', 0) / max(1, CONFIG['trading'].get('lot_size', 1))) if isinstance(signal_params, dict) else 0
+    lot_size = int(CONFIG['trading'].get('lot_size', 1))
+
+    size_engine = PositionSizeEngine()
+    allocation = size_engine.calculate(
+        capital=risk_budget.get('capital', CONFIG['capital']['total_capital']) if isinstance(risk_budget, dict) else CONFIG['capital']['total_capital'],
+        risk_budget=risk_budget,
+        weighted_score=weighted_score,
+        confidence=confidence,
+        market_quality=market_quality,
+        regime=regime,
+        volatility={'vix': state.estimated_vix},
+        recovery_mode=risk_budget.get('recovery_mode', {'active': False}) if isinstance(risk_budget, dict) else {'active': False},
+        daily_loss_state=risk_budget.get('daily_loss_state', {'loss_utilization': 0.0}) if isinstance(risk_budget, dict) else {'loss_utilization': 0.0},
+        sl_points=sl_points,
+        lot_size=lot_size,
+    )
+    adjusted_qty = int(allocation.get('position_size', 0) or 0)
+
+    if adjusted_qty <= 0:
+        cap_reason = allocation.get('cap_reason') or 'allocator_zero_quantity'
+        logger.warning(f"⚠ POSITION SIZE BLOCKED: qty=0 | reason={cap_reason}")
+        logger.state_change("ENTRY_READY", "COOLDOWN", f"Allocator: {cap_reason}")
+        return "COOLDOWN"
+
+    logger.info(
+        f"🎯 SMART SCALP: {direction} | Qty: {adjusted_qty} | Conf: {confidence}% | "
+        f"Alloc: {allocation.get('allocation_grade')} | Risk ₹{allocation.get('risk_amount', 0):.0f}"
+    )
     
     # Store direction in trade for exit reference
     trade = broker.place_order("BUY", qty=adjusted_qty, trades_this_hour=state.trades_this_hour, 
                                 direction=direction, signal_params=signal_params)
     
     if trade:
+        trade.update({
+            'risk_budget_used': allocation.get('risk_budget_used'),
+            'risk_amount': allocation.get('risk_amount'),
+            'allocation_grade': allocation.get('allocation_grade'),
+            'position_size_breakdown': allocation.get('breakdown', {}),
+        })
         state.current_trade = trade
         state.trades_this_hour += 1
+
+        try:
+            from core.services.database import log_trade_entry
+            log_trade_entry({
+                'order_id': trade.get('order_id'),
+                'symbol': trade.get('symbol'),
+                'direction': trade.get('direction', direction),
+                'side': trade.get('side', 'BUY'),
+                'qty': trade.get('qty', adjusted_qty),
+                'entry_price': trade.get('entry_price'),
+                'entry_time': trade.get('entry_time'),
+                'entry_reason': details.get('reason', 'Entry signal'),
+                'score': signal_params.get('score') if isinstance(signal_params, dict) else None,
+                'confidence': signal_params.get('confidence') if isinstance(signal_params, dict) else None,
+                'market_quality_score': details.get('market_quality_score'),
+                'market_quality_grade': details.get('market_quality_grade'),
+                'market_quality_components': details.get('market_quality_components', {}),
+                'hard_reject_reason': details.get('hard_reject_reason'),
+                'risk_budget_used': allocation.get('risk_budget_used'),
+                'risk_amount': allocation.get('risk_amount'),
+                'allocation_grade': allocation.get('allocation_grade'),
+                'position_size_breakdown': allocation.get('breakdown', {}),
+                'factors': signal_params.get('factors', []) if isinstance(signal_params, dict) else [],
+                'greeks': greeks,
+            })
+        except Exception as e:
+            logger.warning(f"⚠ DB trade entry logging failed: {e}")
         
         logger.trade_entry({
             'order_id': trade['order_id'],
@@ -652,8 +704,7 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
 
 
 def state_in_trade(tick: Dict, greeks: Dict, state: TradingState,
-                   exit_check_func, broker, total_capital: float, logger,
-                   recent_ticks: list = None) -> str:
+                   exit_check_func, broker, total_capital: float, logger) -> str:
     """Handle IN_TRADE state - Monitor and exit"""
     from utils.helpers import estimate_vix_from_ticks
     from core.engines.entry_engine import MAX_RECENT_TICKS
@@ -699,6 +750,7 @@ def state_in_trade(tick: Dict, greeks: Dict, state: TradingState,
                 return "IN_TRADE"  # Wait for valid tick
     
     # Calculate RSI for momentum exit
+    recent_ticks = runtime_state.get_recent_ticks(max_items=MAX_RECENT_TICKS)
     rsi = _calculate_rsi(recent_ticks) if recent_ticks else None
     
     # Check exit conditions (now includes RSI for momentum exit)
@@ -726,6 +778,19 @@ def state_in_trade(tick: Dict, greeks: Dict, state: TradingState,
         
         is_loss = result['pnl_inr'] < 0
         state.update_pnl(result['pnl_inr'], total_capital, is_loss, trade_direction)
+
+        try:
+            from core.services.database import log_trade_exit
+            log_trade_exit(state.current_trade.get('order_id'), {
+                'exit_price': result.get('exit_price', tick.get('ltp')),
+                'exit_time': now(),
+                'exit_reason': result.get('exit_reason', exit_reason),
+                'pnl': result.get('pnl_inr', 0),
+                'pnl_pct': result.get('pnl_pct', 0),
+                'hold_time_sec': result.get('hold_time', 0)
+            })
+        except Exception as e:
+            logger.warning(f"⚠ DB trade exit logging failed: {e}")
         
         # 🔄 STRIKE ROTATION after trade exit (Gemini recommendation)
         # Check if spot has moved 50+ pts from current strike

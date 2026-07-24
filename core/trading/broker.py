@@ -15,6 +15,7 @@ import math
 import random
 import requests
 import threading
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
@@ -29,6 +30,7 @@ from config.constants import (
     ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET,
     SL_POINTS_FIXED, TP_POINTS_FIXED, CE_QUANTITY, PE_QUANTITY,
     TOTAL_CAPITAL, MIN_ENTRY_PREMIUM, MAX_ENTRY_PREMIUM,
+    STALE_THRESHOLD_MS_REST,
     # v3.1 Order execution config
     USE_LIMIT_ORDERS, LIMIT_ORDER_OFFSET, MAX_SLIPPAGE_PCT,
     ORDER_RETRY_ENABLED, ORDER_MAX_RETRIES, ORDER_RETRY_DELAY_MS, ORDER_PRICE_CHASE_STEP
@@ -36,6 +38,8 @@ from config.constants import (
 
 # ScripMaster download URL (Angel One official)
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+SCRIP_MASTER_CACHE_FILE = Path("core/data/scripmaster_nifty_nfo.json")
+SCRIP_MASTER_CACHE_TTL_SEC = 6 * 60 * 60
 
 # Premium range for strike selection (use tighter range than entry filter)
 STRIKE_PREMIUM_MIN = 90.0   # Minimum premium for strike selection
@@ -72,7 +76,8 @@ class BrokerInterface:
         # Layer 1: Heartbeat Monitor (15s for algo trading - fast detection)
         # Note: Angel One only sends on price CHANGES. REST polling fills gaps.
         self._ws_last_tick_time: float = 0
-        self._ws_heartbeat_timeout: int = 15  # 15 seconds for algo trading
+        self._ws_last_option_tick_time: float = 0
+        self._ws_heartbeat_timeout: int = 30  # 30 seconds for algo trading (more conservative)
         self._ws_heartbeat_thread: Optional[threading.Thread] = None
         
         # Layer 2: Auto-Reconnect Loop with Exponential Backoff
@@ -85,6 +90,7 @@ class BrokerInterface:
         self._ws_circuit_open: bool = False
         self._ws_circuit_cooldown_until: Optional[datetime] = None
         self._ws_circuit_cooldown_sec: int = 180  # 3 minutes (faster retry)
+        self._ws_connection_limit_cooldown_sec: int = 900  # 15 minutes on broker 429 limit
         
         # Layer 4: Pre-Market Reconnect Timer (reconnect 2 min before market open)
         self._ws_premarket_reconnect_done: bool = False
@@ -101,6 +107,12 @@ class BrokerInterface:
         self._position_cache: Optional[Dict] = None
         self._position_cache_time: float = 0
         self._position_cache_ttl = 5.0
+
+        # Reconnect guard to avoid duplicate reconnection attempts
+        self._ws_reconnect_lock = threading.Lock()
+        self._ws_reconnect_running: bool = False
+        self._ws_shutdown_requested: bool = False
+        self._ws_heartbeat_stop_event = threading.Event()
 
         # REST polling fallback state
         self._last_spot_fetch: float = 0
@@ -119,6 +131,8 @@ class BrokerInterface:
 
     def connect(self) -> bool:
         """Initialize and connect to Angel One broker"""
+        self._ws_shutdown_requested = False
+        self._ws_heartbeat_stop_event.clear()
         self.logger = BotLogger(log_dir=LOG_DIRECTORY, enable_console=LOG_CONSOLE)
 
         self.logger.info("── PTQ Scalp v3.4 ──")
@@ -202,9 +216,36 @@ class BrokerInterface:
         Download Angel One ScripMaster JSON and build token_map.
         This replaces ALL searchScrip API calls — zero rate limit risk.
         """
+        # Try local cache first to avoid blocking startup on slow network.
+        try:
+            if SCRIP_MASTER_CACHE_FILE.exists():
+                age_sec = time.time() - SCRIP_MASTER_CACHE_FILE.stat().st_mtime
+                with SCRIP_MASTER_CACHE_FILE.open("r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                if isinstance(cached, dict):
+                    cached_map = cached.get("token_map", {})
+                else:
+                    cached_map = {}
+                if isinstance(cached_map, dict) and cached_map:
+                    self.token_map.update({str(k): str(v) for k, v in cached_map.items() if k and v})
+                    if age_sec <= SCRIP_MASTER_CACHE_TTL_SEC:
+                        self.logger.info(
+                            f"✅ ScripMaster cache loaded: {len(self.token_map)} tokens "
+                            f"(age {int(age_sec)}s)"
+                        )
+                        return
+                    else:
+                        self.logger.info(
+                            f"♻ Using stale ScripMaster cache while refreshing in foreground "
+                            f"(age {int(age_sec)}s)"
+                        )
+        except Exception as e:
+            self.logger.warning(f"⚠ Local ScripMaster cache read failed: {e}")
+
         self.logger.info("📥 Downloading ScripMaster JSON...")
         try:
-            response = requests.get(SCRIP_MASTER_URL, timeout=30)
+            # Keep timeout tight so readiness flow cannot block for long.
+            response = requests.get(SCRIP_MASTER_URL, timeout=(5, 12))
             response.raise_for_status()
             data = response.json()
 
@@ -219,6 +260,14 @@ class BrokerInterface:
                         count += 1
 
             self.logger.info(f"✅ ScripMaster cached: {count} NIFTY NFO tokens")
+
+            # Persist to local cache for next startup.
+            try:
+                SCRIP_MASTER_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                with SCRIP_MASTER_CACHE_FILE.open("w", encoding="utf-8") as f:
+                    json.dump({"saved_at": datetime.now().isoformat(), "token_map": self.token_map}, f)
+            except Exception as cache_err:
+                self.logger.warning(f"⚠ Could not save ScripMaster cache: {cache_err}")
 
         except Exception as e:
             self.logger.warning(f"⚠ ScripMaster download failed: {e}")
@@ -350,13 +399,16 @@ class BrokerInterface:
             if self._ws_connected and self.broker_client and self._option_token:
                 try:
                     if old_token:
-                        self.broker_client.unsubscribe([(EXCHANGE, old_token, 2)])
-                    self.broker_client.subscribe([(EXCHANGE, self._option_token, 2)])
-                    self.logger.info(f"🔌 WebSocket re-subscribed to {self.current_symbol}")
+                        if not self._unsubscribe_with_verify([(EXCHANGE, old_token, 2)]):
+                            self.logger.warning(f"⚠ Old token unsubscribe failed: {old_token}")
+
+                    if not self._subscribe_with_retry([(EXCHANGE, self._option_token, 2)]):
+                        self.logger.warning(f"⚠ WebSocket re-subscribe failed for {self._option_token}")
+                    else:
+                        self.logger.info(f"🔌 WebSocket re-subscribed to {self.current_symbol}")
                 except Exception as e:
                     self.logger.warning(f"⚠ WebSocket re-subscribe failed: {e}")
-            
-            # Clear cached tick
+
             self._cached_option_tick = None
             self.last_tick = None
             
@@ -443,6 +495,137 @@ class BrokerInterface:
         
         return best_strike, best_premium
 
+    def _clear_rest_cache(self):
+        """Invalidate REST fallback cache after WebSocket recovery."""
+        self._cached_option_tick = None
+        self._last_option_fetch = 0
+        self._last_rest_refresh = 0
+        with self._tick_lock:
+            self.last_tick = None
+            self._tick_buffer.clear()
+        self.logger.debug("REST cache and tick buffer cleared")
+
+    def _verify_subscriptions(self, tokens: List[tuple]) -> bool:
+        """Verify local subscription state for expected tokens."""
+        if not self.broker_client:
+            return False
+
+        success = True
+        for _, token, _ in tokens:
+            if token and token not in self.broker_client.subscriptions:
+                self.logger.warning(f"⚠ Subscription cache missing token {token}")
+                success = False
+        return success
+
+    def _wait_for_first_ws_tick(self, expected_token: str, timeout_sec: int = 10) -> bool:
+        """Wait for the first valid WebSocket tick for the subscribed token."""
+        start_time = time.time()
+        while time.time() - start_time < timeout_sec:
+            with self._tick_lock:
+                if self.last_tick:
+                    tick_token = str(self.last_tick.get('token', ''))
+                    ltp = self.last_tick.get('ltp', 0)
+                    if tick_token == expected_token and ltp and ltp > 0:
+                        return True
+            if not self._ws_connected:
+                break
+            time.sleep(0.2)
+        return False
+
+    def _wait_for_symbol_tick(self, expected_symbol: str, expected_token: str, timeout_sec: float = 3.0) -> bool:
+        """Wait for a fresh option tick that matches both symbol and token."""
+        start_time = time.time()
+        while time.time() - start_time < timeout_sec:
+            with self._tick_lock:
+                tick = self.last_tick.copy() if self.last_tick else None
+            if tick:
+                tick_symbol = tick.get('symbol')
+                tick_token = str(tick.get('token', ''))
+                tick_ltp = tick.get('ltp', 0)
+                if tick_symbol == expected_symbol and tick_token == str(expected_token) and tick_ltp and tick_ltp > 0:
+                    return True
+            if not self._ws_connected:
+                break
+            time.sleep(0.2)
+        return False
+
+    def _ensure_symbol_sync_before_order(self, option_symbol: str, option_token: Optional[str]) -> bool:
+        """Ensure order symbol/token stream is active before pricing and order placement."""
+        if not (USE_LIVE_DATA and ENABLE_WEBSOCKET and self._ws_connected and self.broker_client and option_token):
+            return True
+
+        if self._wait_for_symbol_tick(option_symbol, option_token, timeout_sec=3.0):
+            return True
+
+        self.logger.warning(
+            f"⚠ No fresh tick for {option_symbol} ({option_token}) before order - forcing re-subscribe"
+        )
+
+        try:
+            if not self._subscribe_with_retry([(EXCHANGE, option_token, 2)], retries=1, timeout_sec=5):
+                return False
+        except Exception as e:
+            self.logger.warning(f"⚠ Forced re-subscribe failed before order: {e}")
+            return False
+
+        return self._wait_for_symbol_tick(option_symbol, option_token, timeout_sec=3.0)
+
+    def _unsubscribe_with_verify(self, tokens: List[tuple], retries: int = 2) -> bool:
+        """Unsubscribe from WebSocket tokens with verification."""
+        if not self.broker_client:
+            return False
+
+        for attempt in range(1, retries + 1):
+            self.logger.info(f"🔌 Unsubscribe attempt {attempt}/{retries} for tokens {[t[1] for t in tokens]}")
+            unsubscribed = self.broker_client.unsubscribe(tokens)
+            if not unsubscribed:
+                self.logger.warning("⚠ Unsubscribe send failed")
+                time.sleep(0.5)
+                continue
+
+            still_present = [token for _, token, _ in tokens if token in self.broker_client.subscriptions]
+            if still_present:
+                self.logger.warning(f"⚠ Unsubscribe cache still has tokens: {still_present}")
+                time.sleep(0.5)
+                continue
+
+            return True
+
+        self.logger.error(f"❌ Failed to unsubscribe tokens after {retries} attempts")
+        return False
+
+    def _subscribe_with_retry(self, tokens: List[tuple], retries: int = 3, timeout_sec: int = 10) -> bool:
+        """Subscribe to WebSocket tokens with retry and first-tick validation."""
+        if not self.broker_client:
+            return False
+
+        expected_option_token = next((token for _, token, _ in tokens if token == self._option_token), None)
+
+        for attempt in range(1, retries + 1):
+            self.logger.info(f"🔌 Subscribe attempt {attempt}/{retries} for tokens {[t[1] for t in tokens]}")
+            subscribed = self.broker_client.subscribe(tokens)
+            if not subscribed:
+                self.logger.warning("⚠ Subscribe send failed")
+                time.sleep(1)
+                continue
+
+            if not self._verify_subscriptions(tokens):
+                self.logger.warning("⚠ Subscription local cache verification failed")
+                time.sleep(1)
+                continue
+
+            if expected_option_token and not self._wait_for_first_ws_tick(expected_option_token, timeout_sec):
+                self.logger.warning("⚠ No first tick after subscribe, retrying...")
+                self._unsubscribe_with_verify(tokens)
+                time.sleep(1)
+                continue
+
+            self._clear_rest_cache()
+            return True
+
+        self.logger.error(f"❌ Failed to subscribe to tokens after {retries} attempts")
+        return False
+
     # =========================================================================
     # WEBSOCKET — real-time ticks (eliminates 180s polling delay)
     # =========================================================================
@@ -451,6 +634,10 @@ class BrokerInterface:
         """Start WebSocket and subscribe to NIFTY spot + option"""
         if not self.broker_client:
             return
+        if self._ws_shutdown_requested:
+            if self.logger:
+                self.logger.info("WebSocket start skipped: shutdown requested")
+            return
 
         try:
             self.broker_client.start_websocket(
@@ -458,28 +645,48 @@ class BrokerInterface:
             )
             # Register disconnect callback so BrokerInterface knows when WS dies
             self.broker_client._broker_ws_disconnect_cb = self._on_ws_disconnect
-            time.sleep(2)  # Wait for connection
+
+            # Wait until WebSocket reports connected or timeout
+            start_time = time.time()
+            timeout_sec = 10
+            while time.time() - start_time < timeout_sec:
+                if self.broker_client.ws_connected:
+                    break
+                time.sleep(0.2)
 
             if not self.broker_client.ws_connected:
-                self.logger.warning("⚠ WebSocket connection failed, will use REST polling")
+                self.logger.warning("⚠ WebSocket connection failed or timed out, will use REST polling")
                 return
 
-            # Subscribe: NIFTY spot (LTP) + Option (Quote for bid/ask)
-            tokens = [
+            # Subscribe spot first (LTP mode), then option (Quote mode)
+            spot_tokens = [
                 ("NSE", "99926000", 1),  # NIFTY spot — LTP mode
             ]
-
+            option_tokens = []
             if self._option_token:
-                tokens.append((EXCHANGE, self._option_token, 2))  # Option — Quote mode
+                option_tokens.append((EXCHANGE, self._option_token, 2))  # Option — Quote mode
 
-            self.broker_client.subscribe(tokens)
-            self._ws_connected = True
-            self._ws_last_tick_time = time.time()  # Initialize heartbeat
-            self._ws_reconnect_attempts = 0  # Reset on successful connect
-            self.logger.info(f"🔌 WebSocket subscribed to {len(tokens)} tokens")
-            
+            spot_ok = self._subscribe_with_retry(spot_tokens)
+            option_ok = True
+            if spot_ok and option_tokens:
+                option_ok = self._subscribe_with_retry(option_tokens)
+
+            if spot_ok and option_ok:
+                self._ws_connected = True
+                now_ts = time.time()
+                self._ws_last_tick_time = now_ts  # Initialize heartbeat
+                # Initialize option heartbeat too; avoids false 999s timeout before first option tick.
+                self._ws_last_option_tick_time = now_ts
+                self._ws_reconnect_attempts = 0  # Reset on successful connect
+                self.logger.info(f"🔌 WebSocket subscribed to {len(spot_tokens) + len(option_tokens)} tokens")
+            else:
+                self.logger.error("❌ WebSocket subscription failed after retries")
+                self._ws_connected = False
+                return
+
             # Layer 1: Start heartbeat monitor (if not already running)
             if not self._ws_heartbeat_thread or not self._ws_heartbeat_thread.is_alive():
+                self._ws_heartbeat_stop_event.clear()
                 self._start_ws_heartbeat_monitor()
 
         except Exception as e:
@@ -491,6 +698,31 @@ class BrokerInterface:
 
     def _on_ws_disconnect(self, reason: str = "unknown"):
         """Called when WebSocket disconnects — triggers Layer 2 auto-reconnect"""
+        if self._ws_shutdown_requested:
+            if self.logger:
+                self.logger.info(f"WebSocket disconnect ignored during shutdown: {reason}")
+            return
+
+        # Broker-side connection limit (HTTP 429) should not trigger reconnect storms.
+        reason_text = str(reason or "").lower()
+        is_conn_limit = (
+            "429" in reason_text
+            or "connection limit exceeded" in reason_text
+            or "too many requests" in reason_text
+        )
+        if is_conn_limit:
+            self._ws_connected = False
+            self._ws_circuit_open = True
+            self._ws_circuit_cooldown_until = datetime.now() + timedelta(
+                seconds=self._ws_connection_limit_cooldown_sec
+            )
+            self.logger.warning(
+                "⚠ WebSocket connection limit hit (HTTP 429). "
+                f"Pausing reconnects for {self._ws_connection_limit_cooldown_sec}s "
+                f"until {self._ws_circuit_cooldown_until.strftime('%H:%M:%S')} and using REST fallback."
+            )
+            return
+
         was_connected = self._ws_connected
         self._ws_connected = False
         
@@ -501,61 +733,85 @@ class BrokerInterface:
             self._trigger_ws_reconnect()
     
     def _trigger_ws_reconnect(self):
-        """Layer 2: Auto-reconnect loop with exponential backoff - keeps trying WebSocket"""
-        # Check Layer 3: Circuit Breaker
-        if self._ws_circuit_open:
-            if self._ws_circuit_cooldown_until and datetime.now() < self._ws_circuit_cooldown_until:
-                # Still in cooldown - silently skip
-                return
-            else:
-                # Cooldown expired - reset circuit breaker
-                self._ws_circuit_open = False
-                self._ws_reconnect_attempts = 0
-                self._ws_reconnect_delay = 1.0  # Reset delay
-                self.logger.info("🔄 Circuit breaker reset - attempting reconnection...")
-        
-        # Increment attempt counter
-        self._ws_reconnect_attempts += 1
-        
-        # Layer 3: Check if we've exceeded max attempts
-        if self._ws_reconnect_attempts > self._ws_max_reconnect_attempts:
-            self._ws_circuit_open = True
-            self._ws_circuit_cooldown_until = datetime.now() + timedelta(seconds=self._ws_circuit_cooldown_sec)
-            self.logger.warning(
-                f"🔌 CIRCUIT BREAKER OPEN | {self._ws_reconnect_attempts} failed attempts | "
-                f"Sleeping for {self._ws_circuit_cooldown_sec//60} minutes (until {self._ws_circuit_cooldown_until.strftime('%H:%M:%S')})"
-            )
+        """Layer 2: Auto-reconnect worker thread with exponential backoff."""
+        if self._ws_shutdown_requested:
+            if self.logger:
+                self.logger.info("Reconnect skipped: shutdown requested")
             return
-        
-        # Calculate exponential backoff delay
-        current_delay = min(self._ws_reconnect_delay * (2 ** (self._ws_reconnect_attempts - 1)), 
-                           self._ws_max_reconnect_delay)
-        
-        # Attempt reconnection
-        self.logger.info(f"🔄 WebSocket reconnect attempt {self._ws_reconnect_attempts}/{self._ws_max_reconnect_attempts} (delay: {current_delay:.1f}s)...")
-        
-        try:
-            # Exponential backoff delay
-            time.sleep(current_delay)
-            
-            # Stop old WebSocket
-            if self.broker_client:
-                try:
-                    self.broker_client.stop_websocket()
-                except:
-                    pass
-            
-            # Start fresh WebSocket
-            self._start_websocket()
-            
-            # If successful, reset counter
-            if self._ws_connected:
-                self._ws_reconnect_attempts = 0
-                self.logger.info("✅ WebSocket reconnected successfully!")
-        except Exception as e:
-            self.logger.warning(f"⚠ Reconnect failed: {e}")
-            # Schedule another attempt
-            threading.Thread(target=self._trigger_ws_reconnect, daemon=True).start()
+        with self._ws_reconnect_lock:
+            if self._ws_reconnect_running:
+                self.logger.debug("🔄 Reconnect already running, skipping duplicate trigger")
+                return
+            self._ws_reconnect_running = True
+
+        def reconnect_worker():
+            try:
+                while True:
+                    if self._ws_shutdown_requested:
+                        self.logger.info("Reconnect worker stopping: shutdown requested")
+                        break
+                    # If already reconnected, stop the worker
+                    if self._ws_connected:
+                        self.logger.info("✅ WebSocket already connected, stopping reconnect worker")
+                        break
+
+                    # Circuit breaker logic
+                    if self._ws_circuit_open:
+                        if self._ws_circuit_cooldown_until and datetime.now() < self._ws_circuit_cooldown_until:
+                            self.logger.info(
+                                f"🔌 Circuit breaker active until {self._ws_circuit_cooldown_until.strftime('%H:%M:%S')}, delaying reconnect"
+                            )
+                            time.sleep(10)
+                            continue
+                        self._ws_circuit_open = False
+                        self._ws_reconnect_attempts = 0
+                        self._ws_reconnect_delay = 1.0
+                        self.logger.info("🔄 Circuit breaker reset - attempting reconnection...")
+
+                    self._ws_reconnect_attempts += 1
+                    if self._ws_reconnect_attempts > self._ws_max_reconnect_attempts:
+                        self._ws_circuit_open = True
+                        self._ws_circuit_cooldown_until = datetime.now() + timedelta(seconds=self._ws_circuit_cooldown_sec)
+                        self.logger.warning(
+                            f"🔌 CIRCUIT BREAKER OPEN | {self._ws_reconnect_attempts} failed attempts | "
+                            f"Cooldown until {self._ws_circuit_cooldown_until.strftime('%H:%M:%S')}"
+                        )
+                        break
+
+                    raw_delay = min(self._ws_reconnect_delay * (2 ** (self._ws_reconnect_attempts - 1)), self._ws_max_reconnect_delay)
+                    jitter = random.uniform(-min(3.0, raw_delay * 0.1), min(3.0, raw_delay * 0.1))
+                    current_delay = max(1.0, min(self._ws_max_reconnect_delay, raw_delay + jitter))
+
+                    self.logger.info(
+                        f"🔄 WebSocket reconnect attempt {self._ws_reconnect_attempts}/{self._ws_max_reconnect_attempts} "
+                        f"(delay: {current_delay:.1f}s, jitter: {jitter:+.2f}s)"
+                    )
+
+                    time.sleep(current_delay)
+
+                    if self.broker_client:
+                        try:
+                            self.broker_client.stop_websocket()
+                        except Exception:
+                            pass
+
+                    try:
+                        self._start_websocket()
+                        if self._ws_connected:
+                            self._ws_reconnect_attempts = 0
+                            self.logger.info("✅ WebSocket reconnected successfully!")
+                            break
+                        self.logger.warning("⚠ WebSocket reconnect attempt completed without connection")
+                    except Exception as e:
+                        self.logger.warning(f"⚠ Reconnect attempt error: {e}")
+
+                    # Continue looping until circuit breaker opens or reconnect succeeds
+                
+            finally:
+                with self._ws_reconnect_lock:
+                    self._ws_reconnect_running = False
+
+        threading.Thread(target=reconnect_worker, daemon=True, name="WS-Reconnect").start()
     
     def _start_ws_heartbeat_monitor(self):
         """Layer 1: Heartbeat monitor - checks if ticks are flowing (algo-trading optimized)
@@ -567,6 +823,8 @@ class BrokerInterface:
         def heartbeat_monitor():
             while True:
                 try:
+                    if self._ws_shutdown_requested or self._ws_heartbeat_stop_event.is_set():
+                        break
                     # If circuit breaker is open, just sleep
                     if self._ws_circuit_open:
                         time.sleep(60)  # Check circuit breaker every minute
@@ -575,8 +833,16 @@ class BrokerInterface:
                     # Layer 4: Check for pre-market reconnect (2 min before market open)
                     self._check_premarket_reconnect()
                     
-                    # Check if we're getting ticks
-                    time_since_last_tick = time.time() - self._ws_last_tick_time
+                    # Check if we're getting useful ticks for the active option token.
+                    if self._option_token:
+                        last_stream_tick_time = self._ws_last_option_tick_time
+                    else:
+                        last_stream_tick_time = self._ws_last_tick_time
+
+                    if last_stream_tick_time > 0:
+                        time_since_last_tick = time.time() - last_stream_tick_time
+                    else:
+                        time_since_last_tick = 999
                     
                     # Only reconnect if:
                     # 1. Connected but no tick received for 2+ minutes, AND
@@ -585,8 +851,8 @@ class BrokerInterface:
                     original_tick_age = time.time() - self._ws_original_tick_time if self._ws_original_tick_time else 999
                     
                     if self._ws_connected and time_since_last_tick > self._ws_heartbeat_timeout:
-                        # If original tick data < 5 min old (being refreshed by REST), don't reconnect
-                        if has_usable_cache and original_tick_age < 300:
+                        # If original tick data is still fresh enough, avoid reconnect churn.
+                        if has_usable_cache and original_tick_age < 120:
                             # Log once per minute that we're using REST refresh
                             if int(time_since_last_tick) % 60 == 0:
                                 self.logger.info(f"ℹ WebSocket quiet ({time_since_last_tick:.0f}s), REST keeping data fresh ({original_tick_age:.0f}s old)")
@@ -594,7 +860,7 @@ class BrokerInterface:
                             self.logger.warning(f"💔 Heartbeat FAILED: No tick for {time_since_last_tick:.0f}s - reconnecting...")
                             self._on_ws_disconnect("Heartbeat timeout")
                     
-                    time.sleep(30)  # Check every 30 seconds
+                    time.sleep(15)  # Check every 15 seconds
                     
                 except Exception as e:
                     self.logger.debug(f"Heartbeat monitor error: {e}")
@@ -701,6 +967,7 @@ class BrokerInterface:
                 self.last_tick = new_tick
                 self.last_valid_tick_time = datetime.now()
                 self._ws_original_tick_time = time.time()  # Track when real data arrived
+                self._ws_last_option_tick_time = time.time()
 
     # =========================================================================
     # REST FALLBACK — when WebSocket is disabled or fails
@@ -793,7 +1060,9 @@ class BrokerInterface:
         if not self.broker_client:
             return None
 
-        poll_interval = 10  # 10 seconds (WebSocket is primary, REST is backup)
+        # Keep REST fallback cadence below stale threshold to reduce stale rejects.
+        rest_stale_sec = max(1.0, STALE_THRESHOLD_MS_REST / 1000.0)
+        poll_interval = max(1.0, min(10.0, rest_stale_sec - 1.0))
 
         # Fetch NIFTY spot every 30s via REST
         if time.time() - self._last_spot_fetch > 30:
@@ -806,10 +1075,35 @@ class BrokerInterface:
                     # Check if strike needs adjustment
                     base_strike = round(self.spot_price / 50) * 50
                     if abs(self.spot_price - self.current_strike) >= 50:  # Reduced from 150 to 50
+                        old_symbol = self.current_symbol
+                        old_token = self._option_token
                         self.current_strike = base_strike
                         self.current_symbol = self._build_option_symbol(self.current_strike, OPTION_TYPE)
                         self._option_token = self._get_token(self.current_symbol, EXCHANGE)
                         self.logger.info(f"🔧 Strike adjusted: {self.current_strike} | {self.current_symbol}")
+
+                        # Strike changed via REST path, so WS token must be updated too.
+                        if (
+                            self._ws_connected
+                            and self.broker_client
+                            and self._option_token
+                            and self._option_token != old_token
+                        ):
+                            try:
+                                with self._tick_lock:
+                                    self.last_tick = None
+                                    self._tick_buffer.clear()
+
+                                if old_token:
+                                    if not self._unsubscribe_with_verify([(EXCHANGE, old_token, 2)]):
+                                        self.logger.warning(f"⚠ Old token unsubscribe failed: {old_token}")
+
+                                if not self._subscribe_with_retry([(EXCHANGE, self._option_token, 2)]):
+                                    self.logger.warning(f"⚠ WebSocket re-subscribe failed for {self._option_token}")
+                                else:
+                                    self.logger.info(f"🔌 WebSocket re-subscribed after strike adjust: {old_symbol} → {self.current_symbol}")
+                            except Exception as e:
+                                self.logger.warning(f"⚠ WebSocket re-subscribe failed after strike adjust: {e}")
             except Exception:
                 pass
 
@@ -824,10 +1118,11 @@ class BrokerInterface:
         if self._cached_option_tick:
             cached = self._cached_option_tick.copy()
             cached['spot_price'] = self.spot_price
-            # Keep exact LTP from last REST fetch - no artificial noise
-            cached['timestamp'] = current_time_ms()
-            if 'original_timestamp' not in cached:
-                cached['original_timestamp'] = self._last_option_fetch and int(self._last_option_fetch * 1000) or current_time_ms()
+            # REST snapshots are pull-based; treat each delivered cache read as a fresh
+            # snapshot timestamp for validator freshness checks.
+            now_ms = current_time_ms()
+            cached['timestamp'] = now_ms
+            cached['original_timestamp'] = now_ms
             self.last_valid_tick_time = datetime.now()
             return cached
 
@@ -859,6 +1154,7 @@ class BrokerInterface:
                 if time.time() - last_rest > 60:
                     self.logger.info(f"🔄 REST refresh triggered (WS tick {original_age:.0f}s old)")
                     # Force fresh REST call - bypass _get_rest_tick() interval check
+                    self._clear_rest_cache()
                     rest_tick = self._fetch_option_tick_rest()
                     if rest_tick:
                         self._last_rest_refresh = time.time()
@@ -873,6 +1169,7 @@ class BrokerInterface:
                         return rest_tick
                     else:
                         self.logger.warning("⚠ REST refresh failed")
+                        self._on_ws_disconnect("WS stale and REST refresh failed")
                         return None
             
             with self._tick_lock:
@@ -927,24 +1224,28 @@ class BrokerInterface:
         }
 
     def get_smoothed_tick(self) -> Optional[Dict[str, Any]]:
-        """Get averaged tick from buffer for smoother algo trading (reduces noise)"""
+        """Get smoothed tick from buffer for more robust algo trading."""
         if not self._tick_buffer or len(self._tick_buffer) < 2:
             return self.get_tick()
         
         with self._tick_lock:
-            # Calculate average of buffered ticks
-            avg_ltp = sum(t['ltp'] for t in self._tick_buffer) / len(self._tick_buffer)
-            avg_bid = sum(t['bid'] for t in self._tick_buffer) / len(self._tick_buffer)
-            avg_ask = sum(t['ask'] for t in self._tick_buffer) / len(self._tick_buffer)
-            total_volume = self._tick_buffer[-1].get('volume', 0)
+            weights = [(t.get('volume') or 1) for t in self._tick_buffer]
+            total_weight = sum(weights)
+            if total_weight <= 0:
+                total_weight = len(self._tick_buffer)
+                weights = [1] * len(self._tick_buffer)
+
+            vwap_ltp = sum((t.get('ltp', 0) * w) for t, w in zip(self._tick_buffer, weights)) / total_weight
+            vwap_bid = sum((t.get('bid', 0) * w) for t, w in zip(self._tick_buffer, weights)) / total_weight
+            vwap_ask = sum((t.get('ask', 0) * w) for t, w in zip(self._tick_buffer, weights)) / total_weight
+            smoothed_volume = self._tick_buffer[-1].get('volume', 0) or 1
             
-            # Use latest tick as base, but with smoothed prices
             smoothed = self._tick_buffer[-1].copy()
-            smoothed['ltp'] = round(avg_ltp, 2)
-            smoothed['bid'] = round(avg_bid, 2)
-            smoothed['ask'] = round(avg_ask, 2)
-            smoothed['volume'] = total_volume
-            smoothed['data_source'] = 'WEBSOCKET_SMOOTHED'
+            smoothed['ltp'] = round(vwap_ltp, 2)
+            smoothed['bid'] = round(vwap_bid, 2)
+            smoothed['ask'] = round(vwap_ask, 2)
+            smoothed['volume'] = smoothed_volume
+            smoothed['data_source'] = 'WEBSOCKET_SMOOTHED_VWAP'
             smoothed['buffer_size'] = len(self._tick_buffer)
             
             return smoothed
@@ -1058,6 +1359,7 @@ class BrokerInterface:
         # ═══════════════════════════════════════════════════════════════════
         old_symbol = self.current_symbol
         if option_symbol != self.current_symbol:
+            old_token = self._option_token
             self.current_symbol = option_symbol
             self._option_token = self._get_token(option_symbol, EXCHANGE)
             self.logger.info(f"📍 Symbol switched: {old_symbol} → {option_symbol}")
@@ -1071,20 +1373,33 @@ class BrokerInterface:
                             self.last_tick = None
                             self._tick_buffer.clear()
                         
-                        self.broker_client.subscribe_symbols([
-                            {"exchangeType": "2", "tokens": [self._option_token]}
-                        ])
+                        # Unsubscribe old token first to avoid stale data
+                        if old_token:
+                            if not self._unsubscribe_with_verify([(EXCHANGE, old_token, 2)]):
+                                self.logger.warning(f"⚠ Old token unsubscribe failed: {old_token}")
+
+                        if not self._subscribe_with_retry([(EXCHANGE, self._option_token, 2)]):
+                            self.logger.warning(f"⚠ WebSocket re-subscribe failed for {self._option_token}")
+                            return None
+
                         self.logger.info(f"🔌 WebSocket re-subscribed to {option_symbol}")
-                        
-                        # Wait briefly for first tick from new symbol
-                        time.sleep(0.3)
+
                     except Exception as e:
                         self.logger.warning(f"⚠ WebSocket re-subscribe failed: {e}")
+
+        if not self._ensure_symbol_sync_before_order(option_symbol, self._option_token):
+            self.logger.warning(f"⚠ Order blocked: symbol stream not synced for {option_symbol}")
+            return None
 
         # Get SL/TP from signal params (which now come from .env via strategy)
         sl_points = signal_params.get('sl_points', SL_POINTS_FIXED)
         tp_points = signal_params.get('tp_points', TP_POINTS_FIXED)
         confidence = signal_params.get('confidence', 60)
+        details = signal_params.get('details', {}) if isinstance(signal_params, dict) else {}
+        mq_score = details.get('market_quality_score')
+        mq_grade = details.get('market_quality_grade')
+        mq_components = details.get('market_quality_components', {})
+        mq_hard_reject = details.get('hard_reject_reason')
 
         # -- PAPER TRADING --
         if PAPER_TRADING:
@@ -1122,6 +1437,11 @@ class BrokerInterface:
                 'tp_points': tp_points,
                 'tp_price': entry_price + tp_points if side == 'BUY' else entry_price - tp_points,
                 'confidence': confidence,
+                'score': signal_params.get('score') if isinstance(signal_params, dict) else None,
+                'market_quality_score': mq_score,
+                'market_quality_grade': mq_grade,
+                'market_quality_components': mq_components,
+                'hard_reject_reason': mq_hard_reject,
                 'initial_sl_amount': sl_points * qty,
                 'tp1_hit': False,
                 'tp2_hit': False,
@@ -1298,6 +1618,11 @@ class BrokerInterface:
                             'tp_points': tp_points,
                             'tp_price': avg_price + tp_points if side == 'BUY' else avg_price - tp_points,
                             'confidence': confidence,
+                            'score': signal_params.get('score') if isinstance(signal_params, dict) else None,
+                            'market_quality_score': mq_score,
+                            'market_quality_grade': mq_grade,
+                            'market_quality_components': mq_components,
+                            'hard_reject_reason': mq_hard_reject,
                             'initial_sl_amount': sl_points * filled_qty,
                             'tp1_hit': False,
                             'tp2_hit': False,
@@ -1483,7 +1808,9 @@ class BrokerInterface:
                 'pnl_inr': pnl_inr,
                 'pnl_pct': pnl_pct,
                 'hold_time': hold_time,
-                'exit_confirmed': False
+                'exit_confirmed': False,
+                'exit_price': exit_price,
+                'exit_reason': exit_reason
             }
 
         # Log trade exit only after paper exit or confirmed live exit.
@@ -1501,7 +1828,9 @@ class BrokerInterface:
             'pnl_inr': pnl_inr,
             'pnl_pct': pnl_pct,
             'hold_time': hold_time,
-            'exit_confirmed': True
+            'exit_confirmed': True,
+            'exit_price': exit_price,
+            'exit_reason': exit_reason
         }
 
     # =========================================================================
@@ -1598,14 +1927,19 @@ class BrokerInterface:
 
     def logout(self):
         """Logout and cleanup"""
+        self._ws_shutdown_requested = True
+        self._ws_heartbeat_stop_event.set()
+        self._ws_connected = False
         if self.broker_client:
-            if self._ws_connected:
-                try:
-                    self.broker_client.stop_websocket()
-                except Exception:
-                    pass
+            try:
+                self.broker_client.stop_websocket()
+            except Exception:
+                pass
             if not PAPER_TRADING:
                 self.broker_client.logout()
+
+        if self._ws_heartbeat_thread and self._ws_heartbeat_thread.is_alive():
+            self._ws_heartbeat_thread.join(timeout=1.0)
 
 
 # Singleton instance
