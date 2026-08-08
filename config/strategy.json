@@ -18,9 +18,9 @@
     },
     "scoring_system": {
       "min_score_to_trade": 4,
-      "min_confidence_pct": 70,
+      "min_confidence_pct": 72,
       "max_confidence_score": 11,
-      "min_weighted_score_pct": 36,
+      "min_weighted_score_pct": 42,
       "score_weights": {
         "ema_trend": 20,
         "vwap": 15,
@@ -47,8 +47,15 @@
         "session": 5,
         "freshness": 5
       },
+      "confidence_mq_adjustments": {
+        "A+": -3,
+        "A": -3,
+        "B": -1,
+        "C": 4,
+        "REJECT": 8
+      },
       "market_quality": {
-        "minimum_pct": 65
+        "minimum_pct": 70
       },
       "position_size_engine": {
         "base": {

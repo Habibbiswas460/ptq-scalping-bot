@@ -5,8 +5,10 @@ Trading state management (IDLE, ENTRY_READY, IN_TRADE, COOLDOWN)
 
 import os
 import csv
+import json
 import re
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
 from config.constants import (
@@ -18,7 +20,8 @@ from config.constants import (
     COOLDOWN_EXPIRY_NORMAL, COOLDOWN_EXPIRY_AFTER_SL,
     SESSION_FILTER_ENABLED, ALLOWED_SESSIONS,
     EXPIRY_ONLY_SESSIONS, BLACKOUT_SESSIONS,
-    TRADING_START_TIME
+    TRADING_START_TIME,
+    ENTRY_SIGNAL_MAX_AGE_MS, ENTRY_MAX_DRIFT_PCT,
 )
 from utils.helpers import now, calculate_position_size
 from core.runtime import runtime_state
@@ -31,6 +34,111 @@ SPIKE_THRESHOLD_PCT = 1.5   # 1.5% spot move in ≤10 seconds = spike
 SPIKE_PAUSE_SEC = 60         # Pause 60s after spike detected
 _last_spot_prices = []        # Ring buffer of (timestamp, spot_price)
 _spike_pause_until = None     # datetime when spike pause expires
+_FUTURE_SIGNAL_TOLERANCE_MS = 250.0
+_module_logger = logging.getLogger(__name__)
+
+
+def _record_execution_guard_metric(status: str, reason: str, details: Dict, tick: Dict) -> None:
+    """Persist execution-guard metrics for paper/live tuning and post-run analysis."""
+    try:
+        runtime_state.increment_counter("exec_guard_total", 1)
+        runtime_state.increment_counter(f"exec_guard_{status}", 1)
+        if reason:
+            runtime_state.increment_counter(f"exec_guard_reason_{reason}", 1)
+
+        event = {
+            "recorded_at": datetime.now().isoformat(),
+            "status": status,
+            "reason": reason,
+            "details": details or {},
+            "tick_time": str((tick or {}).get("original_timestamp") or (tick or {}).get("timestamp") or ""),
+            "ltp": float((tick or {}).get("ltp", 0) or 0),
+            "spot_price": float((tick or {}).get("spot_price", 0) or 0),
+        }
+
+        day = datetime.now().strftime("%Y-%m-%d")
+        out_dir = os.path.join("logs", "readiness", day)
+        os.makedirs(out_dir, exist_ok=True)
+        out_file = os.path.join(out_dir, "execution_guard_metrics.jsonl")
+        with open(out_file, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event) + "\n")
+    except Exception:
+        # Metrics should never block trading transitions.
+        pass
+
+
+def _parse_signal_dt(raw_value) -> Optional[datetime]:
+    """Parse supported timestamp formats for signal freshness checks."""
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, datetime):
+        return raw_value if raw_value.tzinfo else raw_value.replace(tzinfo=timezone.utc)
+    if isinstance(raw_value, (int, float)):
+        try:
+            ts = float(raw_value)
+            # Handle milliseconds or microseconds
+            if ts > 1e15:
+                ts /= 1_000_000.0
+            elif ts > 1e12:
+                ts /= 1_000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(raw_value, str):
+        try:
+            parsed = datetime.fromisoformat(raw_value.replace('Z', '+00:00'))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+def _signal_execution_guard(signal_params: Dict, tick: Dict) -> Tuple[bool, str, Dict]:
+    """Block entries when signal is stale or market moved too far before execution."""
+    signal_price = float(signal_params.get('signal_ltp', 0) or 0)
+    current_price = float(tick.get('ltp', tick.get('price', 0)) or 0)
+
+    # Price drift guard to avoid chasing moved premiums.
+    if signal_price > 0 and current_price > 0:
+        drift_pct = abs(current_price - signal_price) / signal_price * 100.0
+        if drift_pct > float(ENTRY_MAX_DRIFT_PCT):
+            return False, (
+                f"Execution drift too high {drift_pct:.2f}% > {ENTRY_MAX_DRIFT_PCT:.2f}% "
+                f"(sig ₹{signal_price:.2f} -> now ₹{current_price:.2f})"
+            ), {
+                "check": "drift",
+                "drift_pct": round(drift_pct, 4),
+                "signal_price": signal_price,
+                "current_price": current_price,
+                "max_drift_pct": float(ENTRY_MAX_DRIFT_PCT),
+            }
+
+    # Signal age guard for delayed loop/order placement.
+    signal_dt = _parse_signal_dt(signal_params.get('signal_timestamp'))
+    tick_dt = _parse_signal_dt(tick.get('original_timestamp') or tick.get('timestamp'))
+    if signal_dt and tick_dt:
+        age_ms = (tick_dt - signal_dt).total_seconds() * 1000.0
+        if age_ms < -_FUTURE_SIGNAL_TOLERANCE_MS:
+            return False, (
+                f"Signal timestamp is in future by {abs(age_ms):.0f}ms "
+                f"(tolerance {_FUTURE_SIGNAL_TOLERANCE_MS:.0f}ms)"
+            ), {
+                "check": "future_signal",
+                "age_ms": round(age_ms, 2),
+                "future_tolerance_ms": _FUTURE_SIGNAL_TOLERANCE_MS,
+            }
+        if age_ms > float(ENTRY_SIGNAL_MAX_AGE_MS):
+            return False, f"Signal stale {age_ms:.0f}ms > {ENTRY_SIGNAL_MAX_AGE_MS}ms", {
+                "check": "stale",
+                "age_ms": round(age_ms, 2),
+                "max_age_ms": float(ENTRY_SIGNAL_MAX_AGE_MS),
+            }
+
+    return True, "ok", {
+        "check": "pass",
+        "signal_price": signal_price,
+        "current_price": current_price,
+    }
 
 
 def _check_intraday_spike(tick: dict, logger) -> bool:
@@ -214,7 +322,7 @@ class TradingState:
                     # Cooldown expired - reset counter and allow recovery trade
                     self.consecutive_ce_losses = 1  # Reset to 1 (still cautious)
                     self.ce_blocked_until = None
-                    print(f"✅ CE cooldown expired - allowing recovery trade")
+                    _module_logger.info("✅ CE cooldown expired - allowing recovery trade")
                     return False, "CE cooldown expired"
             return False, ""
         
@@ -227,7 +335,7 @@ class TradingState:
                     # Cooldown expired - reset counter and allow recovery trade
                     self.consecutive_pe_losses = 1  # Reset to 1 (still cautious)
                     self.pe_blocked_until = None
-                    print(f"✅ PE cooldown expired - allowing recovery trade")
+                    _module_logger.info("✅ PE cooldown expired - allowing recovery trade")
                     return False, "PE cooldown expired"
             return False, ""
         
@@ -339,11 +447,11 @@ class TradingState:
                     break
             self.consecutive_losses = consec_losses
             
-            print(f"✅ Restored from {trade_count} trades: PnL ₹{total_pnl:+,.0f} ({wins}W/{losses}L)")
+            _module_logger.info(f"✅ Restored from {trade_count} trades: PnL ₹{total_pnl:+,.0f} ({wins}W/{losses}L)")
             return True
             
         except Exception as e:
-            print(f"⚠️ Could not restore trades: {e}")
+            _module_logger.warning(f"⚠️ Could not restore trades: {e}")
             return False
     
     def update_pnl(self, pnl_inr: float, total_capital: float, is_loss: bool, direction: str = None):
@@ -360,13 +468,19 @@ class TradingState:
                 # Set cooldown after 2 consecutive losses (prevents permanent blocking)
                 if self.consecutive_ce_losses >= 2:
                     self.ce_blocked_until = datetime.now() + timedelta(minutes=self.DIRECTION_COOLDOWN_MIN)
-                    print(f"⏸️ CE direction on cooldown for {self.DIRECTION_COOLDOWN_MIN}min (after {self.consecutive_ce_losses} losses)")
+                    _module_logger.info(
+                        f"⏸️ CE direction on cooldown for {self.DIRECTION_COOLDOWN_MIN}min "
+                        f"(after {self.consecutive_ce_losses} losses)"
+                    )
             elif direction == 'PE':
                 self.consecutive_pe_losses += 1
                 # Set cooldown after 2 consecutive losses
                 if self.consecutive_pe_losses >= 2:
                     self.pe_blocked_until = datetime.now() + timedelta(minutes=self.DIRECTION_COOLDOWN_MIN)
-                    print(f"⏸️ PE direction on cooldown for {self.DIRECTION_COOLDOWN_MIN}min (after {self.consecutive_pe_losses} losses)")
+                    _module_logger.info(
+                        f"⏸️ PE direction on cooldown for {self.DIRECTION_COOLDOWN_MIN}min "
+                        f"(after {self.consecutive_pe_losses} losses)"
+                    )
         else:
             self.consecutive_losses = 0
             self.winning_trades += 1
@@ -611,6 +725,17 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
         direction = "CE"
 
     details = signal_params.get('details', {}) if isinstance(signal_params, dict) else {}
+    exec_ok, exec_reason, exec_details = _signal_execution_guard(signal_params if isinstance(signal_params, dict) else {}, tick)
+    if exec_ok:
+        _record_execution_guard_metric("pass", "ok", exec_details, tick)
+    else:
+        reason_tag = str(exec_details.get("check", "blocked")) if isinstance(exec_details, dict) else "blocked"
+        _record_execution_guard_metric("blocked", reason_tag, exec_details, tick)
+    if not exec_ok:
+        logger.warning(f"⚠ ENTRY SKIPPED: {exec_reason}")
+        logger.state_change("ENTRY_READY", "COOLDOWN", f"Exec guard: {exec_reason}")
+        return "COOLDOWN"
+
     weighted_score = signal_params.get('score', details.get('weighted_score', 0)) if isinstance(signal_params, dict) else 0
     confidence = signal_params.get('confidence', 0) if isinstance(signal_params, dict) else 0
     market_quality = details.get('market_quality', details.get('market_quality_score', 0))

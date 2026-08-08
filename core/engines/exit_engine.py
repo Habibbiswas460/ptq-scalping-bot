@@ -14,23 +14,34 @@ from config.constants import (
     PROFIT_TARGET_CE, PROFIT_TARGET_PE,
     MAX_HOLD_TIME_WINNING, MAX_HOLD_TIME_LOSING,
     THETA_SEC_KILL_LIMIT, DELTA_KILL_MIN,
-    GAMMA_NORMAL_MAX, GAMMA_EXPIRY_MAX
+    GAMMA_NORMAL_MAX, GAMMA_EXPIRY_MAX,
+    EXIT_HARD_SL_POINTS,
+    EXIT_BREAKEVEN_TRIGGER_POINTS,
+    EXIT_BREAKEVEN_BUFFER_POINTS,
+    EXIT_TRAILING_DISTANCE_POINTS,
+    EXIT_EARLY_LOSS_CUT_POINTS,
+    EXIT_EARLY_LOSS_CUT_TIME_SEC,
+    EXIT_EARLY_CUT_ATR_LOW_POINTS,
+    EXIT_EARLY_CUT_ATR_HIGH_POINTS,
+    EXIT_SOFT_LOSS_TIME_SEC,
+    EXIT_SOFT_LOSS_POINTS,
 )
+from core.risk.greeks_validator import validate_greeks
 
 # ============================================
 # PULLBACK & PROTECT EXIT CONFIGURATION (v3.3 - Improved R:R)
 # ============================================
 # Hard SL: 6 points (exit immediately) - reduced from 8 for better R:R
-HARD_SL_POINTS = 6
+HARD_SL_POINTS = float(EXIT_HARD_SL_POINTS)
 
 # PHASE 6: Earlier trailing activation (v3.3)
 # Breakeven trigger: Move SL to +2 when profit >= 5 points
-BREAKEVEN_TRIGGER = 5
-BREAKEVEN_BUFFER = 2  # Lock +2 point profit
+BREAKEVEN_TRIGGER = float(EXIT_BREAKEVEN_TRIGGER_POINTS)
+BREAKEVEN_BUFFER = float(EXIT_BREAKEVEN_BUFFER_POINTS)
 
 # Dynamic trailing: Keep SL 3 points below current price after breakeven
 # Tighter trail = lock more profit when running
-TRAILING_DISTANCE = 3
+TRAILING_DISTANCE = float(EXIT_TRAILING_DISTANCE_POINTS)
 
 # Smart RSI Exit thresholds
 RSI_OVERBOUGHT = 80  # Exit CE when RSI > 80
@@ -41,11 +52,14 @@ RSI_REVERSAL_CE_EXIT = 60   # CE: exit if RSI drops from >75 to <60
 RSI_REVERSAL_PE_EXIT = 40   # PE: exit if RSI rises from <25 to >40
 
 # Early Momentum Loss Cut (v3.3)
-EARLY_LOSS_CUT_POINTS = 4    # Exit early if price drops 4 pts quickly
-EARLY_LOSS_CUT_TIME_SEC = 30 # Within 30 seconds of entry
+EARLY_LOSS_CUT_POINTS = float(EXIT_EARLY_LOSS_CUT_POINTS)
+EARLY_LOSS_CUT_TIME_SEC = int(EXIT_EARLY_LOSS_CUT_TIME_SEC)
+SOFT_LOSS_TIME_SEC = int(EXIT_SOFT_LOSS_TIME_SEC)
+SOFT_LOSS_POINTS = float(EXIT_SOFT_LOSS_POINTS)
 
 # Max hold time: 15 minutes (900 seconds)
 MAX_HOLD_TIME_SEC = 900
+DEFAULT_TTE_SEC = 7 * 24 * 3600
 
 
 def _audit_exit_event(logger, stage: str, trade: Dict, details: Dict):
@@ -244,10 +258,10 @@ def early_momentum_loss_cut(trade: Dict, tick: Dict) -> Tuple[bool, str]:
     PRIORITY 2b: Early Momentum Loss Cut (v3.4 — ATR-adaptive)
     
     Exits early if price moves adversely within first 30 seconds.
-    Threshold adapts to volatility:
-      - Low vol (ATR < 3): -3 pts  (tight, save more)
-      - Normal vol:         -4 pts  (default)
-      - High vol (ATR > 6): -5 pts  (wider, avoid false exits)
+        Threshold adapts to volatility:
+            - Low vol (ATR < 3): tighter early cut threshold
+            - Normal vol:         configured default threshold
+            - High vol (ATR > 6): wider threshold to avoid false exits
     """
     if not trade:
         return False, ""
@@ -265,11 +279,11 @@ def early_momentum_loss_cut(trade: Dict, tick: Dict) -> Tuple[bool, str]:
     # v3.4: ATR-adaptive early cut threshold
     atr = tick.get('atr', trade.get('atr', 0))
     if atr > 6:
-        cut_threshold = 5  # High vol: wider threshold avoids false exits
+        cut_threshold = float(EXIT_EARLY_CUT_ATR_HIGH_POINTS)
     elif atr < 3:
-        cut_threshold = 3  # Low vol: tighter threshold saves more
+        cut_threshold = float(EXIT_EARLY_CUT_ATR_LOW_POINTS)
     else:
-        cut_threshold = EARLY_LOSS_CUT_POINTS  # Normal: default 4 pts
+        cut_threshold = EARLY_LOSS_CUT_POINTS
     
     # Fast adverse move: lost threshold+ pts within 30 seconds
     if price_diff <= -cut_threshold:
@@ -286,6 +300,39 @@ def early_momentum_loss_cut(trade: Dict, tick: Dict) -> Tuple[bool, str]:
 
         return True, f"\u26a1 EARLY LOSS CUT | {direction} | {price_diff:+.1f}pts in {hold_time:.0f}s (ATR-thresh:{cut_threshold}) | Loss: \u20b9{actual_loss:.0f} (saved {HARD_SL_POINTS - abs(price_diff):.1f}pts vs SL)"
     
+    return False, ""
+
+
+def soft_loss_time_exit(trade: Dict) -> Tuple[bool, str]:
+    """
+    PRIORITY 2c: Soft loss timeout exit.
+
+    If a trade stays mildly negative for too long, exit before hard SL escalation.
+    """
+    if not trade:
+        return False, ""
+
+    hold_time = (datetime.now() - trade['entry_time']).total_seconds()
+    if hold_time < SOFT_LOSS_TIME_SEC:
+        return False, ""
+
+    price_diff = trade.get('price_diff', 0)
+    direction = trade.get('direction', 'CE')
+    qty = trade.get('qty', 0)
+
+    if price_diff <= -SOFT_LOSS_POINTS:
+        max_loss = MAX_LOSS_PER_TRADE_CE if direction == 'CE' else MAX_LOSS_PER_TRADE_PE
+        actual_loss = min(abs(price_diff * qty), max_loss)
+        try:
+            trade['current_pnl'] = -actual_loss
+            trade['_soft_time_cut_applied'] = True
+        except Exception:
+            pass
+        return True, (
+            f"⏳ SOFT LOSS EXIT | {direction} | {price_diff:+.1f}pts after {hold_time:.0f}s"
+            f" | Loss: ₹{actual_loss:.0f}"
+        )
+
     return False, ""
 
 
@@ -335,6 +382,50 @@ def greek_exit(greeks: Dict, day_type: str) -> Tuple[bool, str]:
     return False, ""
 
 
+def _validated_greeks_for_exit(greeks: Dict, tick: Dict, trade: Dict, logger=None) -> Dict:
+    """Cross-validate greeks against API when possible and return best-effort values for exit checks."""
+    if not greeks:
+        return {}
+
+    try:
+        spot = float((tick or {}).get('spot_price') or 0)
+        if spot <= 0:
+            return greeks
+
+        strike = int(round(spot / 50.0) * 50)
+        direction = str((trade or {}).get('direction', 'CE') or 'CE')
+        option_type = 'PE' if direction == 'PE' else 'CE'
+        iv = float((tick or {}).get('iv') or 0.20)
+        tte_sec = float((tick or {}).get('tte_sec') or DEFAULT_TTE_SEC)
+
+        validation = validate_greeks(
+            spot=spot,
+            strike=strike,
+            tte_sec=tte_sec,
+            iv=iv,
+            option_type=option_type,
+            underlying='NIFTY',
+        )
+
+        verdict = validation.get('verdict', 'API_UNAVAILABLE')
+        api_greeks = validation.get('api') or {}
+        if logger and verdict in ('WARNING', 'ERROR'):
+            logger.warning(f"⚠ Greeks divergence verdict={verdict} | using BSM fallback for exits")
+
+        # Use API values only when validator marks them reliable.
+        if verdict == 'OK' and api_greeks:
+            merged = dict(greeks)
+            for k in ('delta', 'gamma', 'theta', 'vega'):
+                if k in api_greeks and api_greeks[k] is not None:
+                    merged[k] = api_greeks[k]
+            return merged
+    except Exception:
+        # Validation is safety enhancement only, never block exits.
+        pass
+
+    return greeks
+
+
 def check_exit_conditions(trade: Dict, tick: Dict, greeks: Dict, 
                           day_type: str, logger, rsi: float = None) -> Tuple[bool, str]:
     """
@@ -342,10 +433,11 @@ def check_exit_conditions(trade: Dict, tick: Dict, greeks: Dict,
     
     1. HARD SL / STEP TRAILING (highest priority)
     2. Early momentum loss cut (fast adverse move in first 30s)
-    3. Greeks deterioration (theta/gamma/delta kill)
-    4. Smart RSI exit (momentum exhaustion)
+    3. Soft loss timeout exit (lingering adverse move)
+    4. Greeks deterioration (theta/gamma/delta kill)
+    5. Smart RSI exit (momentum exhaustion)
     4b. RSI reversal exit (momentum shift from extreme)
-    5. Time exit (15 min max hold)
+    6. Time exit (15 min max hold)
     """
     def _cap_negative_pnl(trade: Dict):
         """Ensure negative PnL is capped to per-trade max loss and mark it."""
@@ -381,9 +473,16 @@ def check_exit_conditions(trade: Dict, tick: Dict, greeks: Dict,
     if early_hit:
         _cap_negative_pnl(trade)
         return True, early_reason
+
+    # Priority 2c: Soft loss timeout cut
+    soft_hit, soft_reason = soft_loss_time_exit(trade)
+    if soft_hit:
+        _cap_negative_pnl(trade)
+        return True, soft_reason
     
-    # Priority 3: Greeks exit
-    greek_hit, greek_reason = greek_exit(greeks, day_type)
+    # Priority 3: Greeks exit (validated/reconciled)
+    effective_greeks = _validated_greeks_for_exit(greeks, tick, trade, logger)
+    greek_hit, greek_reason = greek_exit(effective_greeks, day_type)
     if greek_hit:
         _cap_negative_pnl(trade)
         return True, greek_reason

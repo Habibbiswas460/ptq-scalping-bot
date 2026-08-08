@@ -6,7 +6,7 @@ v3.4 IMPROVEMENTS:
 - Delta range filter (0.35-0.65 ATM zone)
 - OI change direction analysis
 - Volume spike detection (1.5x avg)
-- Premium band filter (80-300)
+- Premium band filter (from config.constants)
 - Risk-based position sizing
 - Improved chop detection
 
@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 from datetime import datetime
 import os
+from collections import deque
+from statistics import median
 
 from core.engines.weighted_score_engine import WeightedScoreEngine
 from core.engines.adaptive_confidence_engine import AdaptiveConfidenceEngine
@@ -52,8 +54,9 @@ DELTA_MIN = 0.35  # Avoid deep OTM
 DELTA_MAX = 0.65  # Avoid deep ITM  
 OI_CHANGE_ENABLED = True
 VOLUME_SPIKE_MULTIPLIER = 1.5  # Volume > 1.5x avg = spike
-PREMIUM_MIN = 80.0   # Avoid too cheap options
-PREMIUM_MAX = 300.0  # Avoid too expensive options
+# Single source of truth for premium band comes from config.constants.
+PREMIUM_MIN = MIN_ENTRY_PREMIUM
+PREMIUM_MAX = MAX_ENTRY_PREMIUM
 
 
 class SmartScalpV3:
@@ -107,6 +110,16 @@ class SmartScalpV3:
             'min_weighted_score_pct',
             int((self.min_score / max(1, self.max_confidence_score)) * 100)
         )
+        self.confidence_mq_adjustments = self.scoring_config.get(
+            'confidence_mq_adjustments',
+            {
+                'A+': -2,
+                'A': -2,
+                'B': -1,
+                'C': 2,
+                'REJECT': 5,
+            }
+        )
         
         # Entry configs
         self.ce_config = self.strategy_config.get('ce_entry', {})
@@ -130,6 +143,7 @@ class SmartScalpV3:
         self._prev_oi = None
         self._oi_change_pct = 0.0
         self._last_price = None
+        self._recent_valid_premiums = deque(maxlen=30)
     
     def _get_greeks_calculator(self):
         """Lazy load Greeks calculator to avoid circular imports"""
@@ -147,7 +161,7 @@ class SmartScalpV3:
             indicators['regime'] = self.get_market_regime(indicators)
         return self.weighted_score_engine.score(indicators, latest_tick, direction, oi_direction)
 
-    def calculate_adaptive_confidence(self, indicators: Dict, latest_tick: Dict, score_pct: int, direction: str, oi_direction: str) -> Tuple[int, Dict[str, int]]:
+    def calculate_adaptive_confidence(self, indicators: Dict, latest_tick: Dict, score_pct: int, direction: str, oi_direction: str) -> Tuple[int, Dict[str, float]]:
         """Calculate adaptive confidence using the modular confidence engine."""
         if 'regime' not in indicators or indicators.get('regime') == 'UNKNOWN':
             indicators['regime'] = self.get_market_regime(indicators)
@@ -268,12 +282,35 @@ class SmartScalpV3:
     def check_premium_filter(self, tick: Dict) -> Tuple[bool, str]:
         """
         Premium filter: Avoid too cheap or expensive options.
-        Optimal range: ₹80 - ₹300
+        Range from config.constants MIN_ENTRY_PREMIUM / MAX_ENTRY_PREMIUM.
         
         Returns:
             (pass_filter, reason)
         """
-        premium = tick.get('ltp', 0)
+        premium = float(tick.get('ltp', 0) or 0)
+        bid = float(tick.get('bid', 0) or 0)
+        ask = float(tick.get('ask', 0) or 0)
+
+        # Guard against quote glitches before evaluating premium range.
+        if bid and ask and ask < bid:
+            return False, f"Invalid quote: ask {ask:.2f} < bid {bid:.2f}"
+
+        # If LTP is unusable but bid/ask are present, use midpoint as fallback premium.
+        if premium <= 0 and bid > 0 and ask > 0:
+            premium = round((bid + ask) / 2.0, 2)
+
+        if premium <= 0:
+            return False, "Invalid premium feed: non-positive LTP"
+
+        # Detect abrupt collapses versus recent valid premium context.
+        if premium >= MIN_ENTRY_PREMIUM:
+            self._recent_valid_premiums.append(premium)
+        if len(self._recent_valid_premiums) >= 10:
+            ref_premium = median(self._recent_valid_premiums)
+            if ref_premium >= MIN_ENTRY_PREMIUM and premium < (0.35 * ref_premium):
+                return False, (
+                    f"Premium feed anomaly ₹{premium:.0f} << ref ₹{ref_premium:.0f}"
+                )
         
         if premium < MIN_ENTRY_PREMIUM:
             return False, f"Premium too low ₹{premium:.0f} < ₹{MIN_ENTRY_PREMIUM:.0f}"
@@ -282,6 +319,37 @@ class SmartScalpV3:
             return False, f"Premium too high ₹{premium:.0f} > ₹{MAX_ENTRY_PREMIUM:.0f}"
         
         return True, f"Premium OK ₹{premium:.0f}"
+
+    def _resolve_tick_time(self, tick: Dict) -> datetime:
+        """Resolve tick timestamp for deterministic replay/backtest time filters."""
+        timestamp = tick.get('original_timestamp') or tick.get('timestamp')
+        if isinstance(timestamp, datetime):
+            return timestamp
+        if isinstance(timestamp, (int, float)):
+            ts_num = float(timestamp)
+            if ts_num > 1e10:
+                ts_num = ts_num / 1000.0
+            return datetime.fromtimestamp(ts_num)
+        if isinstance(timestamp, str):
+            try:
+                return datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            except ValueError:
+                pass
+        return datetime.now()
+
+    def _required_confidence(self, market_quality_grade: Optional[str]) -> int:
+        """Adjust minimum confidence by market-quality grade to keep good setups and filter weak ones."""
+        grade = (market_quality_grade or '').upper()
+        base = int(self.min_confidence)
+        adjustments = getattr(self, 'confidence_mq_adjustments', {
+            'A+': -2,
+            'A': -2,
+            'B': -1,
+            'C': 2,
+            'REJECT': 5,
+        })
+        delta = int(adjustments.get(grade, 0))
+        return max(0, min(100, base + delta))
     
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration file"""
@@ -765,10 +833,9 @@ class SmartScalpV3:
             confidence: 0-100
             details: dict with scoring details
         """
-        from datetime import datetime
-        
         # ====== TIME FILTER: No trades before 09:45 AM ======
-        current_time = datetime.now()
+        latest_tick = ticks[-1] if ticks else {}
+        current_time = self._resolve_tick_time(latest_tick)
         if current_time.hour == 9 and current_time.minute < 45:
             return 0, "", 0, {"reason": f"Time filter: Wait until 09:45 (now {current_time.strftime('%H:%M')})"}
         
@@ -776,8 +843,7 @@ class SmartScalpV3:
         if len(ticks) < 5:
             return 0, "", 0, {"reason": "Warming up"}
         
-        # Get latest tick for option-specific filters
-        latest_tick = ticks[-1] if ticks else {}
+        # latest_tick is already resolved before time filtering.
         
         # ═══════════════════════════════════════════════════════════════
         # v3.1: PREMIUM FILTER (₹80-300 range)
@@ -852,6 +918,7 @@ class SmartScalpV3:
                 'latency_ms': latest_tick.get('latency_ms', 0),
                 'recent_reconnects': latest_tick.get('recent_reconnects', 0),
                 'queue_depth': latest_tick.get('queue_depth', 0),
+                'evaluation_time': current_time,
             },
             validator_result={
                 'is_valid': latest_tick.get('is_valid', True),
@@ -883,14 +950,14 @@ class SmartScalpV3:
         
         # Chop Detection Criteria:
         # 1. EMA squeeze (basic) - increased threshold
-        min_ema_separation = 1.0  # Increased from 0.3 to 1.0
+        min_ema_separation = 0.8  # Slightly relaxed to avoid over-blocking valid pullbacks
         
         # 2. Low ATR = low volatility = choppy
         # Note: Option ATR is much smaller than index (0-10 vs 30-100)
-        low_atr_threshold = 5  # Changed from 30 to 5 for option tick data
+        low_atr_threshold = 3  # Treat only very low ATR as chop for option premium flow
         
         # 3. MACD histogram flattening (momentum dying)
-        macd_flat = abs(macd_hist) < 0.5 and abs(macd_hist - macd_hist_prev) < 0.3
+        macd_flat = abs(macd_hist) < 0.25 and abs(macd_hist - macd_hist_prev) < 0.2
         
         is_choppy = False
         chop_reason = []
@@ -1159,6 +1226,7 @@ class SmartScalpV3:
             confidence, confidence_components = self.calculate_adaptive_confidence(
                 indicators, latest_tick, ce_weighted_pct, 'CE', oi_direction
             )
+            required_conf = self._required_confidence(details.get('market_quality_grade'))
             details["ce_confidence_components"] = confidence_components
             details["score_breakdown"] = details.get("ce_score_breakdown", {})
             details["confidence_breakdown"] = confidence_components
@@ -1168,8 +1236,11 @@ class SmartScalpV3:
             details["reason"] = (
                 f"📈 CE PULLBACK: Score {ce_weighted_pct}% | Conf {confidence}%"
             )
-            if confidence < self.min_confidence:
-                details["reason"] = f"Low confidence {confidence}% < {self.min_confidence}%"
+            if confidence < required_conf:
+                details["reason"] = (
+                    f"Low confidence {confidence}% < {required_conf}%"
+                    f" (MQ {details.get('market_quality_grade', 'NA')})"
+                )
                 return 0, "", 0, details
             return 1, "CE", confidence, details
         elif ce_signal and ce_exhausted:
@@ -1181,6 +1252,7 @@ class SmartScalpV3:
             confidence, confidence_components = self.calculate_adaptive_confidence(
                 indicators, latest_tick, pe_weighted_pct, 'PE', oi_direction
             )
+            required_conf = self._required_confidence(details.get('market_quality_grade'))
             details["pe_confidence_components"] = confidence_components
             details["score_breakdown"] = details.get("pe_score_breakdown", {})
             details["confidence_breakdown"] = confidence_components
@@ -1190,8 +1262,11 @@ class SmartScalpV3:
             details["reason"] = (
                 f"📉 PE PULLBACK: Score {pe_weighted_pct}% | Conf {confidence}%"
             )
-            if confidence < self.min_confidence:
-                details["reason"] = f"Low confidence {confidence}% < {self.min_confidence}%"
+            if confidence < required_conf:
+                details["reason"] = (
+                    f"Low confidence {confidence}% < {required_conf}%"
+                    f" (MQ {details.get('market_quality_grade', 'NA')})"
+                )
                 return 0, "", 0, details
             return 1, "PE", confidence, details
         elif pe_signal and pe_exhausted:
