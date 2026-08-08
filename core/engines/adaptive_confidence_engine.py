@@ -62,7 +62,7 @@ class AdaptiveConfidenceEngine:
         else:
             oi_score = 100 if oi_direction in ['SHORT_BUILDUP', 'LONG_UNWINDING'] else 50 if oi_direction == 'NEUTRAL' else 20
 
-        session_score = 100 if self._is_session_primary() else 65
+        session_score = 100 if self._is_session_primary(latest_tick) else 65
         freshness_score = self._freshness_score(latest_tick)
 
         # Core adaptive chain requested by strategy review:
@@ -115,8 +115,10 @@ class AdaptiveConfidenceEngine:
         bounded = min(100.0, max(0.0, score))
         return minimum + ((bounded / 100.0) * (maximum - minimum))
 
-    def _is_session_primary(self) -> bool:
-        now = datetime.now()
+    def _is_session_primary(self, latest_tick: Dict = None) -> bool:
+        timestamp = (latest_tick or {}).get('timestamp') or (latest_tick or {}).get('original_timestamp')
+        tick_dt = self._normalize_timestamp(timestamp) if timestamp is not None else None
+        now = tick_dt or datetime.now()
         return now.hour == 9 and now.minute >= 45 or 10 <= now.hour < 15 or (now.hour == 15 and now.minute <= 25)
 
     def _normalize_timestamp(self, timestamp):
@@ -160,7 +162,9 @@ class AdaptiveConfidenceEngine:
         if tick_dt is None:
             return 50
 
-        age_sec = max(0.0, (datetime.now() - tick_dt).total_seconds())
+        # Keep datetime arithmetic timezone-consistent for aware/naive timestamps.
+        now = datetime.now(tick_dt.tzinfo) if tick_dt.tzinfo else datetime.now()
+        age_sec = max(0.0, (now - tick_dt).total_seconds())
 
         if age_sec <= 5:
             return 100

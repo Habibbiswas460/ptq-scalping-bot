@@ -3,6 +3,7 @@ PTQ Scalping Bot - Entry Signal Engine
 SMART SCALP v3.4 - Multi-Factor Scoring System
 """
 
+from datetime import datetime
 from typing import Dict, Tuple, List
 
 from utils.greeks import GreeksCalculator
@@ -187,8 +188,16 @@ def entry_signal(tick: Dict, day_type: str, instrument_type: str = "") -> Tuple[
             # Add trend info to message
             full_message = f"{message} | {trend_str}"
             
+            # Store params with execution reference context for anti-chase guard.
+            signal_tick_ts = tick.get('original_timestamp') or tick.get('timestamp')
+            enriched_params = dict(params)
+            enriched_params['signal_ltp'] = tick.get('ltp', tick.get('price', 0))
+            enriched_params['signal_spot_price'] = tick.get('spot_price')
+            enriched_params['signal_timestamp'] = signal_tick_ts
+            enriched_params['signal_recorded_at'] = datetime.now().isoformat()
+
             # Store params for use by trade_manager
-            last_signal_params = params
+            last_signal_params = enriched_params
             
             # Additional PTQ validation (optional - for extra safety)
             if not PAPER_TRADING:
@@ -196,16 +205,16 @@ def entry_signal(tick: Dict, day_type: str, instrument_type: str = "") -> Tuple[
                 greeks = _calculate_greeks(tick)
                 time_ok, time_msg = validate_time_ptq(greeks)
                 if not time_ok:
-                    _log_signal_snapshot(params, False, f"Time: {time_msg}")
+                    _log_signal_snapshot(enriched_params, False, f"Time: {time_msg}")
                     return False, f"Time: {time_msg}"
                 
                 # Greeks gate
                 greek_pass, greek_msg = greek_gate(greeks, day_type)
                 if not greek_pass:
-                    _log_signal_snapshot(params, False, f"Greeks: {greek_msg}")
+                    _log_signal_snapshot(enriched_params, False, f"Greeks: {greek_msg}")
                     return False, f"Greeks: {greek_msg}"
-            
-            _log_signal_snapshot(params, True, full_message)
+
+            _log_signal_snapshot(enriched_params, True, full_message)
             return True, full_message
         else:
             last_signal_params = {}

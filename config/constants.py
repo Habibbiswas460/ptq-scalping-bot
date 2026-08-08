@@ -120,6 +120,18 @@ TRAILING_LOCK_PCT_3 = 58
 TRAILING_ATR_NORMAL = 1.2
 TRAILING_ATR_EXPIRY = 1.0
 
+# Exit engine optimization knobs
+EXIT_HARD_SL_POINTS = env_float('EXIT_HARD_SL_POINTS', float(SL_POINTS_FIXED))
+EXIT_BREAKEVEN_TRIGGER_POINTS = env_float('EXIT_BREAKEVEN_TRIGGER_POINTS', 4.0)
+EXIT_BREAKEVEN_BUFFER_POINTS = env_float('EXIT_BREAKEVEN_BUFFER_POINTS', 2.0)
+EXIT_TRAILING_DISTANCE_POINTS = env_float('EXIT_TRAILING_DISTANCE_POINTS', 2.5)
+EXIT_EARLY_LOSS_CUT_POINTS = env_float('EXIT_EARLY_LOSS_CUT_POINTS', 3.5)
+EXIT_EARLY_LOSS_CUT_TIME_SEC = env_int('EXIT_EARLY_LOSS_CUT_TIME_SEC', 45)
+EXIT_EARLY_CUT_ATR_LOW_POINTS = env_float('EXIT_EARLY_CUT_ATR_LOW_POINTS', 2.5)
+EXIT_EARLY_CUT_ATR_HIGH_POINTS = env_float('EXIT_EARLY_CUT_ATR_HIGH_POINTS', 4.5)
+EXIT_SOFT_LOSS_TIME_SEC = env_int('EXIT_SOFT_LOSS_TIME_SEC', 75)
+EXIT_SOFT_LOSS_POINTS = env_float('EXIT_SOFT_LOSS_POINTS', 1.8)
+
 # =========================================================
 # 📊 STRATEGY SCORING
 # =========================================================
@@ -132,7 +144,7 @@ MIN_CONFIDENCE_AFTER_3SL = env_int('MIN_CONFIDENCE_AFTER_3SL', 85)  # After 3 co
 MAX_CONFIDENCE_SCORE = env_int('MAX_CONFIDENCE_SCORE', 11)  # 11-factor scoring model
 
 # Entry Price Filter (ATM nearby range)
-MIN_ENTRY_PREMIUM = env_float('MIN_ENTRY_PREMIUM', 90.0)   # Min ₹90
+MIN_ENTRY_PREMIUM = env_float('MIN_ENTRY_PREMIUM', 80.0)   # Min ₹80
 MAX_ENTRY_PREMIUM = env_float('MAX_ENTRY_PREMIUM', 350.0)  # Max ₹350 (was 150, blocked all ATM options)
 
 # =========================================================
@@ -249,6 +261,10 @@ LIMIT_ORDER_OFFSET = env_float('LIMIT_ORDER_OFFSET', 0.25)
 
 # Maximum slippage allowed (will fall back to MARKET if exceeded)
 MAX_SLIPPAGE_PCT = env_float('MAX_SLIPPAGE_PCT', 0.5)
+
+# Execution guard: skip entries when signal becomes stale or price drifts too far.
+ENTRY_SIGNAL_MAX_AGE_MS = env_int('ENTRY_SIGNAL_MAX_AGE_MS', 2500)
+ENTRY_MAX_DRIFT_PCT = env_float('ENTRY_MAX_DRIFT_PCT', 0.35)
 
 # Order retry settings
 ORDER_RETRY_ENABLED = env_bool('ORDER_RETRY_ENABLED', True)
@@ -374,6 +390,8 @@ CONFIG = {
         'min_volume_ratio': 1.2,
         'volume_confirmation_required': False,
         'require_consecutive_signals': 1,
+        'signal_max_age_ms': ENTRY_SIGNAL_MAX_AGE_MS,
+        'max_entry_drift_pct': ENTRY_MAX_DRIFT_PCT,
         'time_based_sizing_enabled': False,
         'opening_15min_size_pct': 50,
         'closing_30min_size_pct': 75,

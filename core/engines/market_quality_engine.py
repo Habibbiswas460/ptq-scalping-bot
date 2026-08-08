@@ -49,7 +49,8 @@ class MarketQualityEngine:
         validator_result = validator_result or {'is_valid': True}
 
         max_stale = broker_status.get('max_stale_ms', self.max_stale_ms)
-        age_ms = self._tick_age_ms(tick)
+        reference_ms = self._normalize_timestamp_ms(broker_status.get('evaluation_time'))
+        age_ms = self._tick_age_ms(tick, reference_ms)
         freshness_state = self._freshness_state(age_ms, max_stale)
 
         if freshness_state == 'HARD_REJECT':
@@ -115,9 +116,10 @@ class MarketQualityEngine:
 
         spread_points = self._spread_points(self._spread_pct(tick))
         liquidity_points = self._liquidity_points(indicators, tick)
-        freshness_points = self._freshness_points(tick)
+        freshness_points = self._freshness_points(tick, reference_ms)
         volatility_points = self._volatility_points(indicators)
-        session_points = self._session_points(datetime.now())
+        session_now = datetime.now() if reference_ms is None else datetime.fromtimestamp(reference_ms / 1000.0)
+        session_points = self._session_points(session_now)
         greeks_points = self._greeks_points(greeks, indicators, tick)
         execution_points = self._execution_points(broker_status)
 
@@ -214,11 +216,11 @@ class MarketQualityEngine:
             return ((ask - bid) / bid) * 100.0
         return 99.0
 
-    def _tick_age_ms(self, tick: Dict) -> float:
+    def _tick_age_ms(self, tick: Dict, reference_ms: Optional[int] = None) -> float:
         timestamp = tick.get('original_timestamp') or tick.get('timestamp')
         if not timestamp:
             return 999999.0
-        now_ms = int(datetime.now().timestamp() * 1000)
+        now_ms = reference_ms if reference_ms is not None else int(datetime.now().timestamp() * 1000)
 
         ts_ms = self._normalize_timestamp_ms(timestamp)
         if ts_ms is None:
@@ -287,8 +289,8 @@ class MarketQualityEngine:
             return 4
         return 0
 
-    def _freshness_points(self, tick: Dict) -> int:
-        age_ms = self._tick_age_ms(tick)
+    def _freshness_points(self, tick: Dict, reference_ms: Optional[int] = None) -> int:
+        age_ms = self._tick_age_ms(tick, reference_ms)
         freshness_state = self._freshness_state(age_ms, self.max_stale_ms)
 
         if freshness_state == 'WARN':

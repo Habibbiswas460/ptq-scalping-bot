@@ -16,11 +16,10 @@ Usage:
 import os
 import json
 import csv
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
-from config.constants import MIN_CONFIDENCE
 from core.runtime import runtime_state
 
 
@@ -46,6 +45,8 @@ class BacktestResult:
     """Backtest results summary"""
     start_date: str
     end_date: str
+    first_trade_date: str
+    last_trade_date: str
     initial_capital: float
     final_capital: float
     total_pnl: float
@@ -71,15 +72,19 @@ class Backtester:
     
     def __init__(self, 
                  initial_capital: float = 30000,
-                 sl_points: float = 6,
-                 tp_points: float = 12,
+                 sl_points: float = 7,
+                 tp_points: float = 18,
                  lot_size: int = 65,
                  max_trades_per_day: int = 15,
-                 commission_per_trade: float = 40,  # ₹40 per order (both sides)
+                 commission_per_trade: float = 40,  # ₹40 round-trip brokerage/charges
                  slippage_pct: float = 0.1,  # 0.1% slippage
                  trailing_sl_enabled: bool = True,
                  trailing_activation_points: float = 5,  # Activate after 5pt move
-                 trailing_step_points: float = 2):  # Trail every 2pt step
+                 trailing_step_points: float = 1.5,  # Tighter trail to protect gains
+                 use_strategy_exit_params: bool = False,
+                 use_position_size_engine: bool = False,
+                 position_size_risk_budget_pct: float = 0.02,
+                 position_size_daily_cap_pct: Optional[float] = None):
         
         self.initial_capital = initial_capital
         self.current_capital = initial_capital
@@ -87,11 +92,16 @@ class Backtester:
         self.tp_points = tp_points
         self.lot_size = lot_size
         self.max_trades_per_day = max_trades_per_day
-        self.commission = commission_per_trade
+        self.commission_round_trip = commission_per_trade
+        self.commission_per_side = commission_per_trade / 2.0
         self.slippage_pct = slippage_pct
         self.trailing_sl_enabled = trailing_sl_enabled
         self.trailing_activation_points = trailing_activation_points
         self.trailing_step_points = trailing_step_points
+        self.use_strategy_exit_params = use_strategy_exit_params
+        self.use_position_size_engine = use_position_size_engine
+        self.position_size_risk_budget_pct = position_size_risk_budget_pct
+        self.position_size_daily_cap_pct = position_size_daily_cap_pct
         
         # State
         self.trades: List[BacktestTrade] = []
@@ -108,6 +118,24 @@ class Backtester:
         
         # Strategy instance
         self._strategy = None
+        self._position_size_engine = None
+        if self.use_position_size_engine:
+            from core.engines.position_size_engine import PositionSizeEngine
+            engine_cfg = {}
+            if self.position_size_daily_cap_pct is not None:
+                engine_cfg = {
+                    'safety_caps': {
+                        'daily_risk_cap_pct': float(self.position_size_daily_cap_pct),
+                    }
+                }
+            self._position_size_engine = PositionSizeEngine(config=engine_cfg)
+
+        # Spot-to-option proxy state for spot-only datasets.
+        self._spot_reference_price: Optional[float] = None
+        self._option_reference_price: float = 180.0
+        self._spot_to_option_delta: float = 0.08
+        self._data_start_ts: Optional[datetime] = None
+        self._data_end_ts: Optional[datetime] = None
     
     def _get_strategy(self):
         """Lazy load strategy to avoid circular imports"""
@@ -131,6 +159,31 @@ class Backtester:
             return price + total_slip  # Worse fill for buys
         else:
             return price - total_slip  # Worse fill for sells
+
+    def _resolve_option_price(self, candle: Dict) -> float:
+        """Resolve tradable option-like price from candle data.
+
+        If the input looks like a spot index series (e.g., close ~ 20,000+),
+        derive a synthetic option premium stream so entry filters/SL/TP can operate.
+        """
+        close_price = float(candle.get('close', candle.get('ltp', 100)) or 100)
+        explicit_option_price = candle.get('option_ltp')
+        if explicit_option_price is not None:
+            return max(5.0, float(explicit_option_price))
+
+        # Option premium-like data normally remains in sub-1000 range.
+        if close_price <= 1500:
+            return max(5.0, close_price)
+
+        spot_price = float(candle.get('spot_price', close_price) or close_price)
+        if self._spot_reference_price is None:
+            self._spot_reference_price = spot_price
+
+        # Linear delta proxy to map spot moves into premium moves.
+        implied_option = self._option_reference_price + (
+            (spot_price - self._spot_reference_price) * self._spot_to_option_delta
+        )
+        return max(5.0, min(500.0, implied_option))
     
     def _check_sl_tp(self, current_price: float) -> Tuple[bool, str, float]:
         """
@@ -185,7 +238,7 @@ class Backtester:
             self.current_date = timestamp.date()
             self.daily_trades = 0
         
-        current_price = candle.get('close', candle.get('ltp', 100))
+        current_price = self._resolve_option_price(candle)
         
         # Check existing position first
         if self.current_trade:
@@ -198,8 +251,9 @@ class Backtester:
         if self.current_trade is None and self.daily_trades < self.max_trades_per_day:
             strategy = self._get_strategy()
             signal, direction, confidence, details = strategy.generate_signal(ticks_history)
+            required_conf = int(getattr(strategy, 'min_confidence', 70) or 70)
             
-            if signal == 1 and confidence >= MIN_CONFIDENCE:  # Min confidence threshold
+            if signal == 1 and confidence >= required_conf:
                 indicators = runtime_state.get_indicators()
                 if not indicators:
                     indicators = strategy.calculate_indicators(ticks_history)
@@ -212,13 +266,46 @@ class Backtester:
                      confidence: int, details: Dict, entry_params: Dict) -> Optional[Dict]:
         """Enter a new trade"""
         entry_price = self._apply_slippage(price, 'BUY')
-        
+
+        if self.use_strategy_exit_params:
+            sl_points = entry_params.get('sl_points', self.sl_points)
+            tp_points = entry_params.get('tp_points', self.tp_points)
+            qty = entry_params.get('quantity', self.lot_size)
+        else:
+            # Backtest should honor CLI/runtime SL-TP controls unless explicitly opted out.
+            sl_points = self.sl_points
+            tp_points = self.tp_points
+            qty = self.lot_size
+
+        if self.use_position_size_engine and self._position_size_engine is not None:
+            weighted_score = float(details.get('weighted_score', details.get('score', 0)) or 0)
+            market_quality = float(details.get('market_quality_score', details.get('market_quality', 0)) or 0)
+            regime = str(entry_params.get('regime', details.get('regime', 'UNKNOWN')) or 'UNKNOWN')
+            allocation = self._position_size_engine.calculate(
+                capital=self.current_capital,
+                risk_budget={
+                    # Provide explicit risk amount so backtest can scale position sizing
+                    # even if strategy config clamps daily risk pct at a lower ceiling.
+                    'remaining_risk_amount': self.current_capital * max(0.0, self.position_size_risk_budget_pct),
+                    'daily_risk_budget_pct': self.position_size_risk_budget_pct,
+                },
+                weighted_score=weighted_score,
+                confidence=confidence,
+                market_quality=market_quality,
+                regime=regime,
+                volatility={'vix': 14.0},
+                recovery_mode={'active': False},
+                daily_loss_state={'loss_utilization': 0.0},
+                sl_points=sl_points,
+                lot_size=self.lot_size,
+            )
+            qty = int(allocation.get('position_size', 0) or 0)
+            if qty <= 0:
+                return None
+            details = {**details, 'allocation': allocation}
+
         self.trade_count += 1
         self.daily_trades += 1
-        
-        sl_points = entry_params.get('sl_points', self.sl_points)
-        tp_points = entry_params.get('tp_points', self.tp_points)
-        qty = entry_params.get('quantity', self.lot_size)
         
         self.current_trade = BacktestTrade(
             trade_id=self.trade_count,
@@ -232,8 +319,8 @@ class Backtester:
         )
         self._trade_high_water = entry_price  # Reset high-water for new trade
         
-        # Apply entry commission
-        self.current_capital -= self.commission
+        # Charge half the round-trip cost at entry and half at exit.
+        self.current_capital -= self.commission_per_side
         
         return None  # Trade not complete yet
     
@@ -251,8 +338,8 @@ class Backtester:
         price_diff = actual_exit - trade.entry_price
         pnl = price_diff * trade.qty
         
-        # Apply exit commission
-        pnl -= self.commission
+        # Charge the remaining half of round-trip execution costs at exit.
+        pnl -= self.commission_per_side
         
         # Update trade record
         trade.exit_time = timestamp
@@ -298,15 +385,37 @@ class Backtester:
         """
         print(f"🔬 Starting backtest with {len(historical_data)} candles...")
         print(f"   Capital: ₹{self.initial_capital:,.0f} | SL: {self.sl_points}pts | TP: {self.tp_points}pts")
+
+        if not historical_data:
+            self._data_start_ts = None
+            self._data_end_ts = None
+            return self._calculate_results()
+
+        self._data_start_ts = historical_data[0].get('timestamp')
+        self._data_end_ts = historical_data[-1].get('timestamp')
         
         # Process candles
         ticks_history = []
         for i, candle in enumerate(historical_data):
             # Build tick history (last 60 candles for indicators)
+            option_price = self._resolve_option_price(candle)
+            spot_price = float(candle.get('spot_price', candle.get('close', 100)) or candle.get('close', 100))
+            volume = int(candle.get('volume', 10000) or 0)
+            if volume <= 0:
+                # Spot historical files often carry zero volume; use a neutral fallback for MQ checks.
+                volume = 10000
+            # Create a realistic synthetic quote so spread quality checks can run.
+            spread = max(0.1, option_price * 0.001)
+            bid = max(0.05, option_price - (spread / 2.0))
+            ask = option_price + (spread / 2.0)
+
             tick = {
-                'ltp': candle.get('close', 100),
-                'spot_price': candle.get('spot_price', candle.get('close', 100) * 100),
-                'volume': candle.get('volume', 10000),
+                'ltp': option_price,
+                'spot_price': spot_price,
+                'bid': bid,
+                'ask': ask,
+                'spread_pct': ((ask - bid) / bid) * 100.0 if bid > 0 else 99.0,
+                'volume': volume,
                 'timestamp': candle.get('timestamp')
             }
             ticks_history.append(tick)
@@ -325,7 +434,7 @@ class Backtester:
             last_candle = historical_data[-1]
             self._exit_trade(
                 last_candle.get('timestamp', datetime.now()),
-                last_candle.get('close', 100),
+                self._resolve_option_price(last_candle),
                 'END_OF_DATA'
             )
         
@@ -378,12 +487,16 @@ class Backtester:
         else:
             sharpe = 0
         
-        start_date = self.trades[0].entry_time.strftime('%Y-%m-%d') if self.trades else ''
-        end_date = self.trades[-1].exit_time.strftime('%Y-%m-%d') if self.trades and self.trades[-1].exit_time else ''
+        start_date = self._data_start_ts.strftime('%Y-%m-%d') if isinstance(self._data_start_ts, datetime) else ''
+        end_date = self._data_end_ts.strftime('%Y-%m-%d') if isinstance(self._data_end_ts, datetime) else ''
+        first_trade_date = self.trades[0].entry_time.strftime('%Y-%m-%d') if self.trades else ''
+        last_trade_date = self.trades[-1].exit_time.strftime('%Y-%m-%d') if self.trades and self.trades[-1].exit_time else ''
         
         return BacktestResult(
             start_date=start_date,
             end_date=end_date,
+            first_trade_date=first_trade_date,
+            last_trade_date=last_trade_date,
             initial_capital=self.initial_capital,
             final_capital=self.current_capital,
             total_pnl=self.current_capital - self.initial_capital,
@@ -410,6 +523,8 @@ class Backtester:
         summary = {
             'start_date': result.start_date,
             'end_date': result.end_date,
+            'first_trade_date': result.first_trade_date,
+            'last_trade_date': result.last_trade_date,
             'initial_capital': result.initial_capital,
             'final_capital': round(result.final_capital, 2),
             'total_pnl': round(result.total_pnl, 2),
@@ -455,14 +570,18 @@ def load_historical_data(filepath: str) -> List[Dict]:
     with open(filepath, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
+            volume = int(row.get('volume', 10000) or 0)
+            if volume <= 0:
+                volume = 10000
+
             candle = {
                 'timestamp': datetime.fromisoformat(row['timestamp']),
                 'open': float(row['open']),
                 'high': float(row['high']),
                 'low': float(row['low']),
                 'close': float(row['close']),
-                'volume': int(row.get('volume', 10000)),
-                'spot_price': float(row.get('spot_price', float(row['close']) * 100))
+                'volume': volume,
+                'spot_price': float(row.get('spot_price', float(row['close'])))
             }
             data.append(candle)
     return data
@@ -475,8 +594,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PTQ Scalping Bot Backtester')
     parser.add_argument('--data', type=str, required=True, help='Path to historical data CSV')
     parser.add_argument('--capital', type=float, default=30000, help='Initial capital')
-    parser.add_argument('--sl', type=float, default=6, help='Stop loss points')
-    parser.add_argument('--tp', type=float, default=12, help='Take profit points')
+    parser.add_argument('--sl', type=float, default=7, help='Stop loss points')
+    parser.add_argument('--tp', type=float, default=18, help='Take profit points')
+    parser.add_argument('--use-position-size-engine', action='store_true', help='Use PositionSizeEngine for dynamic quantity')
+    parser.add_argument('--position-size-risk-budget-pct', type=float, default=0.02, help='Risk budget pct for position size engine (e.g. 0.02 = 2%%)')
+    parser.add_argument('--position-size-daily-cap-pct', type=float, default=None, help='Override allocator daily risk cap pct for testing (e.g. 0.05)')
     parser.add_argument('--output', type=str, default='logs/backtest', help='Output directory')
     
     args = parser.parse_args()
@@ -490,7 +612,10 @@ if __name__ == '__main__':
     backtester = Backtester(
         initial_capital=args.capital,
         sl_points=args.sl,
-        tp_points=args.tp
+        tp_points=args.tp,
+        use_position_size_engine=args.use_position_size_engine,
+        position_size_risk_budget_pct=args.position_size_risk_budget_pct,
+        position_size_daily_cap_pct=args.position_size_daily_cap_pct,
     )
     result = backtester.run_backtest(historical_data)
     
