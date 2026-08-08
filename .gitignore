@@ -98,3 +98,11 @@ test_*.py
 # ─────────────────────────────────────────────────────────────────
 core/data/scripmaster_nifty_nfo.json
 data/historical/v3_5_0/*.csv
+data/historical/*.csv
+
+# Local audit and process notes
+prc/
+tcp/
+audit_tmp/
+ACK_WARNING_VERIFICATION_2026-07-27_TO_2026-07-31.md
+RC2_STABILIZATION_AUDIT_2026-07-27_TO_2026-07-31.md
