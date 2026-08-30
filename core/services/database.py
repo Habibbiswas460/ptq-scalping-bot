@@ -126,6 +126,8 @@ class DatabaseManager:
                     pnl REAL DEFAULT 0,
                     pnl_pct REAL DEFAULT 0,
                     hold_time_sec INTEGER DEFAULT 0,
+                    mfe REAL DEFAULT 0,
+                    mae REAL DEFAULT 0,
                     score INTEGER,
                     confidence INTEGER,
                     market_quality_score INTEGER,
@@ -152,7 +154,9 @@ class DatabaseManager:
                 ('risk_budget_used', 'REAL'),
                 ('risk_amount', 'REAL'),
                 ('allocation_grade', 'TEXT'),
-                ('position_size_breakdown', 'TEXT')
+                ('position_size_breakdown', 'TEXT'),
+                ('mfe', 'REAL'),
+                ('mae', 'REAL')
             ])
             
             # Daily summary table
@@ -532,6 +536,8 @@ class DatabaseManager:
                     pnl = ?,
                     pnl_pct = ?,
                     hold_time_sec = ?,
+                    mfe = ?,
+                    mae = ?,
                     status = 'CLOSED'
                 WHERE order_id = ?
             ''', (
@@ -541,6 +547,8 @@ class DatabaseManager:
                 exit_data.get('pnl', 0),
                 exit_data.get('pnl_pct', 0),
                 exit_data.get('hold_time_sec', 0),
+                exit_data.get('mfe', 0),
+                exit_data.get('mae', 0),
                 order_id
             ))
             conn.commit()
@@ -760,6 +768,30 @@ class DatabaseManager:
             conn.commit()
             return cursor.lastrowid
 
+    def prune_old_signal_rows(self, retention_days: int = 7, batch_size: int = 5000) -> Dict[str, int]:
+        """Delete per-tick rows older than retention_days from signals/dvf_signals.
+
+        These two tables log every strategy evaluation (not just trades) and grow
+        unbounded — batched to keep any single DELETE transaction short so it
+        doesn't hold the WAL write lock away from a live trading loop.
+        """
+        cutoff = self._db_timestamp(datetime.now() - timedelta(days=retention_days))
+        deleted = {'signals': 0, 'dvf_signals': 0}
+        for table in deleted:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                while True:
+                    cursor.execute(
+                        f"DELETE FROM {table} WHERE id IN "
+                        f"(SELECT id FROM {table} WHERE timestamp < ? LIMIT ?)",
+                        (cutoff, batch_size),
+                    )
+                    conn.commit()
+                    if cursor.rowcount <= 0:
+                        break
+                    deleted[table] += cursor.rowcount
+        return deleted
+
     def log_dvf_signal(self, signal: Dict) -> int:
         """Log a read-only DVF decision record."""
         with self._get_connection() as conn:
@@ -923,6 +955,12 @@ class DatabaseManager:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM dvf_trades ORDER BY created_at DESC LIMIT ?', (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_open_dvf_trades(self, limit: int = 500) -> List[Dict]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM dvf_trades WHERE status = 'OPEN' ORDER BY id ASC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
 
     def save_dvf_report(self, report_type: str, report_date: str, payload: Dict) -> int:
@@ -1421,6 +1459,9 @@ def get_todays_summary() -> Dict:
 def get_todays_trades() -> List[Dict]:
     return db.get_todays_trades()
 
+def prune_old_signal_rows(retention_days: int = 7) -> Dict[str, int]:
+    return db.prune_old_signal_rows(retention_days=retention_days)
+
 def log_dvf_signal(signal: Dict) -> int:
     return db.log_dvf_signal(signal)
 
@@ -1444,6 +1485,9 @@ def get_dvf_trade_by_decision_id(decision_id: str) -> Optional[Dict]:
 
 def get_dvf_trades(limit: int = 100) -> List[Dict]:
     return db.get_dvf_trades(limit=limit)
+
+def get_open_dvf_trades(limit: int = 500) -> List[Dict]:
+    return db.get_open_dvf_trades(limit=limit)
 
 def save_dvf_report(report_type: str, report_date: str, payload: Dict) -> int:
     return db.save_dvf_report(report_type, report_date, payload)

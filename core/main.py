@@ -133,9 +133,30 @@ def init_features(logger, state):
         rm = RiskManager(CONFIG, logger)
         set_risk_manager(rm)
         logger.info("✓ RiskManager initialized (globally active)")
+
+        # Derive the previous trading day's close from the historical warm-up
+        # candles so gap protection can actually compare against something.
+        try:
+            from core.runtime import runtime_state
+            today = datetime.now().date()
+            prev_day_closes = []
+            for candle in runtime_state.historical_candles:
+                try:
+                    candle_date = datetime.fromisoformat(str(candle.get('timestamp'))).date()
+                except (ValueError, TypeError):
+                    continue
+                if candle_date < today:
+                    prev_day_closes.append((candle_date, candle.get('close')))
+            if prev_day_closes:
+                prev_day_closes.sort(key=lambda item: item[0])
+                previous_close = float(prev_day_closes[-1][1])
+                rm.set_previous_close(previous_close)
+                logger.info(f"✓ Previous close set for gap protection: ₹{previous_close:,.2f}")
+        except Exception as e:
+            logger.warning(f"⚠ Could not set previous close for gap protection: {e}")
     except Exception as e:
         logger.warning(f"⚠ RiskManager init failed: {e} — risk checks may be skipped")
-    
+
     # Initialize Database
     if HAS_DATABASE and CONFIG.get('database', {}).get('enabled', True):
         logger.info("✓ Database initialized (SQLite)")
@@ -210,8 +231,10 @@ def main():
         while next_day.weekday() >= 5:  # Skip weekends
             next_day += timedelta(days=1)
         pre_market_time = next_day.replace(hour=9, minute=10, second=0, microsecond=0)
-    
-    if current < pre_market_time:
+
+    # Unit tests and CI runs should exercise startup logic immediately without sleeping until market open.
+    is_pytest_run = bool(os.getenv("PYTEST_CURRENT_TEST"))
+    if current < pre_market_time and not is_pytest_run:
         wait_seconds = (pre_market_time - current).total_seconds()
         hours = int(wait_seconds // 3600)
         minutes = int((wait_seconds % 3600) // 60)
@@ -271,6 +294,33 @@ def main():
             "connected_at": datetime.now().isoformat(),
         }
     )
+
+    # DVF virtual positions from a prior process instance never get an exit tick,
+    # since _OPEN_VIRTUAL_POSITIONS is in-memory only — sweep them closed here.
+    try:
+        from core.validation.paper_executor import reconcile_stale_open_positions
+        stale_closed = reconcile_stale_open_positions()
+        if stale_closed:
+            logger.info(f"DVF: reconciled {stale_closed} stale OPEN virtual position(s) from a prior run")
+    except Exception as e:
+        logger.warning(f"DVF stale-position reconciliation skipped: {e}")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # P0 WARM-UP: Load canonical historical 5-minute candles to seed EMA/VWAP
+    # ════════════════════════════════════════════════════════════════════════
+    logger.info("Initializing historical indicator warm-up from SmartAPI...")
+    try:
+        # NIFTY spot token is 99926000
+        # Use days_back=5 to safely cross weekends (Saturday/Sunday) and holiday gaps
+        historical = broker.get_historical_candles(exchange="NSE", token="99926000", interval="FIVE_MINUTE", days_back=5)
+        if historical:
+            # Keep up to 100 historical candles (~1.5 days) to ensure strict indicator convergence for EMA 50
+            runtime_state.set_historical_candles(historical[-100:])
+            logger.info(f"✓ Historical API loaded {min(100, len(historical))} canonical 5-mim candles for EMA/VWAP warm-up")
+        else:
+            logger.warning("⚠ Historical API returned empty. Strategy indicators will start from zero.")
+    except Exception as e:
+        logger.warning(f"⚠ Failed to load historical dataset: {e}")
 
     # Run readiness once per process using the already-authenticated broker session.
     startup_profile = (os.getenv("STARTUP_READINESS_PROFILE") or "standard").strip().lower()
@@ -749,7 +799,16 @@ def main():
         
         # Cleanup
         broker.logout()
-        
+
+        try:
+            from core.risk.risk_manager import get_risk_manager
+            rm = get_risk_manager()
+            if rm:
+                rm.end_of_day()
+                logger.info("✓ RiskManager end-of-day processing complete")
+        except Exception as e:
+            logger.warning(f"⚠ RiskManager end-of-day failed: {e}")
+
         logger.info("")
         logger.info("┌─────────── SESSION SUMMARY ───────────┐")
         logger.info(f"│  P&L: ₹{state.daily_pnl_inr:+8.2f} ({state.daily_pnl_pct:+.2f}%)       │")
@@ -790,7 +849,15 @@ def run_with_auto_reconnect():
             
             # Run main trading loop
             result = main()
-            
+
+            # main() can block for hours (overnight pre-market standby),
+            # crossing midnight — refresh temp_logger so the result-handling
+            # messages below land in the correct dated log folder instead of
+            # the one from whenever this process actually launched.
+            current_today_dir = os.path.join("logs", datetime.now().strftime("%Y-%m-%d"))
+            if temp_logger.today_dir != current_today_dir:
+                temp_logger = BotLogger(enable_console=True)
+
             if result == "SHUTDOWN":
                 temp_logger.info("✓ Clean shutdown requested")
                 break
