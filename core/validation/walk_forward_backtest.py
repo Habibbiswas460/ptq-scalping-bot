@@ -17,8 +17,7 @@ from core.backtest import Backtester, load_historical_data
 def _run_window(candles: List[Dict], args) -> Dict:
     bt = Backtester(
         initial_capital=args.capital,
-        sl_points=args.sl,
-        tp_points=args.tp,
+        day_type=args.day_type,
         use_position_size_engine=args.use_position_size_engine,
         position_size_risk_budget_pct=args.position_size_risk_budget_pct,
         position_size_daily_cap_pct=args.position_size_daily_cap_pct,
@@ -66,8 +65,7 @@ def main() -> None:
     parser.add_argument("--window-days", type=int, default=30, help="Window size in days")
     parser.add_argument("--step-days", type=int, default=10, help="Window step in days")
     parser.add_argument("--capital", type=float, default=30000)
-    parser.add_argument("--sl", type=float, default=7)
-    parser.add_argument("--tp", type=float, default=18)
+    parser.add_argument("--day-type", type=str, default="NORMAL", help="Day type passed to the exit engine (NORMAL or EXPIRY)")
     parser.add_argument("--min-confidence", type=int, default=72)
     parser.add_argument("--use-position-size-engine", action="store_true")
     parser.add_argument("--position-size-risk-budget-pct", type=float, default=0.04)
@@ -106,8 +104,7 @@ def main() -> None:
         "avg_profit_factor": round(mean(finite_pf_values), 2) if finite_pf_values else None,
         "avg_max_drawdown_pct": round(mean(r["max_drawdown_pct"] for r in rows), 2),
         "settings": {
-            "sl": args.sl,
-            "tp": args.tp,
+            "day_type": args.day_type,
             "min_confidence": args.min_confidence,
             "use_position_size_engine": args.use_position_size_engine,
             "position_size_risk_budget_pct": args.position_size_risk_budget_pct,

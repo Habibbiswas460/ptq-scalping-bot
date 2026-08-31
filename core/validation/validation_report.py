@@ -4,7 +4,13 @@ from datetime import datetime, timedelta
 from typing import Dict, List
 
 from core.services.database import db, save_dvf_report
-from core.validation.analytics import allocation_analytics, reject_reason_stats, regime_stats, session_stats
+from core.validation.analytics import (
+    allocation_analytics,
+    mfe_mae_summary,
+    reject_reason_stats,
+    regime_stats,
+    session_stats,
+)
 from core.validation.calibration_engine import (
     confidence_calibration,
     market_quality_calibration,
@@ -62,6 +68,7 @@ class ValidationReportEngine:
             'session_stats': session_stats(days, end_date=report_date),
             'regime_stats': regime_stats(days, end_date=report_date),
             'allocation_analytics': allocation_analytics(days, end_date=report_date),
+            'mfe_mae_summary': mfe_mae_summary(days, end_date=report_date),
         }
         save_dvf_report(report_type, report_date, report)
         return report
@@ -107,6 +114,18 @@ class ValidationReportEngine:
                 for row in rows:
                     lines.append(str(row))
             lines.append('')
+
+        lines.append('[10] MFE/MAE Summary')
+        mfe_summary = report.get('mfe_mae_summary', {})
+        if not mfe_summary:
+            lines.append('(no data)')
+        else:
+            lines.append(f"Trades: {mfe_summary.get('trades', 0)}")
+            lines.append(f"Avg MFE: {mfe_summary.get('avg_mfe', 0):.2f}")
+            lines.append(f"Avg MAE: {mfe_summary.get('avg_mae', 0):.2f}")
+            lines.append(f"Best MFE: {mfe_summary.get('best_mfe', 0):.2f}")
+            lines.append(f"Worst MAE: {mfe_summary.get('worst_mae', 0):.2f}")
+        lines.append('')
 
         return '\n'.join(lines)
 

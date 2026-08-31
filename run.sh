@@ -49,6 +49,7 @@ ENGINE_VERSION="v3.5"
 READINESS_VERSION="v2.0.0"
 RUN_MODE="menu"
 NO_ANIMATION="false"
+TRADE_LOOKUP_ID=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -64,9 +65,18 @@ while [ $# -gt 0 ]; do
         --no-animation)
             NO_ANIMATION="true"
             ;;
+        --trade-id)
+            if [ $# -lt 2 ]; then
+                printf "Missing value for --trade-id\n"
+                exit 2
+            fi
+            TRADE_LOOKUP_ID="$2"
+            RUN_MODE="trade_lookup"
+            shift
+            ;;
         *)
             printf "Unknown option: %s\n" "$1"
-            printf "Usage: ./run.sh [--version|--readiness|--health|--no-animation]\n"
+            printf "Usage: ./run.sh [--version|--readiness|--health|--no-animation|--trade-id <paper_trade_id>]\n"
             exit 2
             ;;
     esac
@@ -544,7 +554,8 @@ show_main_menu() {
     printf "    ║   ${G7}[6]${BCYAN} 📋 Log Viewer           ${DIM}Browse daily trade logs${BCYAN}             ║\n"
     printf "    ║   ${G9}[7]${BCYAN} 🩺 System Health        ${DIM}Full diagnostic check${BCYAN}               ║\n"
     printf "    ║   ${G1}[8]${BCYAN} 🔧 Project Tools        ${DIM}Cleanup, structure, docs${BCYAN}            ║\n"
-    printf "    ║   ${G9}[9]${BCYAN} 🧾 Version & Changelog  ${DIM}Build info and recent updates${BCYAN}       ║\n"
+    printf "    ║   ${G12}[9]${BCYAN} 🔍 Trade MFE/MAE        ${DIM}Search by paper trade ID${BCYAN}           ║\n"
+    printf "    ║   ${G9}[10]${BCYAN} 🧾 Version & Changelog ${DIM}Build info and recent updates${BCYAN}      ║\n"
     printf "    ║   ${DIM}[0]${BCYAN} 🚪 Exit                                                  ║\n"
     echo "    ║                                                                  ║"
     echo "    ╚══════════════════════════════════════════════════════════════════╝"
@@ -568,7 +579,7 @@ show_main_menu() {
     esac
     printf "${NC}\n\n"
 
-    printf "    ${BWHITE}Select [0-9]: ${NC}"
+    printf "    ${BWHITE}Select [0-10]: ${NC}"
     read -r choice
 
     case $choice in
@@ -580,7 +591,8 @@ show_main_menu() {
         6) menu_logs ;;
         7) menu_health ;;
         8) menu_tools ;;
-        9) menu_version ;;
+        9) menu_trade_mfe_mae ;;
+        10) menu_version ;;
         0)
             echo ""
             printf "    ${BGREEN}Goodbye! Happy Trading! 📈${NC}\n\n"
@@ -610,8 +622,8 @@ menu_trading() {
     printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
 
-    SL=$(get_env "SL_POINTS" "6")
-    TP=$(get_env "TP_POINTS" "12")
+    SL=$(get_env "SL_POINTS" "7")
+    TP=$(get_env "TP_POINTS" "14")
     CE=$(get_env "CE_QUANTITY" "195")
     PE=$(get_env "PE_QUANTITY" "130")
     echo ""
@@ -675,6 +687,30 @@ menu_trading() {
 
 launch_bot() {
     local paper_mode="$1"
+
+    # ── Single-instance guard ────────────────────────────────────────────
+    # Refuse to launch if a bot process from a previous run.sh session is
+    # still alive - two live app.py instances against the same broker
+    # account would double-trade.
+    local pid_file="$SCRIPT_DIR/.run_bot.pid"
+    if [ -f "$pid_file" ]; then
+        local existing_pid
+        existing_pid="$(cat "$pid_file" 2>/dev/null)"
+        if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+            clear
+            echo ""
+            printf "    ${BRED}✗ A bot instance is already running (PID $existing_pid).${NC}\n"
+            printf "    ${DIM}Stop it first (or remove $pid_file if it is stale) before launching another.${NC}\n"
+            echo ""
+            press_enter
+            return 1
+        fi
+        # Stale PID file from a crashed/killed process - safe to reclaim.
+        rm -f "$pid_file"
+    fi
+    echo "$$" > "$pid_file"
+    trap 'rm -f "$pid_file"' RETURN
+
     export PAPER_TRADING="$paper_mode"
     # Keep runtime mode aligned with readiness decision.
     # Paper mode can still use live data; live mode always uses live data.
@@ -726,24 +762,25 @@ launch_bot() {
         MAX_RESTARTS=5
     fi
 
-    while [ $RESTART_COUNT -lt $MAX_RESTARTS ]; do
+    while true; do
         "$PYTHON_BIN" app.py
         EXIT_CODE=$?
 
         if [ $EXIT_CODE -eq 0 ]; then
             printf "\n    ${BGREEN}✓ Bot exited cleanly${NC}\n"
             break
-        else
-            RESTART_COUNT=$((RESTART_COUNT + 1))
-            printf "\n    ${BYELLOW}⚠ Crashed (exit: $EXIT_CODE). Restart $RESTART_COUNT/$MAX_RESTARTS in 10s...${NC}\n"
-            printf "    ${DIM}Ctrl+C to cancel${NC}\n"
-            sleep 10
-            if [ $RESTART_COUNT -ge $MAX_RESTARTS ]; then
-                printf "\n    ${BRED}✗ Max restarts reached. Stopping.${NC}\n"
-                break
-            fi
-            printf "    ${BCYAN}🔄 Restarting...${NC}\n\n"
         fi
+
+        RESTART_COUNT=$((RESTART_COUNT + 1))
+        if [ $RESTART_COUNT -gt $MAX_RESTARTS ]; then
+            printf "\n    ${BRED}✗ Max restarts ($MAX_RESTARTS) reached. Stopping.${NC}\n"
+            break
+        fi
+
+        printf "\n    ${BYELLOW}⚠ Crashed (exit: $EXIT_CODE). Restart $RESTART_COUNT/$MAX_RESTARTS in 10s...${NC}\n"
+        printf "    ${DIM}Ctrl+C to cancel${NC}\n"
+        sleep 10
+        printf "    ${BCYAN}🔄 Restarting...${NC}\n\n"
     done
 
     echo ""
@@ -757,6 +794,73 @@ launch_bot() {
 # ═══════════════════════════════════════════════════════════════════════════════
 # ███  LEVEL 2: ANALYTICS MENU  ███
 # ═══════════════════════════════════════════════════════════════════════════════
+lookup_trade_mfe_mae() {
+    local trade_id="$1"
+    if [ -z "$trade_id" ]; then
+        printf "    ${BYELLOW}No trade ID supplied.${NC}\n"
+        return 1
+    fi
+
+    "$PYTHON_BIN" - <<PY "$trade_id"
+import os
+import sqlite3
+import sys
+
+trade_id = sys.argv[1]
+
+sys.path.insert(0, os.getcwd())
+from core.services.database import DB_PATH
+
+conn = sqlite3.connect(DB_PATH)
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
+cur.execute("""
+SELECT id, order_id, direction, entry_time, exit_time, pnl, pnl_pct, hold_time_sec, mfe, mae, status
+FROM trades
+WHERE order_id = ?
+LIMIT 1
+""", (trade_id,))
+row = cur.fetchone()
+if row is None:
+    print(f"\nNo trade found for: {trade_id}")
+    sys.exit(0)
+print("\n📊 TRADE MFE/MAE RESULT")
+print("=" * 60)
+for key in ['id','order_id','direction','status','entry_time','exit_time','pnl','pnl_pct','hold_time_sec','mfe','mae']:
+    value = row[key]
+    print(f"{key}: {value}")
+print("=" * 60)
+PY
+}
+
+menu_trade_mfe_mae() {
+    clear
+    echo ""
+    printf "    ${BCYAN}╔══════════════════════════════════════════════════════════╗${NC}\n"
+    printf "    ${BCYAN}║${NC}  ${BWHITE}🔍 TRADE MFE/MAE LOOKUP${NC}                                  ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}╠══════════════════════════════════════════════════════════╣${NC}\n"
+    printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   Enter the paper trade ID to inspect its stored MFE/MAE  ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   Example: PAPER_1785749874_0                             ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
+    echo ""
+    printf "    ${BWHITE}Paper trade ID: ${NC}"
+    read -r trade_id
+
+    if [ -z "$trade_id" ]; then
+        printf "    ${BYELLOW}No trade ID entered.${NC}\n"
+        press_enter
+        show_main_menu
+        return
+    fi
+
+    lookup_trade_mfe_mae "$trade_id"
+
+    press_enter
+    show_main_menu
+}
+
 menu_analytics() {
     clear
     echo ""
@@ -770,11 +874,12 @@ menu_analytics() {
     printf "    ${BCYAN}║${NC}   ${BGREEN}[4]${NC} Trading Calendar     ${DIM}Visual daily PnL grid${NC}       ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[5]${NC} Best & Worst Hours   ${DIM}Hourly performance${NC}          ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[6]${NC} Interactive Mode     ${DIM}Full analytics dashboard${NC}    ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[7]${NC} DVF Virtual Trades   ${DIM}Paper-simulated decisions${NC}    ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${DIM}[0]${NC} ← Back                                             ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
     echo ""
-    printf "    ${BWHITE}Select [0-6]: ${NC}"
+    printf "    ${BWHITE}Select [0-7]: ${NC}"
     read -r achoice
 
     echo ""
@@ -797,11 +902,111 @@ else:
     print('  No hourly data available yet')
 " 2>/dev/null || printf "    ${DIM}No hourly data available yet${NC}\n" ;;
         6) "$PYTHON_BIN" utils/analytics.py --interactive ;;
+        7) menu_dvf_trades; return ;;
         0) show_main_menu; return ;;
         *) printf "    ${BRED}Invalid${NC}\n" ;;
     esac
     press_enter
     menu_analytics
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ███  LEVEL 3: DVF VIRTUAL TRADES VIEWER  ███
+# ═══════════════════════════════════════════════════════════════════════════════
+menu_dvf_trades() {
+    clear
+    echo ""
+    printf "    ${BCYAN}╔══════════════════════════════════════════════════════════╗${NC}\n"
+    printf "    ${BCYAN}║${NC}  ${BWHITE}🧬 DVF VIRTUAL TRADES${NC}                                    ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}╠══════════════════════════════════════════════════════════╣${NC}\n"
+    printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[1]${NC} Recent Virtual Trades  ${DIM}Last 20, any day${NC}          ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[2]${NC} Today's Virtual Trades ${DIM}Opened today${NC}               ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[3]${NC} Open Virtual Positions ${DIM}Not yet closed${NC}              ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[4]${NC} Signal + Trade Detail  ${DIM}Joined with dvf_signals${NC}     ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[5]${NC} Summary Stats          ${DIM}Win rate, PnL, count${NC}        ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${DIM}[0]${NC} ← Back                                             ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
+    echo ""
+    printf "    ${BWHITE}Select [0-5]: ${NC}"
+    read -r dchoice
+
+    echo ""
+    case $dchoice in
+        1) run_dvf_trades_query "recent" ;;
+        2) run_dvf_trades_query "today" ;;
+        3) run_dvf_trades_query "open" ;;
+        4) run_dvf_trades_query "joined" ;;
+        5) run_dvf_trades_query "summary" ;;
+        0) menu_analytics; return ;;
+        *) printf "    ${BRED}Invalid${NC}\n" ;;
+    esac
+    press_enter
+    menu_dvf_trades
+}
+
+run_dvf_trades_query() {
+    local mode="$1"
+    "$PYTHON_BIN" - <<PY "$mode"
+import os
+import sqlite3
+import sys
+
+mode = sys.argv[1]
+sys.path.insert(0, os.getcwd())
+from core.services.database import DB_PATH
+
+conn = sqlite3.connect(DB_PATH)
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
+
+if mode == "recent":
+    cur.execute("""SELECT decision_id, status, direction, virtual_entry_time,
+        virtual_entry_price, virtual_exit_price, pnl, exit_reason
+        FROM dvf_trades ORDER BY id DESC LIMIT 20""")
+elif mode == "today":
+    cur.execute("""SELECT decision_id, status, direction, virtual_entry_time,
+        virtual_entry_price, virtual_exit_price, pnl, exit_reason
+        FROM dvf_trades WHERE date(virtual_entry_time) = date('now') ORDER BY id""")
+elif mode == "open":
+    cur.execute("""SELECT decision_id, direction, virtual_entry_time, virtual_entry_price
+        FROM dvf_trades WHERE status = 'OPEN' ORDER BY id DESC""")
+elif mode == "joined":
+    cur.execute("""SELECT s.timestamp, s.direction, s.weighted_score, s.confidence,
+        s.market_quality_grade, t.pnl, t.exit_reason
+        FROM dvf_signals s JOIN dvf_trades t ON t.decision_id = s.decision_id
+        ORDER BY s.timestamp DESC LIMIT 20""")
+elif mode == "summary":
+    cur.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), SUM(pnl) FROM dvf_trades WHERE status = 'CLOSED'")
+    total, wins, pnl = cur.fetchone()
+    total = total or 0
+    wins = wins or 0
+    pnl = pnl or 0.0
+    print("\n📊 DVF VIRTUAL TRADE SUMMARY")
+    print("=" * 60)
+    print(f"Closed virtual trades : {total}")
+    print(f"Wins                  : {wins}")
+    print(f"Win rate              : {(wins/total*100):.1f}%" if total else "Win rate              : N/A")
+    print(f"Total virtual PnL     : Rs{pnl:+,.2f}")
+    print("=" * 60)
+    sys.exit(0)
+else:
+    print("Unknown mode")
+    sys.exit(0)
+
+rows = cur.fetchall()
+if not rows:
+    print("\nNo DVF virtual trade rows found for this view.")
+    sys.exit(0)
+
+cols = rows[0].keys()
+print("\n📊 DVF VIRTUAL TRADES (%s)" % mode)
+print("=" * 90)
+for row in rows:
+    print(" | ".join(f"{c}={row[c]}" for c in cols))
+print("=" * 90)
+PY
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -872,13 +1077,13 @@ run_quick_backtest() {
     local selected="${CSV_FILES[$((fnum-1))]}"
     echo ""
     printf "    ${BCYAN}📈 Running backtest on: ${BWHITE}${selected}${NC}\n"
-    printf "    ${DIM}Using defaults: Capital=₹$(get_env TOTAL_CAPITAL 30000) SL=$(get_env SL_POINTS 6) TP=$(get_env TP_POINTS 12)${NC}\n\n"
+    printf "    ${DIM}Using defaults: Capital=₹$(get_env TOTAL_CAPITAL 30000) SL=$(get_env SL_POINTS 7) TP=$(get_env TP_POINTS 14)${NC}\n\n"
 
     "$PYTHON_BIN" core/backtest.py \
         --data "$selected" \
         --capital "$(get_env TOTAL_CAPITAL 30000)" \
-        --sl "$(get_env SL_POINTS 6)" \
-        --tp "$(get_env TP_POINTS 12)"
+        --sl "$(get_env SL_POINTS 7)" \
+        --tp "$(get_env TP_POINTS 14)"
 
     press_enter
     menu_backtest
@@ -926,7 +1131,7 @@ run_custom_backtest() {
     # Step 3: Stop Loss
     printf "    ${BYELLOW}Step 3: Stop Loss Points${NC}\n"
     local def_sl
-    def_sl=$(get_env "SL_POINTS" "6")
+    def_sl=$(get_env "SL_POINTS" "7")
     printf "    ${BWHITE}SL points [${def_sl}]: ${NC}"
     read -r bt_sl
     bt_sl="${bt_sl:-$def_sl}"
@@ -935,7 +1140,7 @@ run_custom_backtest() {
     # Step 4: Take Profit
     printf "    ${BYELLOW}Step 4: Take Profit Points${NC}\n"
     local def_tp
-    def_tp=$(get_env "TP_POINTS" "12")
+    def_tp=$(get_env "TP_POINTS" "14")
     printf "    ${BWHITE}TP points [${def_tp}]: ${NC}"
     read -r bt_tp
     bt_tp="${bt_tp:-$def_tp}"
@@ -1166,8 +1371,8 @@ menu_config() {
     echo ""
 
     # SL/TP
-    SL=$(get_env "SL_POINTS" "6")
-    TP=$(get_env "TP_POINTS" "12")
+    SL=$(get_env "SL_POINTS" "7")
+    TP=$(get_env "TP_POINTS" "14")
     TSL=$(get_env "TSL_ENABLED" "true")
     printf "    ${BYELLOW}SL/TP & Exit:${NC}\n"
     printf "      Stop Loss         : ${BRED}-${SL} points${NC}\n"
@@ -1674,6 +1879,11 @@ fi
 
 if [ "$RUN_MODE" = "health" ]; then
     run_full_project_check
+    exit $?
+fi
+
+if [ "$RUN_MODE" = "trade_lookup" ]; then
+    lookup_trade_mfe_mae "$TRADE_LOOKUP_ID"
     exit $?
 fi
 

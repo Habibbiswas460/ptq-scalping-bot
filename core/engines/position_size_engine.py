@@ -68,6 +68,10 @@ class PositionSizeEngine:
             "enforce_lot_rounding": True,
             "daily_risk_cap_pct": 0.03,
             "recovery_mode_cap_pct": 0.50,
+            # If the risk-capped budget falls just short of covering one lot
+            # (e.g. ATR widened the SL from 6pts to 7pts), round up to 1 lot
+            # instead of silently zeroing the trade. 0.05 = up to 5% short.
+            "min_lot_rounding_tolerance_pct": 0.05,
         },
         "allocation_grades": {
             "A+": 1.02,
@@ -79,7 +83,12 @@ class PositionSizeEngine:
 
     def __init__(self, config: Optional[Dict] = None):
         strategy_config = self._load_strategy_config()
+        env_config = self._load_env_config()
         self.config = self._merge_config(self.DEFAULT_CONFIG, strategy_config)
+        # .env is the owner-facing config surface — it overrides strategy.json
+        # (a lower-level tuning file) but not an explicit constructor override
+        # (used by backtest.py to run parameter sweeps).
+        self.config = self._merge_config(self.config, env_config)
         self.config = self._merge_config(self.config, config or {})
 
     def calculate(
@@ -150,6 +159,24 @@ class PositionSizeEngine:
         lot_risk = float(sl_points) * float(lot_size)
         lots = int(floor(capped_risk_amount / lot_risk)) if lot_risk > 0 else 0
 
+        # Razor-thin miss rescue: don't let a wider ATR-adjusted SL zero out an
+        # otherwise-good signal when the *uncapped* budget is only marginally
+        # short of one lot. This must never bypass an actual risk-budget cap
+        # (daily/recovery/remaining-risk/etc.) - `capped` is True whenever
+        # _apply_risk_caps() had to clamp the amount, so gate the rescue on
+        # `not capped` to guarantee actual_risk_amount can never exceed the
+        # enforced budget.
+        tolerance_pct = float(self.config["safety_caps"].get("min_lot_rounding_tolerance_pct", 0.0))
+        if (
+            lots == 0
+            and lot_risk > 0
+            and tolerance_pct > 0
+            and not capped
+            and capped_risk_amount >= lot_risk * (1 - tolerance_pct)
+        ):
+            lots = 1
+            cap_reason = self._append_reason(cap_reason, "rounded_up_min_lot")
+
         max_lots = int(self.config["safety_caps"]["max_lots"])
         if lots > max_lots:
             lots = max_lots
@@ -200,6 +227,13 @@ class PositionSizeEngine:
             with open(config_path, 'r', encoding='utf-8') as handle:
                 payload = json.load(handle)
             return payload.get('strategy', {}).get('scoring_system', {}).get('position_size_engine', {})
+        except Exception:
+            return {}
+
+    def _load_env_config(self) -> Dict:
+        try:
+            from config.constants import POSITION_SIZE_ENV_CONFIG
+            return POSITION_SIZE_ENV_CONFIG
         except Exception:
             return {}
 
@@ -264,9 +298,13 @@ class PositionSizeEngine:
         else:
             indicator = float(volatility)
 
+        vol_range = self._range("volatility")
         if indicator <= 0:
-            return self._range("volatility").apply(0.95)
-        return self._linear_scale(indicator, 10.0, 40.0, ClampRange(self._range("volatility").maximum, self._range("volatility").minimum))
+            return vol_range.apply(0.95)
+
+        normalized = max(0.0, min(1.0, (indicator - 10.0) / (40.0 - 10.0)))
+        raw = vol_range.maximum - (vol_range.maximum - vol_range.minimum) * normalized
+        return vol_range.apply(raw)
 
     def _recovery_multiplier(self, recovery_mode: Union[bool, Dict]) -> float:
         if isinstance(recovery_mode, dict):

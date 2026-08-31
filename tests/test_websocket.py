@@ -201,6 +201,44 @@ class TestBrokerSplitSubscriptions:
         assert broker._ws_connected is False
 
 
+class TestStrikeRotationProtection:
+    """Regression tests for strike rotation guardrails."""
+
+    def test_check_and_rotate_strike_skips_when_recent_rotation_happened(self):
+        from core.trading.broker import BrokerInterface
+
+        broker = BrokerInterface()
+        broker.logger = MagicMock()
+        broker.spot_price = 25000.0
+        broker.current_strike = 25050
+        broker._option_token = "44649"
+        broker._last_strike_rotation_time = time.time()
+        broker._find_strike_by_premium = MagicMock(return_value=(25000, 120.0))
+        broker.last_tick = {"ltp": 40.0}
+
+        result = broker.check_and_rotate_strike()
+
+        assert result is False
+        broker._find_strike_by_premium.assert_not_called()
+
+    def test_check_and_rotate_strike_skips_when_ws_transport_stress_recent(self):
+        from core.trading.broker import BrokerInterface
+
+        broker = BrokerInterface()
+        broker.logger = MagicMock()
+        broker.spot_price = 25000.0
+        broker.current_strike = 25050
+        broker._option_token = "44649"
+        broker._last_ws_reconnect_time = time.time()
+        broker._find_strike_by_premium = MagicMock(return_value=(25000, 120.0))
+        broker.last_tick = {"ltp": 40.0}
+
+        result = broker.check_and_rotate_strike()
+
+        assert result is False
+        broker._find_strike_by_premium.assert_not_called()
+
+
 class TestClientReliabilityHardening:
     """Regression tests for client-side websocket reliability infrastructure."""
 
@@ -212,7 +250,9 @@ class TestClientReliabilityHardening:
         assert client._set_ack_result("sub_test", True) is True
         assert client._wait_for_ack("sub_test", timeout=0.01) is True
 
-    def test_subscribe_ack_timeout_falls_back_to_local_cache(self):
+    def test_subscribe_is_fire_and_forget_no_blocking_ack_wait(self):
+        # SmartAPI never sends a JSON ack for subscribe/unsubscribe (see
+        # findings.md §2.10) — subscribe() must not block waiting for one.
         logger = MagicMock()
         client = AngelOneClient("k", "c", "p", "t", logger=logger)
         client.ws_connected = True
@@ -225,6 +265,7 @@ class TestClientReliabilityHardening:
         assert ok is True
         assert client.subscriptions.get("12345") == 2
         assert "NFO:12345:2" in client.ws_subscriptions
+        client._wait_for_ack.assert_not_called()
 
     def test_duplicate_subscribe_is_skipped(self):
         logger = MagicMock()

@@ -95,6 +95,10 @@ cp .env.example .env
 ./run.sh --readiness --no-animation
 ```
 
+Canonical launcher command policy:
+- Use only ./run.sh for launcher actions.
+- Do not use ./rin.sh (invalid command; returns command not found).
+
 6. Run paper mode launch:
 
 ```bash
@@ -119,6 +123,25 @@ RC2 Freeze verification snapshot:
 - 151 passed
 - 1 skipped
 - 0 failed
+
+## MFE/MAE inspection
+You can inspect the recent trade excursion summary directly with:
+
+```bash
+./venv/bin/python - <<'PY'
+from core.validation.analytics import recent_sessions_trade_mfe_mae_summary
+print(recent_sessions_trade_mfe_mae_summary(7))
+PY
+```
+
+For a custom date window:
+
+```bash
+./venv/bin/python - <<'PY'
+from core.validation.analytics import recent_sessions_trade_mfe_mae_summary
+print(recent_sessions_trade_mfe_mae_summary(10, end_date='2026-08-10'))
+PY
+```
 
 ## Documentation Scope
 This README is intentionally RC2-current and excludes legacy historical process narrative. Historical reports and freeze evidence live under [archive](archive).

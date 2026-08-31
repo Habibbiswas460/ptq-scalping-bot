@@ -81,4 +81,10 @@ if __name__ == "__main__":
             print(error)
         sys.exit(1)
 
+    try:
+        from core.services.database import prune_old_signal_rows
+        prune_old_signal_rows(retention_days=7)
+    except Exception:
+        pass
+
     run_with_auto_reconnect()

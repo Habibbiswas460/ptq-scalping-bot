@@ -32,8 +32,8 @@ class ConfigValidator:
         'USE_LIVE_DATA': ('true', 'Live data recommended for accurate signals'),
         'ENABLE_WEBSOCKET': ('true', 'WebSocket recommended for low latency'),
         'TOTAL_CAPITAL': ('30000', 'Capital should be set'),
-        'SL_POINTS': ('6', 'Stop loss should be configured'),
-        'TP_POINTS': ('12', 'Take profit should be configured'),
+        'SL_POINTS': ('7', 'Stop loss should be configured'),
+        'TP_POINTS': ('14', 'Take profit should be configured'),
         'MAX_TRADES_PER_DAY': ('15', 'Max trades per day recommended'),
         'MAX_TRADES_PER_HOUR': ('10', 'Max trades per hour recommended'),
     }
@@ -170,8 +170,8 @@ class ConfigValidator:
             self.errors.append("❌ Live trading enabled but no broker credentials configured!")
         
         # Stop loss vs take profit
-        sl = float(self.get_env_value('SL_POINTS', '6') or '6')
-        tp = float(self.get_env_value('TP_POINTS', '12') or '12')
+        sl = float(self.get_env_value('SL_POINTS', '7') or '7')
+        tp = float(self.get_env_value('TP_POINTS', '14') or '14')
         if tp <= sl:
             self.warnings.append(f"⚠️  Risk/Reward: TP ({tp}) should be greater than SL ({sl})")
         

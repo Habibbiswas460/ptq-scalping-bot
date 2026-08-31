@@ -5,7 +5,7 @@ Updated: 2026-02-12 - New exit logic
 """
 
 from datetime import datetime
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from config.constants import (
     CONFIG,
@@ -15,6 +15,8 @@ from config.constants import (
     MAX_HOLD_TIME_WINNING, MAX_HOLD_TIME_LOSING,
     THETA_SEC_KILL_LIMIT, DELTA_KILL_MIN,
     GAMMA_NORMAL_MAX, GAMMA_EXPIRY_MAX,
+    TRAILING_ENABLED,
+    TSL_STEP_LEVELS,
     EXIT_HARD_SL_POINTS,
     EXIT_BREAKEVEN_TRIGGER_POINTS,
     EXIT_BREAKEVEN_BUFFER_POINTS,
@@ -25,6 +27,14 @@ from config.constants import (
     EXIT_EARLY_CUT_ATR_HIGH_POINTS,
     EXIT_SOFT_LOSS_TIME_SEC,
     EXIT_SOFT_LOSS_POINTS,
+    RSI_REVERSAL_MIN_PROFIT_POINTS,
+    RSI_OVERBOUGHT,
+    RSI_OVERSOLD,
+    RSI_EXIT_MIN_PROFIT_POINTS,
+    RSI_REVERSAL_CE_EXIT,
+    RSI_REVERSAL_PE_EXIT,
+    RSI_REVERSAL_CE_EXTREME,
+    RSI_REVERSAL_PE_EXTREME,
 )
 from core.risk.greeks_validator import validate_greeks
 
@@ -43,23 +53,25 @@ BREAKEVEN_BUFFER = float(EXIT_BREAKEVEN_BUFFER_POINTS)
 # Tighter trail = lock more profit when running
 TRAILING_DISTANCE = float(EXIT_TRAILING_DISTANCE_POINTS)
 
-# Smart RSI Exit thresholds
-RSI_OVERBOUGHT = 80  # Exit CE when RSI > 80
-RSI_OVERSOLD = 20    # Exit PE when RSI < 20
-
-# RSI Reversal Exit thresholds (v3.3 - exit on momentum shift)
-RSI_REVERSAL_CE_EXIT = 60   # CE: exit if RSI drops from >75 to <60
-RSI_REVERSAL_PE_EXIT = 40   # PE: exit if RSI rises from <25 to >40
-
 # Early Momentum Loss Cut (v3.3)
 EARLY_LOSS_CUT_POINTS = float(EXIT_EARLY_LOSS_CUT_POINTS)
 EARLY_LOSS_CUT_TIME_SEC = int(EXIT_EARLY_LOSS_CUT_TIME_SEC)
 SOFT_LOSS_TIME_SEC = int(EXIT_SOFT_LOSS_TIME_SEC)
 SOFT_LOSS_POINTS = float(EXIT_SOFT_LOSS_POINTS)
 
-# Max hold time: 15 minutes (900 seconds)
-MAX_HOLD_TIME_SEC = 900
 DEFAULT_TTE_SEC = 7 * 24 * 3600
+
+# Overridable clock for exit-timing decisions (early loss cut, soft loss,
+# time exit, end-of-day cutoff). Live trading never sets this — _now() falls
+# through to the real wall clock exactly as before. Backtesting sets it to
+# the current historical candle's timestamp before each exit check, since
+# replaying history against real datetime.now() would make every hold-time
+# calculation nonsensical (see findings.md §2.1).
+_clock_override: Optional[datetime] = None
+
+
+def _now() -> datetime:
+    return _clock_override if _clock_override is not None else datetime.now()
 
 
 def _audit_exit_event(logger, stage: str, trade: Dict, details: Dict):
@@ -77,10 +89,11 @@ def get_step_trailing_sl(trade: Dict, price_diff: float) -> Tuple[float, str]:
     """
     STEP TRAILING STOP LOSS - Pullback & Protect Strategy (OPTIMIZED)
     
-    Logic:
-    1. Initial SL = -6 points (hard SL)
-    2. If profit >= 5 pts → Move SL to +2 (breakeven lock)
-    3. If profit > 5 pts → Trail SL 3 points below MAX profit (never decreases!)
+     Logic:
+     1. Initial SL = -HARD_SL_POINTS
+     2. If trailing is enabled, apply configured TSL step levels from constants.
+         Example step table: 8:4,12:7 means if max profit >= 12, SL locks at +7.
+     3. SL never decreases (highest_sl lock).
     
     Returns:
         (sl_level, sl_status)
@@ -97,15 +110,25 @@ def get_step_trailing_sl(trade: Dict, price_diff: float) -> Tuple[float, str]:
     highest_sl = trade.get('highest_sl', -HARD_SL_POINTS)
     
     # Start with hard SL
-    trailing_sl = -HARD_SL_POINTS  # -6 points
+    trailing_sl = -HARD_SL_POINTS
     sl_status = "HARD_SL"
-    
-    # Step 1: Breakeven activation (when we've seen +5 profit)
-    if max_profit >= BREAKEVEN_TRIGGER:
-        # Calculate SL based on max profit (not current price!)
-        # SL = max_profit - trailing_distance, but minimum is BREAKEVEN_BUFFER
-        trailing_sl = max(BREAKEVEN_BUFFER, max_profit - TRAILING_DISTANCE)
-        sl_status = f"TRAILING(+{trailing_sl:.1f})" if trailing_sl > BREAKEVEN_BUFFER else "BREAKEVEN"
+
+    # Step trailing from configured map (single source of truth: TSL_STEP_LEVELS),
+    # plus an earlier breakeven-lock rung so profit isn't fully unprotected
+    # between entry and the first real TSL step.
+    if TRAILING_ENABLED:
+        step_sl = trailing_sl
+        effective_levels = list(TSL_STEP_LEVELS)
+        if BREAKEVEN_TRIGGER > 0:
+            effective_levels.append((BREAKEVEN_TRIGGER, BREAKEVEN_BUFFER))
+        for trigger_profit, lock_sl in sorted(effective_levels):
+            if max_profit >= float(trigger_profit):
+                step_sl = max(step_sl, float(lock_sl))
+        if step_sl > trailing_sl:
+            trailing_sl = step_sl
+            sl_status = f"STEP_TSL(+{trailing_sl:.1f})"
+    else:
+        sl_status = "TRAILING_DISABLED"
     
     # CRITICAL: SL should NEVER decrease!
     if trailing_sl > highest_sl:
@@ -113,10 +136,8 @@ def get_step_trailing_sl(trade: Dict, price_diff: float) -> Tuple[float, str]:
         highest_sl = trailing_sl
     else:
         trailing_sl = highest_sl
-        if trailing_sl > BREAKEVEN_BUFFER:
+        if trailing_sl > 0:
             sl_status = f"LOCKED(+{trailing_sl:.1f})"
-        elif trailing_sl > 0:
-            sl_status = "BREAKEVEN"
     
     return trailing_sl, sl_status
 
@@ -143,7 +164,17 @@ def check_hard_sl(trade: Dict, tick: Dict, logger) -> Tuple[bool, str]:
     # Update trade state
     trade['price_diff'] = price_diff
     trade['current_pnl'] = price_diff * qty
-    
+
+    # Trade-scoped max favorable / adverse excursion (tracked on the trade
+    # dict itself, unlike compute_trade_mfe_mae_from_ticks which reads a
+    # global rolling tick buffer that isn't scoped to this specific trade
+    # and is unreliable for short-lived trades).
+    current_pnl_now = trade['current_pnl']
+    if current_pnl_now > trade.get('mfe_inr', 0.0):
+        trade['mfe_inr'] = current_pnl_now
+    if current_pnl_now < trade.get('mae_inr', 0.0):
+        trade['mae_inr'] = current_pnl_now
+
     # Get step trailing SL
     trailing_sl, sl_status = get_step_trailing_sl(trade, price_diff)
     trade['current_tsl'] = trailing_sl
@@ -167,8 +198,10 @@ def check_hard_sl(trade: Dict, tick: Dict, logger) -> Tuple[bool, str]:
             trade['current_pnl'] = -actual_loss
             return True, f"🛑 HARD SL HIT | {direction} | -{HARD_SL_POINTS}pts @ ₹{current_price:.2f} | Loss: ₹{actual_loss:.0f}"
     
-    # Check take profit (20 points)
-    if price_diff >= TP_POINTS_FIXED:
+    # Fixed take profit — only applies when trailing is disabled. With
+    # trailing on, the step ladder already handles profit-taking and can
+    # capture rungs above this fixed target instead of being cut short here.
+    if not TRAILING_ENABLED and price_diff >= TP_POINTS_FIXED:
         profit = price_diff * qty
         return True, f"🎯 TAKE PROFIT | {direction} | +{price_diff:.1f}pts @ ₹{current_price:.2f} | Profit: ₹{profit:.0f}"
     
@@ -193,7 +226,7 @@ def smart_rsi_exit(trade: Dict, rsi: float = None, logger=None) -> Tuple[bool, s
     current_pnl = trade.get('current_pnl', 0)
     
     # Only exit on RSI if we're in profit
-    if price_diff < 2:
+    if price_diff < RSI_EXIT_MIN_PROFIT_POINTS:
         _audit_exit_event(logger, "RSI_EVAL", trade, {
             "reason": "profit_threshold_not_met",
             "price_diff": round(price_diff, 2),
@@ -203,11 +236,11 @@ def smart_rsi_exit(trade: Dict, rsi: float = None, logger=None) -> Tuple[bool, s
     
     # CE trade: Exit on extreme overbought
     if direction == 'CE' and rsi > RSI_OVERBOUGHT:
-        return True, f"\U0001f4ca RSI EXIT | CE | RSI={rsi:.0f} (OB>{RSI_OVERBOUGHT}) | Lock profit: \u20b9{current_pnl:.0f}"
-    
+        return True, f"\U0001f4ca RSI EXIT | CE | RSI={rsi:.0f} (OB>{RSI_OVERBOUGHT:.0f}) | Lock profit: \u20b9{current_pnl:.0f}"
+
     # PE trade: Exit on extreme oversold
     if direction == 'PE' and rsi < RSI_OVERSOLD:
-        return True, f"\U0001f4ca RSI EXIT | PE | RSI={rsi:.0f} (OS<{RSI_OVERSOLD}) | Lock profit: \u20b9{current_pnl:.0f}"
+        return True, f"\U0001f4ca RSI EXIT | PE | RSI={rsi:.0f} (OS<{RSI_OVERSOLD:.0f}) | Lock profit: \u20b9{current_pnl:.0f}"
     
     return False, ""
 
@@ -240,14 +273,14 @@ def rsi_reversal_exit(trade: Dict, rsi: float = None, logger=None) -> Tuple[bool
         trade['_max_rsi_seen'] = rsi
         max_rsi_seen = rsi
     
-    # PE trade: If RSI was deeply oversold (<25) and now recovering (>40), momentum reversing
-    if direction == 'PE' and min_rsi_seen < 25 and rsi > RSI_REVERSAL_PE_EXIT:
-        if price_diff > 0:  # Only if in profit
+    # PE trade: If RSI was deeply oversold and now recovering, momentum reversing
+    if direction == 'PE' and min_rsi_seen < RSI_REVERSAL_PE_EXTREME and rsi > RSI_REVERSAL_PE_EXIT:
+        if price_diff >= RSI_REVERSAL_MIN_PROFIT_POINTS:  # Only if profit clears the floor
             return True, f"\U0001f504 RSI REVERSAL EXIT | PE | RSI {min_rsi_seen:.0f}\u2192{rsi:.0f} | Lock: \u20b9{current_pnl:.0f}"
-    
-    # CE trade: If RSI was deeply overbought (>75) and now dropping (<60), momentum reversing
-    if direction == 'CE' and max_rsi_seen > 75 and rsi < RSI_REVERSAL_CE_EXIT:
-        if price_diff > 0:  # Only if in profit
+
+    # CE trade: If RSI was deeply overbought and now dropping, momentum reversing
+    if direction == 'CE' and max_rsi_seen > RSI_REVERSAL_CE_EXTREME and rsi < RSI_REVERSAL_CE_EXIT:
+        if price_diff >= RSI_REVERSAL_MIN_PROFIT_POINTS:  # Only if profit clears the floor
             return True, f"\U0001f504 RSI REVERSAL EXIT | CE | RSI {max_rsi_seen:.0f}\u2192{rsi:.0f} | Lock: \u20b9{current_pnl:.0f}"
     
     return False, ""
@@ -266,7 +299,7 @@ def early_momentum_loss_cut(trade: Dict, tick: Dict) -> Tuple[bool, str]:
     if not trade:
         return False, ""
     
-    hold_time = (datetime.now() - trade['entry_time']).total_seconds()
+    hold_time = (_now() - trade['entry_time']).total_seconds()
     
     # Only active in first 30 seconds
     if hold_time > EARLY_LOSS_CUT_TIME_SEC:
@@ -312,7 +345,7 @@ def soft_loss_time_exit(trade: Dict) -> Tuple[bool, str]:
     if not trade:
         return False, ""
 
-    hold_time = (datetime.now() - trade['entry_time']).total_seconds()
+    hold_time = (_now() - trade['entry_time']).total_seconds()
     if hold_time < SOFT_LOSS_TIME_SEC:
         return False, ""
 
@@ -346,18 +379,20 @@ def time_exit_15min(trade: Dict) -> Tuple[bool, str]:
     if not trade:
         return False, ""
     
-    hold_time = (datetime.now() - trade['entry_time']).total_seconds()
+    hold_time = (_now() - trade['entry_time']).total_seconds()
     current_pnl = trade.get('current_pnl', 0)
     price_diff = trade.get('price_diff', 0)
     tsl_status = trade.get('tsl_status', 'HARD_SL')
-    
-    # 15 minute max hold time
-    if hold_time > MAX_HOLD_TIME_SEC:
-        status = "winning" if price_diff >= 0 else "losing"
+
+    # Max hold time (.env-configurable, separate winning/losing thresholds)
+    is_winning = price_diff >= 0
+    max_hold_sec = MAX_HOLD_TIME_WINNING if is_winning else MAX_HOLD_TIME_LOSING
+    if hold_time > max_hold_sec:
+        status = "winning" if is_winning else "losing"
         return True, f"⏰ TIME EXIT ({status}) | Held: {hold_time/60:.1f}min | TSL: {tsl_status} | P&L: ₹{current_pnl:.0f}"
     
     # Exit 5 min before market close
-    now = datetime.now()
+    now = _now()
     if now.hour == 15 and now.minute >= 25:
         return True, f"⏰ MARKET CLOSE EXIT | P&L: ₹{current_pnl:.0f}"
     
@@ -430,14 +465,14 @@ def check_exit_conditions(trade: Dict, tick: Dict, greeks: Dict,
                           day_type: str, logger, rsi: float = None) -> Tuple[bool, str]:
     """
     PULLBACK & PROTECT - Exit Priority Order (v3.3):
-    
+
     1. HARD SL / STEP TRAILING (highest priority)
     2. Early momentum loss cut (fast adverse move in first 30s)
-    3. Soft loss timeout exit (lingering adverse move)
-    4. Greeks deterioration (theta/gamma/delta kill)
-    5. Smart RSI exit (momentum exhaustion)
+    2c. Soft loss timeout exit (lingering adverse move)
+    3. Greeks deterioration (theta/gamma/delta kill)
+    4. Smart RSI exit (momentum exhaustion)
     4b. RSI reversal exit (momentum shift from extreme)
-    6. Time exit (15 min max hold)
+    5. Time exit (15 min max hold)
     """
     def _cap_negative_pnl(trade: Dict):
         """Ensure negative PnL is capped to per-trade max loss and mark it."""
@@ -506,7 +541,8 @@ def check_exit_conditions(trade: Dict, tick: Dict, greeks: Dict,
         return True, time_reason
     
     # Log trailing status periodically
-    if logger and trade.get('max_profit_points', 0) >= BREAKEVEN_TRIGGER:
+    first_tsl_trigger = TSL_STEP_LEVELS[0][0] if TSL_STEP_LEVELS else BREAKEVEN_TRIGGER
+    if logger and trade.get('max_profit_points', 0) >= float(first_tsl_trigger):
         if not trade.get('_tsl_logged'):
             tsl = trade.get('current_tsl', -HARD_SL_POINTS)
             status = trade.get('tsl_status', 'HARD_SL')
