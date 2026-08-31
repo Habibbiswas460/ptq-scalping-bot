@@ -35,7 +35,7 @@ from core.engines.state_machine import (
     state_in_trade, state_cooldown
 )
 from core.risk.session_trend import start_trading_session
-from core.risk.kill_switch import emergency_check, track_rejected_tick, reset_rejected_tick_counter, is_stale_data_kill_active, is_high_latency_paused
+from core.risk.kill_switch import emergency_check, check_daily_loss_alert, track_rejected_tick, reset_rejected_tick_counter, is_stale_data_kill_active, is_high_latency_paused
 from core.risk.greeks_calc import calculate_greeks, init_greeks_fetcher
 from core.services.mode_switch import (
     update_trading_mode, get_current_mode, get_mode_emoji,
@@ -55,7 +55,7 @@ from core.runtime import runtime_state
 
 # New feature imports
 try:
-    from core.services.database import db, log_trade_entry, log_trade_exit, save_state
+    from core.services.database import db, log_trade_entry, log_trade_exit
     HAS_DATABASE = True
 except ImportError:
     HAS_DATABASE = False
@@ -65,6 +65,19 @@ try:
     HAS_TELEGRAM = True
 except ImportError:
     HAS_TELEGRAM = False
+
+
+def _notify_kill_switch_telegram(reason: str, details: dict, logger) -> None:
+    """Best-effort Telegram alert for a kill-switch transition, gated on
+    TELEGRAM_NOTIFY_KILL_SWITCH. Never raises into the caller — this must
+    not affect the kill-switch state transition itself."""
+    if not HAS_TELEGRAM or not CONFIG['telegram'].get('notify_kill_switch'):
+        return
+    try:
+        notify_kill_switch(reason, details)
+    except Exception as e:
+        logger.debug(f"Telegram kill-switch notify failed: {e}")
+
 
 # Auto-reconnect settings
 MAX_RECONNECT_ATTEMPTS = 10
@@ -305,6 +318,37 @@ def main():
     except Exception as e:
         logger.warning(f"DVF stale-position reconciliation skipped: {e}")
 
+    # Real-money positions from a prior process instance that never got
+    # closed (findings.md/fixed.md §10.1). Unlike the DVF sweep above, this
+    # is real capital, and the live order-placement path has never actually
+    # been exercised (§2.2) — so rather than guessing at a stale SL/TP ladder
+    # or auto-placing a real exit order through an untested code path, treat
+    # any leftover position as a hard stop: alert loudly and refuse to open
+    # new trades until a human confirms it's handled (mirrors the existing
+    # "exit not confirmed" kill-switch pattern elsewhere in this file).
+    try:
+        from core.services.database import get_active_positions
+        orphaned_positions = get_active_positions()
+        if orphaned_positions:
+            order_ids = [p.get('order_id') for p in orphaned_positions]
+            logger.error(
+                f"🚨 {len(orphaned_positions)} active position(s) found from a prior "
+                f"process instance — refusing to open new trades until manually "
+                f"resolved: {order_ids}"
+            )
+            if HAS_TELEGRAM and CONFIG['telegram'].get('notify_kill_switch'):
+                try:
+                    notify_kill_switch(
+                        "Orphaned position(s) from a prior run — manual review required",
+                        {"order_ids": order_ids, "count": len(orphaned_positions)},
+                    )
+                except Exception as e:
+                    logger.debug(f"Telegram orphan-position notify failed: {e}")
+            trading_state.state = "KILL_SWITCH"
+            trading_state.manual_intervention_required = True
+    except Exception as e:
+        logger.warning(f"Active-position recovery check skipped: {e}")
+
     # ════════════════════════════════════════════════════════════════════════
     # P0 WARM-UP: Load canonical historical 5-minute candles to seed EMA/VWAP
     # ════════════════════════════════════════════════════════════════════════
@@ -542,6 +586,7 @@ def main():
                         state.state = "KILL_SWITCH"
                         state.kill_switch_count = getattr(state, 'kill_switch_count', 0) + 1
                         logger.kill_switch(stale_reason, stale_details)
+                        _notify_kill_switch_telegram(stale_reason, stale_details, logger)
                 
                 time.sleep(0.1)
                 continue
@@ -583,7 +628,20 @@ def main():
                 tick, state.daily_pnl_inr, state.total_trades_today,
                 broker.last_valid_tick_time
             )
-            
+
+            # Pre-kill-switch early warning (DAILY_LOSS_ALERT, was previously
+            # a fully dead function — see findings.md/fixed.md "Outstanding
+            # follow-ups"). Purely advisory: emergency_check() above already
+            # owns the actual stop decision, this only logs/alerts once when
+            # daily_pnl_inr first crosses the lower alert threshold.
+            try:
+                _, state.daily_loss_alerted = check_daily_loss_alert(
+                    state.daily_pnl_inr, state.daily_loss_alerted, logger
+                )
+            except Exception:
+                pass
+
+
             if kill_triggered:
                 if state.current_trade:
                     close_current_trade(state, "Kill switch: " + kill_reason, logger, tick)
@@ -599,6 +657,7 @@ def main():
                         state.state = "KILL_SWITCH"
                         state.kill_switch_count = getattr(state, 'kill_switch_count', 0) + 1
                         logger.kill_switch(kill_reason, kill_details)
+                        _notify_kill_switch_telegram(kill_reason, kill_details, logger)
                         logger.warning(f"⚠ HIGH LATENCY PAUSE - {kill_details.get('latency_ms', 0):.0f}ms - Waiting for network to stabilize")
                     elif kill_reason == "Latency recovery":
                         # Still recovering - show progress
@@ -610,6 +669,7 @@ def main():
                         state.state = "KILL_SWITCH"
                         state.kill_switch_count = getattr(state, 'kill_switch_count', 0) + 1
                         logger.kill_switch(kill_reason, kill_details)
+                        _notify_kill_switch_telegram(kill_reason, kill_details, logger)
                         logger.warning(f"⚠ SPREAD KILL - {kill_reason} - Pausing {kill_details.get('cooldown_sec', 30)}s then retrying")
                     elif kill_reason == "Spread cooldown":
                         # Still in cooldown, just wait
@@ -624,6 +684,7 @@ def main():
                         state.state = "KILL_SWITCH"
                         state.kill_switch_count = getattr(state, 'kill_switch_count', 0) + 1
                         logger.kill_switch(kill_reason, kill_details)
+                        _notify_kill_switch_telegram(kill_reason, kill_details, logger)
                         logger.warning(f"⚠ KILL SWITCH - {kill_reason} - NO NEW ENTRIES (bot continues)")
                 
                 # Continue running but skip entry logic
@@ -768,7 +829,7 @@ def main():
         valid_ticks = getattr(state, 'ticks_processed', 0)
         invalid_ticks = getattr(state, 'invalid_ticks', 0)
         
-        logger.daily_summary({
+        daily_summary_payload = {
             'total_trades': state.total_trades_today,
             'winning_trades': state.winning_trades,
             'losing_trades': state.losing_trades,
@@ -778,7 +839,14 @@ def main():
             'ticks_received': total_ticks,
             'ticks_valid': valid_ticks,
             'ticks_invalid': invalid_ticks
-        })
+        }
+        logger.daily_summary(daily_summary_payload)
+
+        if HAS_TELEGRAM and CONFIG['telegram'].get('daily_summary'):
+            try:
+                notify_daily_summary(daily_summary_payload)
+            except Exception as e:
+                logger.debug(f"Telegram daily-summary notify failed: {e}")
 
         # Auto archive P0-3 validation evidence for historical comparison.
         try:

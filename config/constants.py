@@ -34,7 +34,7 @@ TOTAL_CAPITAL = env_int('TOTAL_CAPITAL', 30000)
 # 3 consecutive losses = 4.5% drawdown (vs 21% before)
 RISK_PER_TRADE = env_float('RISK_PER_TRADE_PCT', 3)
 MAX_DAILY_LOSS_PCT = env_float('MAX_DAILY_LOSS_PCT', 10.0)  # 10% max daily loss (₹300 for 30k)
-MAX_DAILY_LOSS_AMOUNT = env_int('MAX_DAILY_LOSS', 2500)  # Changed from 25000 to 2500
+MAX_DAILY_LOSS_AMOUNT = env_int('MAX_DAILY_LOSS', 3000)  # Owner's real ceiling — matches KILL_SWITCH_LOSS's default
 DAILY_LOSS_ALERT = env_int('DAILY_LOSS_ALERT', 1500)      # Alert at ₹1500 loss
 PROFIT_LOCK_THRESHOLD = env_int('PROFIT_LOCK_THRESHOLD', 1000)  # Lock profit at ₹1000
 
@@ -271,14 +271,31 @@ COOLDOWN_EXPIRY_AFTER_SL = 180
 COOLDOWN_NON_TRADE_BLOCK_SEC = env_int('COOLDOWN_NON_TRADE_BLOCK', 15)
 
 # =========================================================
+# 🔀 MODE SWITCH (AGGRESSIVE <-> SAFE) — switch-condition scalars only.
+# The two full per-mode threshold dicts (AGGRESSIVE_THRESHOLDS/SAFE_THRESHOLDS
+# in mode_switch.py, 8 keys x paper/live variant) stay hardcoded — lower
+# priority since the whole subsystem doesn't activate in paper mode anyway
+# (mode_switch.should_go_safe() always returns False under PAPER_TRADING).
+# =========================================================
+MODE_SWITCH_CONSECUTIVE_LOSS_TRIGGER = env_int('MODE_SWITCH_CONSECUTIVE_LOSS_TRIGGER', 1)
+MODE_SWITCH_VOLUME_DETERIORATION_THRESHOLD = env_float('MODE_SWITCH_VOLUME_DETERIORATION_THRESHOLD', 0.9)
+MODE_SWITCH_CHOP_DETECTION_THRESHOLD = env_float('MODE_SWITCH_CHOP_DETECTION_THRESHOLD', 0.0002)
+MODE_SWITCH_THETA_DETERIORATION = env_float('MODE_SWITCH_THETA_DETERIORATION', 0.30)
+MODE_SWITCH_SAFE_HOUR_NORMAL = env_int('MODE_SWITCH_SAFE_HOUR_NORMAL', 13)
+MODE_SWITCH_VOLUME_RECOVERY_THRESHOLD = env_float('MODE_SWITCH_VOLUME_RECOVERY_THRESHOLD', 1.1)
+MODE_SWITCH_RANGE_RECOVERY_THRESHOLD = env_float('MODE_SWITCH_RANGE_RECOVERY_THRESHOLD', 0.0004)
+MODE_SWITCH_THETA_RECOVERY_THRESHOLD = env_float('MODE_SWITCH_THETA_RECOVERY_THRESHOLD', 0.20)
+
+# =========================================================
 # 🚨 KILL SWITCH (UPDATED v3.1 - Tighter Risk Control)
 # =========================================================
 
 KILL_SWITCH_ENABLED = env_bool('KILL_SWITCH_ENABLED', True)
-# Reduced from 900 to 600 (2% of 30k capital). Must stay below
-# MAX_DAILY_LOSS_AMOUNT so this dedicated kill switch actually fires
-# before (not after) the generic daily-loss check in kill_switch.py.
-KILL_SWITCH_LOSS = env_int('KILL_SWITCH_LOSS', 600)
+# Owner's explicit decision (findings.md/fixed.md §13): ₹3,000 is the real
+# daily loss ceiling, and the kill switch must equal MAX_DAILY_LOSS_AMOUNT's
+# default exactly — not a tighter value — so emergency_check()'s two checks
+# agree by construction instead of one silently pre-empting the other.
+KILL_SWITCH_LOSS = env_int('KILL_SWITCH_LOSS', 3000)
 KILL_SWITCH_DAILY_LOSS = KILL_SWITCH_LOSS
 KILL_SWITCH_CONSEC_LOSS = env_int('KILL_SWITCH_CONSEC_LOSS', 5)
 KILL_SWITCH_SPREAD = env_float('KILL_SWITCH_SPREAD_PCT', 0.6)
@@ -531,6 +548,10 @@ CONFIG = {
         'enabled': TELEGRAM_ENABLED,
         'bot_token': TELEGRAM_BOT_TOKEN,
         'chat_id': TELEGRAM_CHAT_ID,
+        'notify_entries': TELEGRAM_NOTIFY_ENTRIES,
+        'notify_exits': TELEGRAM_NOTIFY_EXITS,
+        'notify_kill_switch': TELEGRAM_NOTIFY_KILL_SWITCH,
+        'daily_summary': TELEGRAM_DAILY_SUMMARY,
     },
     'database': {
         'enabled': DATABASE_ENABLED,

@@ -1009,10 +1009,21 @@ class BrokerInterface:
 
                 # ═══════════════════════════════════════════════════════════════
                 # CRITICAL FIX: Only accept ticks from CURRENT subscribed token
-                # After symbol switch, old token's ticks may still arrive briefly
+                # After symbol switch, old token's ticks may still arrive briefly.
+                # This is also what makes the unsubscribe-side verification gap
+                # noted in findings.md/fixed.md §2.10 low-risk in practice — even
+                # if a real unsubscribe silently fails at the SmartAPI layer, a
+                # stale old-token tick can never reach strategy/exit logic; it's
+                # discarded right here. Logged (not silent) so a real occurrence
+                # is now observable instead of invisible.
                 # ═══════════════════════════════════════════════════════════════
                 if self._option_token and token != self._option_token:
-                    # This tick is from old symbol, discard it
+                    self._stale_token_tick_count = getattr(self, '_stale_token_tick_count', 0) + 1
+                    if self.logger and self._stale_token_tick_count % 20 == 1:
+                        self.logger.debug(
+                            f"⏳ Discarded stale tick for old token={token} "
+                            f"(current={self._option_token}, count={self._stale_token_tick_count})"
+                        )
                     return
                 
                 tick_ts = current_time_ms()

@@ -9,7 +9,13 @@ from typing import Dict, List, Tuple
 import threading
 from core.runtime import runtime_state
 
-from config.constants import CONFIG, MAX_DAILY_LOSS_AMOUNT
+from config.constants import (
+    CONFIG, MAX_DAILY_LOSS_AMOUNT,
+    MODE_SWITCH_CONSECUTIVE_LOSS_TRIGGER, MODE_SWITCH_VOLUME_DETERIORATION_THRESHOLD,
+    MODE_SWITCH_CHOP_DETECTION_THRESHOLD, MODE_SWITCH_THETA_DETERIORATION,
+    MODE_SWITCH_SAFE_HOUR_NORMAL, MODE_SWITCH_VOLUME_RECOVERY_THRESHOLD,
+    MODE_SWITCH_RANGE_RECOVERY_THRESHOLD, MODE_SWITCH_THETA_RECOVERY_THRESHOLD,
+)
 
 # Thread lock for mode state
 _mode_lock = threading.Lock()
@@ -88,17 +94,17 @@ active_thresholds = AGGRESSIVE_THRESHOLDS.copy()
 # SWITCH CONDITION PARAMETERS
 # =============================================================================
 
-# Switch to SAFE triggers
-CONSECUTIVE_LOSS_TRIGGER = 1          # 1 loss = go safe
-VOLUME_DETERIORATION_THRESHOLD = 0.9  # avg ratio < 0.9 = go safe
-CHOP_DETECTION_THRESHOLD = 0.0002     # range < 0.02% = chop
-THETA_DETERIORATION = 0.30            # theta/sec > 0.30 = go safe
-SAFE_HOUR_NORMAL = 13                 # After 1 PM on normal days = safe
+# Switch to SAFE triggers (.env-configurable — see config/constants.py)
+CONSECUTIVE_LOSS_TRIGGER = MODE_SWITCH_CONSECUTIVE_LOSS_TRIGGER    # 1 loss = go safe
+VOLUME_DETERIORATION_THRESHOLD = MODE_SWITCH_VOLUME_DETERIORATION_THRESHOLD  # avg ratio < 0.9 = go safe
+CHOP_DETECTION_THRESHOLD = MODE_SWITCH_CHOP_DETECTION_THRESHOLD    # range < 0.02% = chop
+THETA_DETERIORATION = MODE_SWITCH_THETA_DETERIORATION              # theta/sec > 0.30 = go safe
+SAFE_HOUR_NORMAL = MODE_SWITCH_SAFE_HOUR_NORMAL                     # After 1 PM on normal days = safe
 
-# Switch to AGGRESSIVE triggers (ALL must be true)
-VOLUME_RECOVERY_THRESHOLD = 1.1       # avg ratio >= 1.1
-RANGE_RECOVERY_THRESHOLD = 0.0004     # range > 0.04%
-THETA_RECOVERY_THRESHOLD = 0.20       # theta/sec < 0.20
+# Switch to AGGRESSIVE triggers (ALL must be true, .env-configurable)
+VOLUME_RECOVERY_THRESHOLD = MODE_SWITCH_VOLUME_RECOVERY_THRESHOLD  # avg ratio >= 1.1
+RANGE_RECOVERY_THRESHOLD = MODE_SWITCH_RANGE_RECOVERY_THRESHOLD    # range > 0.04%
+THETA_RECOVERY_THRESHOLD = MODE_SWITCH_THETA_RECOVERY_THRESHOLD    # theta/sec < 0.20
 
 # Lockdown trigger - use 90% of MAX_DAILY_LOSS from settings
 # Only lockdown when approaching the user's configured limit
@@ -358,17 +364,20 @@ def _log_mode_switch(old_mode: str, new_mode: str, reason: str):
 
 def get_current_mode() -> str:
     """Get current trading mode"""
-    return _current_mode
+    with _mode_lock:
+        return _current_mode
 
 
 def get_active_thresholds() -> Dict:
     """Get active thresholds based on current mode"""
-    return active_thresholds.copy()
+    with _mode_lock:
+        return active_thresholds.copy()
 
 
 def get_threshold(key: str) -> float:
     """Get a specific threshold value"""
-    return active_thresholds.get(key, 0)
+    with _mode_lock:
+        return active_thresholds.get(key, 0)
 
 
 def record_trade_result(is_win: bool):
@@ -388,14 +397,17 @@ def reset_mode():
 
 def is_entries_allowed() -> bool:
     """Check if new entries are allowed (not in lockdown)"""
-    return _current_mode != MODE_LOCKDOWN
+    with _mode_lock:
+        return _current_mode != MODE_LOCKDOWN
 
 
 def get_mode_emoji() -> str:
     """Get emoji for current mode"""
-    if _current_mode == MODE_AGGRESSIVE:
+    with _mode_lock:
+        current_mode = _current_mode
+    if current_mode == MODE_AGGRESSIVE:
         return "🔴"
-    elif _current_mode == MODE_SAFE:
+    elif current_mode == MODE_SAFE:
         return "🟢"
     else:
         return "🔒"

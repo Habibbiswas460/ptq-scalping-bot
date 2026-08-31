@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, Optional
 
 from core.services.database import (
@@ -14,16 +14,21 @@ from core.services.database import (
 
 
 def _to_datetime(value) -> datetime:
+    """Normalize to a naive local-time datetime, matching the convention used
+    everywhere else in this codebase (dvf_signals.timestamp, trades.entry_time,
+    state_machine.py's now(), etc.). Tz-aware inputs — including rows written
+    before this normalization, when this module used datetime.now(timezone.utc)
+    — are converted to local time first so hold-time math stays correct."""
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return value.astimezone().replace(tzinfo=None) if value.tzinfo else value
     if isinstance(value, str) and value:
         normalized = value.replace('Z', '+00:00')
         try:
             parsed = datetime.fromisoformat(normalized)
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone().replace(tzinfo=None) if parsed.tzinfo else parsed
         except ValueError:
-            return datetime.now(timezone.utc)
-    return datetime.now(timezone.utc)
+            return datetime.now()
+    return datetime.now()
 
 
 def simulate_entry(decision: Dict, market_context: Dict) -> Dict:
@@ -44,7 +49,7 @@ def simulate_entry(decision: Dict, market_context: Dict) -> Dict:
         "allocation_grade": decision.get("allocation_grade"),
         "market_quality_grade": decision.get("market_quality_grade"),
         "risk_amount": market_context.get("risk_amount", 0),
-        "virtual_entry_time": market_context.get("entry_time", datetime.now(timezone.utc)),
+        "virtual_entry_time": market_context.get("entry_time", datetime.now()),
         "virtual_entry_price": fill_price,
         "slippage_model": market_context.get("slippage_model", "none"),
         "notes": market_context.get("notes"),
@@ -70,7 +75,7 @@ def simulate_exit(position: Dict, market_context: Dict) -> Dict:
     risk_amount = float(position.get("risk_amount", 0) or 0)
     pnl_pct = round((pnl / risk_amount) * 100, 2) if risk_amount > 0 else 0.0
     entry_time = _to_datetime(position.get("virtual_entry_time"))
-    exit_time = _to_datetime(market_context.get("exit_time", datetime.now(timezone.utc)))
+    exit_time = _to_datetime(market_context.get("exit_time", datetime.now()))
     hold_time_sec = max(0, int((exit_time - entry_time).total_seconds()))
     mfe = float(market_context.get("mfe", max(0.0, pnl)) or 0)
     mae = float(market_context.get("mae", min(0.0, pnl)) or 0)
@@ -157,7 +162,7 @@ def record_decision(decision: Dict, was_taken: bool, tick: Dict) -> None:
             },
             {
                 "entry_price": entry_price,
-                "entry_time": datetime.now(timezone.utc),
+                "entry_time": datetime.now(),
                 "risk_amount": decision.get("risk_amount") or 0,
             },
         )
@@ -165,7 +170,7 @@ def record_decision(decision: Dict, was_taken: bool, tick: Dict) -> None:
         trade["direction"] = direction
         trade["sl_price"] = entry_price - sl_points if direction == "CE" else entry_price + sl_points
         trade["tp_price"] = entry_price + tp_points if direction == "CE" else entry_price - tp_points
-        trade["opened_at"] = datetime.now(timezone.utc)
+        trade["opened_at"] = datetime.now()
         _OPEN_VIRTUAL_POSITIONS[decision_id] = trade
     except Exception:
         pass
@@ -178,7 +183,7 @@ def update_open_positions(tick: Dict) -> None:
             return
         tick_symbol = tick.get("symbol")
         ltp = float(tick.get("ltp", 0) or 0)
-        now_ts = datetime.now(timezone.utc)
+        now_ts = datetime.now()
 
         for decision_id in list(_OPEN_VIRTUAL_POSITIONS.keys()):
             position = _OPEN_VIRTUAL_POSITIONS[decision_id]
@@ -224,7 +229,7 @@ def reconcile_stale_open_positions(max_age_sec: int = _MAX_VIRTUAL_HOLD_SEC) -> 
     """
     closed = 0
     try:
-        now_ts = datetime.now(timezone.utc)
+        now_ts = datetime.now()
         for row in get_open_dvf_trades():
             entry_time = _to_datetime(row.get("virtual_entry_time"))
             if (now_ts - entry_time).total_seconds() < max_age_sec:

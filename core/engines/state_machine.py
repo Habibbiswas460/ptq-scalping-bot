@@ -253,6 +253,7 @@ class TradingState:
         # PnL tracking
         self.daily_pnl_inr = 0.0
         self.daily_pnl_pct = 0.0
+        self.daily_loss_alerted = False  # DAILY_LOSS_ALERT pre-warning, see check_daily_loss_alert()
         
         # Trade counters
         self.trades_this_hour = 0
@@ -834,7 +835,39 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
             })
         except Exception as e:
             logger.warning(f"⚠ DB trade entry logging failed: {e}")
-        
+
+        try:
+            # Position-recovery record (findings.md/fixed.md §10.1 — this
+            # table previously had zero callers anywhere, so a crash/restart
+            # mid-trade left the position completely unmonitored with no
+            # trace of it ever having existed. main()'s startup now checks
+            # this table and refuses to trade if it finds a leftover ACTIVE
+            # row — see the check right after broker.connect().
+            from core.services.database import save_position
+            save_position({
+                'order_id': trade.get('order_id'),
+                'symbol': trade.get('symbol'),
+                'direction': trade.get('direction', direction),
+                'side': trade.get('side', 'BUY'),
+                'qty': trade.get('qty', adjusted_qty),
+                'entry_price': trade.get('entry_price'),
+                'entry_time': trade.get('entry_time'),
+                'stop_loss': trade.get('fixed_sl_price'),
+                'take_profit': trade.get('tp_price'),
+                'current_price': trade.get('entry_price'),
+                'unrealized_pnl': 0,
+                'broker_order_id': trade.get('broker_order_id') or trade.get('order_id'),
+            })
+        except Exception as e:
+            logger.warning(f"⚠ Active-position recovery record failed: {e}")
+
+        if CONFIG['telegram'].get('notify_entries'):
+            try:
+                from core.services.telegram_bot import notify_entry
+                notify_entry(trade)
+            except Exception as e:
+                logger.debug(f"Telegram entry notify failed: {e}")
+
         logger.trade_entry({
             'order_id': trade['order_id'],
             'symbol': trade.get('symbol', ''),
@@ -967,7 +1000,20 @@ def state_in_trade(tick: Dict, greeks: Dict, state: TradingState,
             })
         except Exception as e:
             logger.warning(f"⚠ DB trade exit logging failed: {e}")
-        
+
+        try:
+            from core.services.database import close_position
+            close_position(state.current_trade.get('order_id'))
+        except Exception as e:
+            logger.warning(f"⚠ Active-position recovery record close failed: {e}")
+
+        if CONFIG['telegram'].get('notify_exits'):
+            try:
+                from core.services.telegram_bot import notify_exit
+                notify_exit(state.current_trade, result.get('pnl_inr', 0), result.get('exit_reason', exit_reason))
+            except Exception as e:
+                logger.debug(f"Telegram exit notify failed: {e}")
+
         # 🔄 STRIKE ROTATION after trade exit (Gemini recommendation)
         # Check if spot has moved 50+ pts from current strike
         if broker.check_and_rotate_strike(trade_direction):
