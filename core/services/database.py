@@ -523,7 +523,7 @@ class DatabaseManager:
             ))
             conn.commit()
             return cursor.lastrowid
-    
+
     def log_exit(self, order_id: str, exit_data: Dict) -> bool:
         """Log trade exit to database"""
         with self._get_connection() as conn:
@@ -553,7 +553,7 @@ class DatabaseManager:
             ))
             conn.commit()
             return cursor.rowcount > 0
-    
+
     def get_trade(self, order_id: str) -> Optional[Dict]:
         """Get trade by order_id"""
         with self._get_connection() as conn:
@@ -580,17 +580,6 @@ class DatabaseManager:
                 WHERE date(entry_time) = ? 
                 ORDER BY entry_time DESC
             ''', (today,))
-            return [dict(row) for row in cursor.fetchall()]
-    
-    def get_trades_by_date(self, date: str) -> List[Dict]:
-        """Get all trades for a specific date"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT * FROM trades 
-                WHERE date(entry_time) = ? 
-                ORDER BY entry_time DESC
-            ''', (date,))
             return [dict(row) for row in cursor.fetchall()]
     
     # ==========================================
@@ -665,65 +654,6 @@ class DatabaseManager:
             conn.commit()
         
         return summary
-    
-    def get_daily_summary(self, date: str = None) -> Optional[Dict]:
-        """Get daily summary"""
-        if date is None:
-            date = datetime.now().strftime('%Y-%m-%d')
-        
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM daily_summary WHERE date = ?', (date,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-    
-    def get_weekly_summary(self) -> List[Dict]:
-        """Get last 7 days summary"""
-        week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT * FROM daily_summary 
-                WHERE date >= ? 
-                ORDER BY date DESC
-            ''', (week_ago,))
-            return [dict(row) for row in cursor.fetchall()]
-    
-    # ==========================================
-    # BOT STATE OPERATIONS
-    # ==========================================
-    
-    def save_bot_state(self, state: Dict) -> bool:
-        """Save current bot state"""
-        today = datetime.now().strftime('%Y-%m-%d')
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT OR REPLACE INTO bot_state (
-                    date, daily_pnl, total_trades, winning_trades,
-                    losing_trades, consecutive_losses, state, last_update
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                today,
-                state.get('daily_pnl', 0),
-                state.get('total_trades', 0),
-                state.get('winning_trades', 0),
-                state.get('losing_trades', 0),
-                state.get('consecutive_losses', 0),
-                state.get('state', 'IDLE'),
-                datetime.now()
-            ))
-            conn.commit()
-            return True
-    
-    def load_bot_state(self) -> Optional[Dict]:
-        """Load today's bot state"""
-        today = datetime.now().strftime('%Y-%m-%d')
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM bot_state WHERE date = ?', (today,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
     
     # ==========================================
     # SIGNAL LOGGING (for strategy analysis)
@@ -1024,57 +954,9 @@ class DatabaseManager:
             conn.commit()
             return cursor.lastrowid
 
-    def get_dvf_calibration(self, calibration_type: Optional[str] = None, limit: int = 30) -> List[Dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            if calibration_type:
-                cursor.execute('SELECT * FROM dvf_calibration WHERE calibration_type = ? ORDER BY created_at DESC LIMIT ?', (calibration_type, limit))
-            else:
-                cursor.execute('SELECT * FROM dvf_calibration ORDER BY created_at DESC LIMIT ?', (limit,))
-            return [dict(row) for row in cursor.fetchall()]
-    
     # ==========================================
     # ANALYTICS QUERIES
     # ==========================================
-    
-    def get_performance_by_hour(self, days: int = 30) -> List[Dict]:
-        """Get performance breakdown by hour"""
-        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT 
-                    strftime('%H', entry_time) as hour,
-                    COUNT(*) as total_trades,
-                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
-                    SUM(pnl) as total_pnl,
-                    AVG(pnl) as avg_pnl
-                FROM trades 
-                WHERE date(entry_time) >= ? AND status = 'CLOSED'
-                GROUP BY hour
-                ORDER BY hour
-            ''', (start_date,))
-            return [dict(row) for row in cursor.fetchall()]
-    
-    def get_performance_by_direction(self, days: int = 30) -> Dict:
-        """Get CE vs PE performance"""
-        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT 
-                    direction,
-                    COUNT(*) as total_trades,
-                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                    SUM(pnl) as total_pnl,
-                    AVG(pnl) as avg_pnl
-                FROM trades 
-                WHERE date(entry_time) >= ? AND status = 'CLOSED'
-                GROUP BY direction
-            ''', (start_date,))
-            rows = cursor.fetchall()
-            return {row['direction']: dict(row) for row in rows}
 
     def get_market_quality_distribution(self, days: int = 30) -> List[Dict]:
         """Get market-quality grade distribution from signal logs."""
@@ -1282,56 +1164,6 @@ class DatabaseManager:
             ''', (start_date,))
             return [dict(row) for row in cursor.fetchall()]
     
-    def get_win_streak(self) -> Dict:
-        """Get current and max win/loss streaks"""
-        trades = self.get_todays_trades()
-        closed = [t for t in trades if t['status'] == 'CLOSED']
-        
-        if not closed:
-            return {'current_streak': 0, 'streak_type': None, 'max_win_streak': 0, 'max_loss_streak': 0}
-        
-        # Sort by exit time
-        closed.sort(key=lambda x: x['exit_time'] or x['entry_time'])
-        
-        current_streak = 0
-        streak_type = None
-        max_win_streak = 0
-        max_loss_streak = 0
-        temp_streak = 0
-        temp_type = None
-        
-        for trade in closed:
-            is_win = trade['pnl'] > 0
-            
-            if temp_type is None:
-                temp_type = 'win' if is_win else 'loss'
-                temp_streak = 1
-            elif (is_win and temp_type == 'win') or (not is_win and temp_type == 'loss'):
-                temp_streak += 1
-            else:
-                if temp_type == 'win':
-                    max_win_streak = max(max_win_streak, temp_streak)
-                else:
-                    max_loss_streak = max(max_loss_streak, temp_streak)
-                temp_type = 'win' if is_win else 'loss'
-                temp_streak = 1
-            
-            current_streak = temp_streak
-            streak_type = temp_type
-        
-        # Update max streaks with final streak
-        if temp_type == 'win':
-            max_win_streak = max(max_win_streak, temp_streak)
-        else:
-            max_loss_streak = max(max_loss_streak, temp_streak)
-        
-        return {
-            'current_streak': current_streak,
-            'streak_type': streak_type,
-            'max_win_streak': max_win_streak,
-            'max_loss_streak': max_loss_streak
-        }
-
     # ==========================================
     # POSITION RECOVERY OPERATIONS
     # ==========================================
@@ -1498,9 +1330,6 @@ def get_dvf_reports(report_type: Optional[str] = None, limit: int = 30) -> List[
 def save_dvf_calibration(calibration_type: str, as_of_date: str, payload: List[Dict]) -> int:
     return db.save_dvf_calibration(calibration_type, as_of_date, payload)
 
-def get_dvf_calibration(calibration_type: Optional[str] = None, limit: int = 30) -> List[Dict]:
-    return db.get_dvf_calibration(calibration_type=calibration_type, limit=limit)
-
 def get_market_quality_distribution(days: int = 30) -> List[Dict]:
     return db.get_market_quality_distribution(days=days)
 
@@ -1521,12 +1350,6 @@ def get_confidence_calibration(days: int = 30) -> List[Dict]:
 
 def get_market_quality_grade_avg_pnl(days: int = 30) -> List[Dict]:
     return db.get_market_quality_grade_avg_pnl(days=days)
-
-def save_state(state: Dict) -> bool:
-    return db.save_bot_state(state)
-
-def load_state() -> Optional[Dict]:
-    return db.load_bot_state()
 
 
 # Position recovery convenience functions

@@ -33,8 +33,7 @@ PTQ-scalping bot/
 ├── tcp/
 ├── tests/
 ├── utils/
-├── venv/
-└── .venv/
+└── venv/
 ```
 
 ## Top-level files and their purpose

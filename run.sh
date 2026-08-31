@@ -44,9 +44,16 @@ G10='\033[38;5;21m'; G11='\033[38;5;93m'; G12='\033[38;5;201m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
+# Single source of truth for the version strings shown in the UI — see VERSION
+# at repo root. Falls back to these literals if the file is ever missing, so a
+# fresh checkout without it still runs (just without a guaranteed-current label).
 BOT_VERSION="v5.1"
 ENGINE_VERSION="v3.5"
 READINESS_VERSION="v2.0.0"
+if [ -f "$SCRIPT_DIR/VERSION" ]; then
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/VERSION"
+fi
 RUN_MODE="menu"
 NO_ANIMATION="false"
 TRADE_LOOKUP_ID=""
@@ -1077,13 +1084,11 @@ run_quick_backtest() {
     local selected="${CSV_FILES[$((fnum-1))]}"
     echo ""
     printf "    ${BCYAN}📈 Running backtest on: ${BWHITE}${selected}${NC}\n"
-    printf "    ${DIM}Using defaults: Capital=₹$(get_env TOTAL_CAPITAL 30000) SL=$(get_env SL_POINTS 7) TP=$(get_env TP_POINTS 14)${NC}\n\n"
+    printf "    ${DIM}Using defaults: Capital=₹$(get_env TOTAL_CAPITAL 30000) | Exit logic: core.engines.exit_engine (live-parity)${NC}\n\n"
 
     "$PYTHON_BIN" core/backtest.py \
         --data "$selected" \
-        --capital "$(get_env TOTAL_CAPITAL 30000)" \
-        --sl "$(get_env SL_POINTS 7)" \
-        --tp "$(get_env TP_POINTS 14)"
+        --capital "$(get_env TOTAL_CAPITAL 30000)"
 
     press_enter
     menu_backtest
@@ -1128,26 +1133,18 @@ run_custom_backtest() {
     bt_capital="${bt_capital:-$def_capital}"
     printf "    ${BGREEN}✓${NC} ₹${bt_capital}\n\n"
 
-    # Step 3: Stop Loss
-    printf "    ${BYELLOW}Step 3: Stop Loss Points${NC}\n"
-    local def_sl
-    def_sl=$(get_env "SL_POINTS" "7")
-    printf "    ${BWHITE}SL points [${def_sl}]: ${NC}"
-    read -r bt_sl
-    bt_sl="${bt_sl:-$def_sl}"
-    printf "    ${BGREEN}✓${NC} ${bt_sl} points\n\n"
+    # Step 3: Day type (exit logic itself comes from core.engines.exit_engine,
+    # the same config/.env-driven logic live uses — not a CLI-tunable SL/TP
+    # simulation anymore, see findings.md/fixed.md §14.1)
+    printf "    ${BYELLOW}Step 3: Day Type${NC}\n"
+    printf "    ${DIM}Passed to the exit engine (NORMAL or EXPIRY)${NC}\n"
+    printf "    ${BWHITE}Day type [NORMAL]: ${NC}"
+    read -r bt_day_type
+    bt_day_type="${bt_day_type:-NORMAL}"
+    printf "    ${BGREEN}✓${NC} ${bt_day_type}\n\n"
 
-    # Step 4: Take Profit
-    printf "    ${BYELLOW}Step 4: Take Profit Points${NC}\n"
-    local def_tp
-    def_tp=$(get_env "TP_POINTS" "14")
-    printf "    ${BWHITE}TP points [${def_tp}]: ${NC}"
-    read -r bt_tp
-    bt_tp="${bt_tp:-$def_tp}"
-    printf "    ${BGREEN}✓${NC} ${bt_tp} points\n\n"
-
-    # Step 5: Output directory
-    printf "    ${BYELLOW}Step 5: Output Directory${NC}\n"
+    # Step 4: Output directory
+    printf "    ${BYELLOW}Step 4: Output Directory${NC}\n"
     printf "    ${BWHITE}Output dir [logs/backtest]: ${NC}"
     read -r bt_output
     bt_output="${bt_output:-logs/backtest}"
@@ -1159,11 +1156,8 @@ run_custom_backtest() {
     draw_line "─" 55 "$BCYAN"
     printf "      Data File    : ${BWHITE}${bt_data}${NC}\n"
     printf "      Capital      : ${BWHITE}₹${bt_capital}${NC}\n"
-    printf "      Stop Loss    : ${BRED}-${bt_sl} pts${NC}\n"
-    printf "      Take Profit  : ${BGREEN}+${bt_tp} pts${NC}\n"
-    local rr
-    rr=$(echo "scale=1; $bt_tp / $bt_sl" | bc 2>/dev/null || echo "?")
-    printf "      R:R Ratio    : ${BWHITE}1:${rr}${NC}\n"
+    printf "      Day Type     : ${BWHITE}${bt_day_type}${NC}\n"
+    printf "      Exit Logic   : ${BWHITE}core.engines.exit_engine (live-parity)${NC}\n"
     printf "      Output       : ${BWHITE}${bt_output}${NC}\n"
     draw_line "─" 55 "$BCYAN"
     echo ""
@@ -1180,8 +1174,7 @@ run_custom_backtest() {
         "$PYTHON_BIN" core/backtest.py \
             --data "$bt_data" \
             --capital "$bt_capital" \
-            --sl "$bt_sl" \
-            --tp "$bt_tp" \
+            --day-type "$bt_day_type" \
             --output "$bt_output"
 
         echo ""
@@ -1378,7 +1371,7 @@ menu_config() {
     printf "      Stop Loss         : ${BRED}-${SL} points${NC}\n"
     printf "      Take Profit       : ${BGREEN}+${TP} points${NC}\n"
     local rr
-    rr=$(echo "scale=0; $TP / $SL" | bc 2>/dev/null || echo "2")
+    rr=$(echo "scale=0; $TP / $SL" | bc 2>/dev/null || echo "?")
     printf "      R:R Ratio         : ${BWHITE}1:${rr}${NC}\n"
     printf "      Trailing SL       : "
     [ "$TSL" = "true" ] && printf "${BGREEN}✓ Enabled${NC}\n" || printf "${BRED}✗ Disabled${NC}\n"
@@ -1668,10 +1661,22 @@ menu_health() {
     if [ -z "$api_key" ] || [ -z "$client_id" ] || [ -z "$password" ] || [ -z "$totp_secret" ]; then
         API_R="SKIP:Missing credentials in .env"
     else
-    API_R=$(timeout 15 "$PYTHON_BIN" -c "
+    # Pass credentials via the subprocess environment, not interpolated into
+    # the -c script text — a process's command line (including -c text) is
+    # visible to any local user via `ps aux`/`/proc/<pid>/cmdline`, while
+    # its environment is restricted to root/same-user via /proc/<pid>/environ.
+    API_R=$(ANGEL_HC_API_KEY="$api_key" ANGEL_HC_CLIENT_ID="$client_id" \
+        ANGEL_HC_PASSWORD="$password" ANGEL_HC_TOTP_SECRET="$totp_secret" \
+        timeout 15 "$PYTHON_BIN" -c "
+import os
 try:
     from brokers.angel_one.client import AngelOneClient
-    c = AngelOneClient('${api_key}', '${client_id}', '${password}', '${totp_secret}')
+    c = AngelOneClient(
+        os.environ['ANGEL_HC_API_KEY'],
+        os.environ['ANGEL_HC_CLIENT_ID'],
+        os.environ['ANGEL_HC_PASSWORD'],
+        os.environ['ANGEL_HC_TOTP_SECRET'],
+    )
     print('OK' if c.login() else 'FAIL')
 except Exception as e:
     print(f'ERR:{e}')
@@ -1734,7 +1739,6 @@ menu_tools() {
     printf "    ${BCYAN}║${NC}   ${BGREEN}[5]${NC} Run Cleanup Script   ${DIM}cleanup.sh${NC}                  ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[6]${NC} View Documentation   ${DIM}README / DOCS${NC}               ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[7]${NC} Bot Monitor Status   ${DIM}Live monitor snapshot${NC}       ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[8]${NC} Market Readiness Pro ${DIM}Pre-open gate + report${NC}      ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[8]${NC} Market Readiness Pro ${DIM}Pre-open gate + report${NC}      ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${BGREEN}[9]${NC} Version & Changelog  ${DIM}Build info and recent updates${NC}  ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${DIM}[0]${NC} ← Back                                             ${BCYAN}║${NC}\n"

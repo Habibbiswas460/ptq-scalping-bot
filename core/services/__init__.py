@@ -12,7 +12,6 @@ def __getattr__(name: str) -> Any:
     for module_name in (
         "core.services.database",
         "core.services.telegram_bot",
-        "core.services.session_manager",
         "core.services.mode_switch",
     ):
         module = import_module(module_name)
