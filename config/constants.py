@@ -32,10 +32,10 @@ ENABLE_WEBSOCKET = env_bool('ENABLE_WEBSOCKET', True)
 TOTAL_CAPITAL = env_int('TOTAL_CAPITAL', 30000)
 # RISK IMPROVEMENT: Reduced from 7% to 1.5% (Professional: 0.5-2%)
 # 3 consecutive losses = 4.5% drawdown (vs 21% before)
-RISK_PER_TRADE = env_float('RISK_PER_TRADE_PCT', 1.5)
-MAX_DAILY_LOSS_PCT = env_float('MAX_DAILY_LOSS_PCT', 5.0)  # 5% max daily loss (₹1500 for 30k)
-MAX_DAILY_LOSS_AMOUNT = env_int('MAX_DAILY_LOSS', 1500)  # Changed from 25000 to 1500
-DAILY_LOSS_ALERT = env_int('DAILY_LOSS_ALERT', 1000)      # Alert at ₹1000 loss
+RISK_PER_TRADE = env_float('RISK_PER_TRADE_PCT', 3)
+MAX_DAILY_LOSS_PCT = env_float('MAX_DAILY_LOSS_PCT', 10.0)  # 10% max daily loss (₹300 for 30k)
+MAX_DAILY_LOSS_AMOUNT = env_int('MAX_DAILY_LOSS', 2500)  # Changed from 25000 to 2500
+DAILY_LOSS_ALERT = env_int('DAILY_LOSS_ALERT', 1500)      # Alert at ₹1500 loss
 PROFIT_LOCK_THRESHOLD = env_int('PROFIT_LOCK_THRESHOLD', 1000)  # Lock profit at ₹1000
 
 # =========================================================
@@ -60,23 +60,19 @@ INDIA_VIX_INSTRUMENTTYPE = 'AMXIDX'
 
 CE_QUANTITY = env_int('CE_QUANTITY', 65)   # Reduced from 260 to 1 lot
 PE_QUANTITY = env_int('PE_QUANTITY', 65)   # Reduced from 156 to 1 lot
-POSITION_SIZING_ENABLED = env_bool('POSITION_SIZING_ENABLED', True)  # ENABLED
 
 # Risk-based position sizing formula:
 # position_size = (capital × risk_pct / SL_amount)
-# Example: (30000 × 1.5% / 520) = 0.86 lots → 1 lot (65 qty)
-POSITION_SIZING_METHOD = env_str('POSITION_SIZING_METHOD', 'risk_based')
-MAX_LOTS = env_int('MAX_LOTS', 2)  # Max 2 lots for 30k capital
-MIN_LOTS = env_int('MIN_LOTS', 1)  # Min 1 lot
+# Example: (capital × 3% / 520) = 0.86 lots → 1 lot (65 qty)
 
 # =========================================================
 # 🛑 STOP LOSS SETTINGS (v3.3 - Improved R:R ratio)
 # =========================================================
 
-SL_POINTS_FIXED = env_int('SL_POINTS', 6)  # Reduced from 8 to 6 (better R:R)
+SL_POINTS_FIXED = env_int('SL_POINTS', 7)  # Reduced from 8 to 7 (better R:R)
 SL_POINTS_MIN = SL_POINTS_FIXED
 SL_POINTS_MAX = SL_POINTS_FIXED
-SL_AMOUNT = env_int('SL_AMOUNT', SL_POINTS_FIXED * LOT_SIZE)  # 6 pts × 65 qty = ₹390
+SL_AMOUNT = env_int('SL_AMOUNT', SL_POINTS_FIXED * LOT_SIZE)  # 7 pts × 65 qty = ₹455
 MAX_LOSS_PER_TRADE_CE = SL_POINTS_FIXED * CE_QUANTITY
 MAX_LOSS_PER_TRADE_PE = SL_POINTS_FIXED * PE_QUANTITY
 STOP_LOSS_AMOUNT = SL_AMOUNT
@@ -86,7 +82,7 @@ STOP_LOSS_PCT = 8.0
 # 🎯 PROFIT TARGETS (v3.3 - R:R = 1:2 minimum)
 # =========================================================
 
-TP_POINTS_FIXED = env_int('TP_POINTS', 12)  # Reduced from 16 to 12 (SL=6, R:R=1:2)
+TP_POINTS_FIXED = env_int('TP_POINTS', 14)  # Reduced from 16 to 14 (SL=7, R:R=1:2)
 TP_MULTIPLIER = env_float('TP_MULTIPLIER', 2.0)
 TP_MULTIPLIER_LOW = TP_MULTIPLIER
 TP_MULTIPLIER_MED = TP_MULTIPLIER
@@ -131,6 +127,98 @@ EXIT_EARLY_CUT_ATR_LOW_POINTS = env_float('EXIT_EARLY_CUT_ATR_LOW_POINTS', 2.5)
 EXIT_EARLY_CUT_ATR_HIGH_POINTS = env_float('EXIT_EARLY_CUT_ATR_HIGH_POINTS', 4.5)
 EXIT_SOFT_LOSS_TIME_SEC = env_int('EXIT_SOFT_LOSS_TIME_SEC', 75)
 EXIT_SOFT_LOSS_POINTS = env_float('EXIT_SOFT_LOSS_POINTS', 1.8)
+# Minimum profit (in option points) before an RSI-reversal exit is allowed to
+# lock in gains. Without this floor the exit fires on any price_diff > 0,
+# locking wins of a few rupees while early-loss-cut losses average ~2.7pts.
+RSI_REVERSAL_MIN_PROFIT_POINTS = env_float('RSI_REVERSAL_MIN_PROFIT_POINTS', 1.5)
+
+# Smart RSI exit thresholds — force-close on RSI extremes / reversals.
+# Previously hardcoded module constants in exit_engine.py; now owner-tunable.
+RSI_OVERBOUGHT = env_float('RSI_OVERBOUGHT', 80)      # Exit CE when RSI > this
+RSI_OVERSOLD = env_float('RSI_OVERSOLD', 20)          # Exit PE when RSI < this
+RSI_EXIT_MIN_PROFIT_POINTS = env_float('RSI_EXIT_MIN_PROFIT_POINTS', 2.0)  # Min profit before RSI overbought/oversold exit is even evaluated
+RSI_REVERSAL_CE_EXIT = env_float('RSI_REVERSAL_CE_EXIT', 60)      # CE: exit once RSI drops back below this
+RSI_REVERSAL_PE_EXIT = env_float('RSI_REVERSAL_PE_EXIT', 40)      # PE: exit once RSI rises back above this
+RSI_REVERSAL_CE_EXTREME = env_float('RSI_REVERSAL_CE_EXTREME', 75)  # CE: must have seen RSI above this before a reversal counts
+RSI_REVERSAL_PE_EXTREME = env_float('RSI_REVERSAL_PE_EXTREME', 25)  # PE: must have seen RSI below this before a reversal counts
+
+# ATR-adaptive SL/TP widening (strategies/smart_scalp_v3.py get_entry_params)
+ATR_SL_HIGH_THRESHOLD = env_float('ATR_SL_HIGH_THRESHOLD', 8)   # ATR above this widens SL/TP
+ATR_SL_LOW_THRESHOLD = env_float('ATR_SL_LOW_THRESHOLD', 4)     # ATR below this tightens SL/TP
+ATR_HIGH_SL_ADJUSTMENT = env_float('ATR_HIGH_SL_ADJUSTMENT', 1)  # Points added to SL when ATR is high
+ATR_HIGH_TP_ADJUSTMENT = env_float('ATR_HIGH_TP_ADJUSTMENT', 2)  # Points added to TP when ATR is high
+ATR_LOW_SL_ADJUSTMENT = env_float('ATR_LOW_SL_ADJUSTMENT', 1)    # Points removed from SL when ATR is low
+ATR_LOW_TP_ADJUSTMENT = env_float('ATR_LOW_TP_ADJUSTMENT', 2)    # Points removed from TP when ATR is low
+ATR_SL_MIN_POINTS = env_float('ATR_SL_MIN_POINTS', 4)            # SL floor when ATR is low
+ATR_TP_MIN_POINTS = env_float('ATR_TP_MIN_POINTS', 10)           # TP floor when ATR is low
+
+# Strike selection premium band (which strike gets chosen — separate from
+# MIN_ENTRY_PREMIUM/MAX_ENTRY_PREMIUM, which gate whether an already-chosen
+# strike is allowed to enter). Previously hardcoded in core/trading/broker.py.
+# Matched to MIN_ENTRY_PREMIUM/MAX_ENTRY_PREMIUM (findings.md §2.6) — this band
+# used to be narrower (90-150) than the entry gate (70-350), so strike
+# selection could rotate away from an ATM strike the entry gate would have
+# allowed, for the same reason MAX_ENTRY_PREMIUM itself was widened from 150.
+STRIKE_PREMIUM_MIN = env_float('STRIKE_PREMIUM_MIN', 70.0)
+STRIKE_PREMIUM_MAX = env_float('STRIKE_PREMIUM_MAX', 350.0)
+
+# Number of consecutive same-direction signals (within a 5s window) required
+# before an entry is taken. Previously a literal inside the CONFIG dict below.
+REQUIRE_CONSECUTIVE_SIGNALS = env_int('REQUIRE_CONSECUTIVE_SIGNALS', 1)
+
+# =========================================================
+# 💰 POSITION SIZE ENGINE (core/engines/position_size_engine.py)
+# =========================================================
+# Previously a Python-only DEFAULT_CONFIG dict with no .env override at all —
+# every value below mirrors that dict's defaults exactly, so this is a pure
+# config-location change unless you edit values here.
+POSITION_SIZE_ENV_CONFIG = {
+    "base": {
+        "default_risk_budget_pct": env_float('POS_SIZE_DEFAULT_RISK_PCT', 0.01),
+        "min_risk_budget_pct": env_float('POS_SIZE_MIN_RISK_PCT', 0.002),
+        "max_risk_budget_pct": env_float('POS_SIZE_MAX_RISK_PCT', 0.02),
+    },
+    "soft_adjustment": {
+        "weights": {
+            "score": env_float('POS_SIZE_WEIGHT_SCORE', 0.18),
+            "confidence": env_float('POS_SIZE_WEIGHT_CONFIDENCE', 0.18),
+            "market_quality": env_float('POS_SIZE_WEIGHT_MARKET_QUALITY', 0.18),
+            "regime": env_float('POS_SIZE_WEIGHT_REGIME', 0.12),
+            "volatility": env_float('POS_SIZE_WEIGHT_VOLATILITY', 0.14),
+            "recovery": env_float('POS_SIZE_WEIGHT_RECOVERY', 0.10),
+            "daily_loss": env_float('POS_SIZE_WEIGHT_DAILY_LOSS', 0.10),
+        },
+        "final_allocation_clamp": [
+            env_float('POS_SIZE_ALLOC_CLAMP_MIN', 0.40),
+            env_float('POS_SIZE_ALLOC_CLAMP_MAX', 1.10),
+        ],
+    },
+    "ranges": {
+        "score": [env_float('POS_SIZE_RANGE_SCORE_MIN', 0.80), env_float('POS_SIZE_RANGE_SCORE_MAX', 1.10)],
+        "confidence": [env_float('POS_SIZE_RANGE_CONFIDENCE_MIN', 0.80), env_float('POS_SIZE_RANGE_CONFIDENCE_MAX', 1.10)],
+        "market_quality": [env_float('POS_SIZE_RANGE_MARKET_QUALITY_MIN', 0.75), env_float('POS_SIZE_RANGE_MARKET_QUALITY_MAX', 1.10)],
+        "regime": [env_float('POS_SIZE_RANGE_REGIME_MIN', 0.85), env_float('POS_SIZE_RANGE_REGIME_MAX', 1.05)],
+        "volatility": [env_float('POS_SIZE_RANGE_VOLATILITY_MIN', 0.70), env_float('POS_SIZE_RANGE_VOLATILITY_MAX', 1.00)],
+        "recovery": [env_float('POS_SIZE_RANGE_RECOVERY_MIN', 0.50), env_float('POS_SIZE_RANGE_RECOVERY_MAX', 1.00)],
+        "daily_loss": [env_float('POS_SIZE_RANGE_DAILY_LOSS_MIN', 0.40), env_float('POS_SIZE_RANGE_DAILY_LOSS_MAX', 1.00)],
+    },
+    "safety_caps": {
+        "max_capital_allocation_pct": env_float('POS_SIZE_MAX_CAPITAL_ALLOCATION_PCT', 0.20),
+        "max_symbol_daily_risk_pct": env_float('POS_SIZE_MAX_SYMBOL_DAILY_RISK_PCT', 0.40),
+        "max_lots": env_int('POS_SIZE_MAX_LOTS', 8),
+        "min_executable_quantity": env_int('POS_SIZE_MIN_EXECUTABLE_QTY', 1),
+        "enforce_lot_rounding": env_bool('POS_SIZE_ENFORCE_LOT_ROUNDING', True),
+        "daily_risk_cap_pct": env_float('POS_SIZE_DAILY_RISK_CAP_PCT', 0.03),
+        "recovery_mode_cap_pct": env_float('POS_SIZE_RECOVERY_MODE_CAP_PCT', 0.50),
+        "min_lot_rounding_tolerance_pct": env_float('POS_SIZE_MIN_LOT_ROUNDING_TOLERANCE_PCT', 0.05),
+    },
+    "allocation_grades": {
+        "A+": env_float('POS_SIZE_GRADE_A_PLUS', 1.02),
+        "A": env_float('POS_SIZE_GRADE_A', 0.95),
+        "B": env_float('POS_SIZE_GRADE_B', 0.85),
+        "C": env_float('POS_SIZE_GRADE_C', 0.70),
+    },
+}
 
 # =========================================================
 # 📊 STRATEGY SCORING
@@ -140,18 +228,18 @@ STRATEGY_NAME = 'smart_scalp_institutional'
 STRATEGY_VERSION = '3.4'
 MIN_SCORE_TO_TRADE = env_int('MIN_SCORE', 4)  # v3.4 entry gate lowered to 4
 MIN_CONFIDENCE = env_int('MIN_CONFIDENCE', 70)  # Balanced: 70% (was 80, too strict)
-MIN_CONFIDENCE_AFTER_3SL = env_int('MIN_CONFIDENCE_AFTER_3SL', 85)  # After 3 consecutive SL (was 92)
+MIN_CONFIDENCE_AFTER_3SL = env_int('MIN_CONFIDENCE_AFTER_3SL', 85)  # After 5 consecutive SL (was 92)
 MAX_CONFIDENCE_SCORE = env_int('MAX_CONFIDENCE_SCORE', 11)  # 11-factor scoring model
 
 # Entry Price Filter (ATM nearby range)
-MIN_ENTRY_PREMIUM = env_float('MIN_ENTRY_PREMIUM', 80.0)   # Min ₹80
+MIN_ENTRY_PREMIUM = env_float('MIN_ENTRY_PREMIUM', 70.0)   # Min ₹70
 MAX_ENTRY_PREMIUM = env_float('MAX_ENTRY_PREMIUM', 350.0)  # Max ₹350 (was 150, blocked all ATM options)
 
 # =========================================================
 # ⏱️ TRADING LIMITS
 # =========================================================
 
-MAX_TRADES_PER_DAY = env_int('MAX_TRADES_PER_DAY', 15)
+MAX_TRADES_PER_DAY = env_int('MAX_TRADES_PER_DAY', 30)
 MAX_TRADES_PER_HOUR = env_int('MAX_TRADES_PER_HOUR', 10)
 IDEAL_TRADES_PER_DAY = env_int('IDEAL_TRADES_PER_DAY', 8)
 
@@ -164,30 +252,37 @@ MAX_HOLD_TIME_WINNING = env_int('MAX_HOLD_TIME_SEC', 900)
 MAX_HOLD_TIME_LOSING = MAX_HOLD_TIME_WINNING
 MAX_HOLD_TIME_EXPIRY = env_int('MAX_HOLD_TIME_EXPIRY_SEC', 600)
 CONSECUTIVE_LOSS_LIMIT = env_int('CONSECUTIVE_LOSS_LIMIT', 2)
-PAUSE_AFTER_LOSS_SEC = env_int('COOLDOWN_AFTER_CONSEC_LOSS', 1200)
+PAUSE_AFTER_LOSS_SEC = env_int('COOLDOWN_AFTER_CONSEC_LOSS', 900)
 
 # =========================================================
 # ⏸️ COOLDOWN
 # =========================================================
 
-COOLDOWN_NORMAL_SEC = env_int('COOLDOWN_NORMAL', 180)
-COOLDOWN_AFTER_PROFIT_SEC = env_int('COOLDOWN_AFTER_PROFIT', 120)
-COOLDOWN_AFTER_SL_SEC = env_int('COOLDOWN_AFTER_SL', 300)
-COOLDOWN_AFTER_CONSECUTIVE_LOSS = env_int('COOLDOWN_AFTER_CONSEC_LOSS', 1200)
+COOLDOWN_NORMAL_SEC = env_int('COOLDOWN_NORMAL', 120)
+COOLDOWN_AFTER_PROFIT_SEC = env_int('COOLDOWN_AFTER_PROFIT', 30)
+COOLDOWN_AFTER_SL_SEC = env_int('COOLDOWN_AFTER_SL', 120)
+COOLDOWN_AFTER_CONSECUTIVE_LOSS = env_int('COOLDOWN_AFTER_CONSEC_LOSS', 900)
 COOLDOWN_EXPIRY_NORMAL = 120
 COOLDOWN_EXPIRY_AFTER_SL = 180
+# No capital was ever at risk on these blocks (risk-gate block, execution-drift
+# skip, position-size-zero, order failure) — much shorter than a real trade's
+# cooldown so the bot can retry once conditions change, not sit out a full
+# post-trade cooldown for a trade that never happened.
+COOLDOWN_NON_TRADE_BLOCK_SEC = env_int('COOLDOWN_NON_TRADE_BLOCK', 15)
 
 # =========================================================
 # 🚨 KILL SWITCH (UPDATED v3.1 - Tighter Risk Control)
 # =========================================================
 
 KILL_SWITCH_ENABLED = env_bool('KILL_SWITCH_ENABLED', True)
-# Reduced from 900 to 450 (1.5% of 30k capital)
-KILL_SWITCH_LOSS = env_int('KILL_SWITCH_LOSS', 450)
+# Reduced from 900 to 600 (2% of 30k capital). Must stay below
+# MAX_DAILY_LOSS_AMOUNT so this dedicated kill switch actually fires
+# before (not after) the generic daily-loss check in kill_switch.py.
+KILL_SWITCH_LOSS = env_int('KILL_SWITCH_LOSS', 600)
 KILL_SWITCH_DAILY_LOSS = KILL_SWITCH_LOSS
-KILL_SWITCH_CONSEC_LOSS = env_int('KILL_SWITCH_CONSEC_LOSS', 3)
+KILL_SWITCH_CONSEC_LOSS = env_int('KILL_SWITCH_CONSEC_LOSS', 5)
 KILL_SWITCH_SPREAD = env_float('KILL_SWITCH_SPREAD_PCT', 0.6)
-KILL_SWITCH_LATENCY = env_int('KILL_SWITCH_LATENCY_MS', 100)
+KILL_SWITCH_LATENCY = env_int('KILL_SWITCH_LATENCY_MS', 1500)
 
 # =========================================================
 # ⏰ MARKET HOURS
@@ -204,7 +299,7 @@ AVOID_FIRST_15MIN = env_bool('AVOID_FIRST_15MIN', True)
 # =========================================================
 
 DELTA_MIN = env_float('DELTA_MIN', 0.25)
-DELTA_MAX = env_float('DELTA_MAX', 0.75)
+DELTA_MAX = env_float('DELTA_MAX', 0.80)
 DELTA_KILL_MIN = env_float('DELTA_KILL_MIN', 0.15)
 GAMMA_NORMAL_MAX = env_float('GAMMA_NORMAL_MAX', 0.08)
 GAMMA_EXPIRY_MAX = env_float('GAMMA_EXPIRY_MAX', 0.12)
@@ -219,7 +314,7 @@ EMA_FAST = env_int('EMA_FAST', 5)
 EMA_SIGNAL = env_int('EMA_SIGNAL', 9)
 EMA_MEDIUM = env_int('EMA_MEDIUM', 21)
 EMA_SLOW = env_int('EMA_SLOW', 50)
-RSI_PERIOD = env_int('RSI_PERIOD', 14)
+RSI_PERIOD = env_int('RSI_PERIOD', 18)
 MACD_FAST = env_int('MACD_FAST', 12)
 MACD_SLOW = env_int('MACD_SLOW', 26)
 MACD_SIGNAL = env_int('MACD_SIGNAL', 9)
@@ -235,9 +330,9 @@ KC_ATR_MULT = 1.5
 
 LATENCY_LIMIT_MS = env_int('LATENCY_LIMIT_MS', 100)
 SPREAD_LIMIT_PCT = env_float('SPREAD_LIMIT_PCT', 2.5)  # Options have 0.5-2.5% spread, especially near expiry/EOD
-TICK_TIMEOUT_SEC = env_int('TICK_TIMEOUT_SEC', 2)
+TICK_TIMEOUT_SEC = env_int('TICK_TIMEOUT_SEC', 3)
 MIN_VOLUME = env_int('MIN_VOLUME', 100)
-MIN_OPTION_PRICE = env_int('MIN_OPTION_PRICE', 5)
+MIN_OPTION_PRICE = env_int('MIN_OPTION_PRICE', 1)
 MAX_OPTION_PRICE = env_int('MAX_OPTION_PRICE', 500)
 STALE_THRESHOLD_MS_WEBSOCKET = env_int('WS_STALE_MS', 10000)
 STALE_THRESHOLD_MS_REST = env_int('REST_STALE_MS', 5000)
@@ -264,7 +359,7 @@ MAX_SLIPPAGE_PCT = env_float('MAX_SLIPPAGE_PCT', 0.5)
 
 # Execution guard: skip entries when signal becomes stale or price drifts too far.
 ENTRY_SIGNAL_MAX_AGE_MS = env_int('ENTRY_SIGNAL_MAX_AGE_MS', 2500)
-ENTRY_MAX_DRIFT_PCT = env_float('ENTRY_MAX_DRIFT_PCT', 0.35)
+ENTRY_MAX_DRIFT_PCT = env_float('ENTRY_MAX_DRIFT_PCT', 0.75)
 
 # Order retry settings
 ORDER_RETRY_ENABLED = env_bool('ORDER_RETRY_ENABLED', True)
@@ -367,29 +462,16 @@ CONFIG = {
         'consecutive_loss_limit': CONSECUTIVE_LOSS_LIMIT,
         'consecutive_win_limit': 8,
         'pause_after_consecutive_loss_sec': PAUSE_AFTER_LOSS_SEC,
-        'position_sizing_enabled': POSITION_SIZING_ENABLED,
-        'position_sizing_method': POSITION_SIZING_METHOD,
-        'min_lots': MIN_LOTS,
-        'max_lots': MAX_LOTS,
-        'min_position_size': 1,
         'capital_utilization_pct': 80,
         'atr_risk_multiplier': 2.0,
         'vix_low_threshold': 12.0,
         'vix_high_threshold': 20.0,
-        'position_size_low_vix': 1.25,
-        'position_size_high_vix': 0.5,
-        'position_size_normal_vix': 1.0,
-        # Trailing SL (risk_manager version)
-        'trailing_sl_enabled': TRAILING_ENABLED,
-        'trailing_activation_amount': 50,
-        'trailing_atr_multiplier': 1.5,
-        'trailing_lock_pct': 40,
     },
     'entry_filters': {
         'avoid_first_15min': AVOID_FIRST_15MIN,
         'min_volume_ratio': 1.2,
         'volume_confirmation_required': False,
-        'require_consecutive_signals': 1,
+        'require_consecutive_signals': REQUIRE_CONSECUTIVE_SIGNALS,
         'signal_max_age_ms': ENTRY_SIGNAL_MAX_AGE_MS,
         'max_entry_drift_pct': ENTRY_MAX_DRIFT_PCT,
         'time_based_sizing_enabled': False,
@@ -411,10 +493,12 @@ CONFIG = {
     },
     'cooldown': {
         'normal_sec': COOLDOWN_NORMAL_SEC,
+        'after_profit_sec': COOLDOWN_AFTER_PROFIT_SEC,
         'after_sl_sec': COOLDOWN_AFTER_SL_SEC,
         'after_consecutive_loss_sec': COOLDOWN_AFTER_CONSECUTIVE_LOSS,
         'expiry_normal_sec': COOLDOWN_EXPIRY_NORMAL,
         'expiry_after_sl_sec': COOLDOWN_EXPIRY_AFTER_SL,
+        'non_trade_block_sec': COOLDOWN_NON_TRADE_BLOCK_SEC,
     },
     'greeks_limits': {
         'delta_min': DELTA_MIN,

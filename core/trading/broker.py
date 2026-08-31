@@ -30,7 +30,9 @@ from config.constants import (
     ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET,
     SL_POINTS_FIXED, TP_POINTS_FIXED, CE_QUANTITY, PE_QUANTITY,
     TOTAL_CAPITAL, MIN_ENTRY_PREMIUM, MAX_ENTRY_PREMIUM,
+    MAX_LOSS_PER_TRADE_CE, MAX_LOSS_PER_TRADE_PE,
     STALE_THRESHOLD_MS_REST,
+    STRIKE_PREMIUM_MIN, STRIKE_PREMIUM_MAX,
     # v3.1 Order execution config
     USE_LIMIT_ORDERS, LIMIT_ORDER_OFFSET, MAX_SLIPPAGE_PCT,
     ORDER_RETRY_ENABLED, ORDER_MAX_RETRIES, ORDER_RETRY_DELAY_MS, ORDER_PRICE_CHASE_STEP
@@ -40,10 +42,6 @@ from config.constants import (
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 SCRIP_MASTER_CACHE_FILE = Path("core/data/scripmaster_nifty_nfo.json")
 SCRIP_MASTER_CACHE_TTL_SEC = 6 * 60 * 60
-
-# Premium range for strike selection (use tighter range than entry filter)
-STRIKE_PREMIUM_MIN = 90.0   # Minimum premium for strike selection
-STRIKE_PREMIUM_MAX = 150.0  # Maximum premium for strike selection
 
 
 class BrokerInterface:
@@ -62,6 +60,10 @@ class BrokerInterface:
         self.spot_price: float = 0.0
         self._current_expiry: Optional[str] = None
         self._option_token: Optional[str] = None
+
+        # Last known-good historical candles, keyed by "exchange:token:interval"
+        # (fallback source when the broker API rate-limits a fetch)
+        self._historical_candles_cache: Dict[str, Dict[str, Any]] = {}
 
         # WebSocket tick state (thread-safe)
         self._tick_lock = threading.Lock()
@@ -118,6 +120,14 @@ class BrokerInterface:
         self._last_spot_fetch: float = 0
         self._last_option_fetch: float = 0
         self._cached_option_tick: Optional[Dict] = None
+
+        # Strike rotation guardrails: prevent re-subscription churn during WS stress
+        self._last_strike_rotation_time: float = 0.0
+        self._strike_rotation_cooldown_sec: int = 180
+        self._last_ws_reconnect_time: float = 0.0
+        self._ws_reconnect_stress_cooldown_sec: int = 180
+        self._last_ws_ack_timeout_time: float = 0.0
+        self._ws_ack_timeout_cooldown_sec: int = 180
 
         # Simulation state (for paper trading without live data)
         self._simulated_premium: Optional[float] = None
@@ -345,6 +355,10 @@ class BrokerInterface:
         """
         Check if strike needs rotation based on PREMIUM (not just spot movement).
         Select ATM/OTM/ITM based on which has premium in ₹90-150 range.
+
+        Guardrails:
+        - Do not rotate again immediately after a recent rotation.
+        - Do not churn WebSocket during reconnect / transport stress.
         
         Args:
             direction: 'CE' or 'PE' - if provided, rotates to this direction
@@ -354,13 +368,52 @@ class BrokerInterface:
         """
         if not self.spot_price or self.spot_price < 10000:
             return False
+
+        if self._ws_circuit_open:
+            if self.logger:
+                self.logger.debug("⏳ Strike rotation skipped: WS circuit breaker is open")
+            return False
+
+        now_ts = time.time()
+        if self._last_strike_rotation_time and (now_ts - self._last_strike_rotation_time) < self._strike_rotation_cooldown_sec:
+            if self.logger:
+                self.logger.debug(
+                    "⏳ Strike rotation skipped: cooldown active for "
+                    f"{self._strike_rotation_cooldown_sec}s"
+                )
+            return False
+
+        if self._last_ws_ack_timeout_time and (now_ts - self._last_ws_ack_timeout_time) < self._ws_ack_timeout_cooldown_sec:
+            if self.logger:
+                self.logger.debug(
+                    "⏳ Strike rotation skipped: recent ACK timeout stress detected "
+                    f"({int(now_ts - self._last_ws_ack_timeout_time)}s ago)"
+                )
+            return False
+
+        if self._last_ws_reconnect_time and (now_ts - self._last_ws_reconnect_time) < self._ws_reconnect_stress_cooldown_sec:
+            if self.logger:
+                self.logger.debug(
+                    "⏳ Strike rotation skipped: recent reconnect churn detected "
+                    f"({int(now_ts - self._last_ws_reconnect_time)}s ago)"
+                )
+            return False
+
+        if self._last_ws_ack_timeout_time and (now_ts - self._last_ws_ack_timeout_time) < self._ws_ack_timeout_cooldown_sec:
+            if self.logger:
+                self.logger.debug(
+                    "⏳ Strike rotation skipped: recent ACK timeout stress detected "
+                    f"({int(now_ts - self._last_ws_ack_timeout_time)}s ago)"
+                )
+            return False
         
         opt_type = direction if direction else OPTION_TYPE
         
         # Get current option premium
         current_premium = 0
-        if self.last_tick:
-            current_premium = self.last_tick.get('ltp', 0)
+        with self._tick_lock:
+            if self.last_tick:
+                current_premium = self.last_tick.get('ltp', 0)
         
         # Check if premium is out of range
         need_rotation = False
@@ -394,24 +447,29 @@ class BrokerInterface:
             strike_type = "ATM" if best_strike == atm_strike else ("OTM" if (opt_type == 'CE' and best_strike > atm_strike) or (opt_type == 'PE' and best_strike < atm_strike) else "ITM")
             self.logger.info(f"🔄 STRIKE ROTATION: {old_strike} → {self.current_strike} ({strike_type}) | Premium: ₹{best_premium:.0f}")
             self.logger.info(f"   Symbol: {old_symbol} → {self.current_symbol}")
+            self._last_strike_rotation_time = time.time()
             
-            # Re-subscribe WebSocket to new token
+            # Re-subscribe WebSocket to new token using MAKE-BEFORE-BREAK (Overlapping)
             if self._ws_connected and self.broker_client and self._option_token:
                 try:
-                    if old_token:
-                        if not self._unsubscribe_with_verify([(EXCHANGE, old_token, 2)]):
-                            self.logger.warning(f"⚠ Old token unsubscribe failed: {old_token}")
-
+                    # 1. Subscribe to new token FIRST (so data flow doesn't break)
                     if not self._subscribe_with_retry([(EXCHANGE, self._option_token, 2)]):
                         self.logger.warning(f"⚠ WebSocket re-subscribe failed for {self._option_token}")
                     else:
                         self.logger.info(f"🔌 WebSocket re-subscribed to {self.current_symbol}")
+
+                    # 2. Unsubscribe old token SECOND
+                    if old_token and old_token != self._option_token:
+                        if not self._unsubscribe_with_verify([(EXCHANGE, old_token, 2)]):
+                            self.logger.warning(f"⚠ Old token unsubscribe failed: {old_token}")
+
                 except Exception as e:
-                    self.logger.warning(f"⚠ WebSocket re-subscribe failed: {e}")
+                    self.logger.warning(f"⚠ WebSocket re-subscribe/unsubscribe failed: {e}")
 
             self._cached_option_tick = None
-            self.last_tick = None
-            
+            with self._tick_lock:
+                self.last_tick = None
+
             return True
         
         return False
@@ -452,7 +510,7 @@ class BrokerInterface:
         best_premium = 0
         best_distance_from_mid = float('inf')  # Prefer premium closer to middle of range
         
-        mid_premium = (STRIKE_PREMIUM_MIN + STRIKE_PREMIUM_MAX) / 2  # ₹120
+        mid_premium = (STRIKE_PREMIUM_MIN + STRIKE_PREMIUM_MAX) / 2  # ₹210 (post-§2.6 widening)
         
         for strike in strikes_to_check:
             if strike <= 0:
@@ -645,6 +703,9 @@ class BrokerInterface:
             )
             # Register disconnect callback so BrokerInterface knows when WS dies
             self.broker_client._broker_ws_disconnect_cb = self._on_ws_disconnect
+            
+            # Register explicit ACK timeout callback so we can record transport stress without severing the socket
+            self.broker_client._broker_ws_ack_timeout_cb = lambda: setattr(self, '_last_ws_ack_timeout_time', time.time())
 
             # Wait until WebSocket reports connected or timeout
             start_time = time.time()
@@ -703,8 +764,12 @@ class BrokerInterface:
                 self.logger.info(f"WebSocket disconnect ignored during shutdown: {reason}")
             return
 
-        # Broker-side connection limit (HTTP 429) should not trigger reconnect storms.
         reason_text = str(reason or "").lower()
+
+        if "ack timeout" in reason_text:
+            self._last_ws_ack_timeout_time = time.time()
+
+        # Broker-side connection limit (HTTP 429) should not trigger reconnect storms.
         is_conn_limit = (
             "429" in reason_text
             or "connection limit exceeded" in reason_text
@@ -789,6 +854,8 @@ class BrokerInterface:
 
                     time.sleep(current_delay)
 
+                    self._last_ws_reconnect_time = time.time()
+
                     if self.broker_client:
                         try:
                             self.broker_client.stop_websocket()
@@ -851,8 +918,13 @@ class BrokerInterface:
                     original_tick_age = time.time() - self._ws_original_tick_time if self._ws_original_tick_time else 999
                     
                     if self._ws_connected and time_since_last_tick > self._ws_heartbeat_timeout:
+                        now_dt = datetime.now()
+                        is_premarket = now_dt.hour < 9 or (now_dt.hour == 9 and now_dt.minute < 15)
+                        is_weekend = now_dt.weekday() >= 5
+
                         # If original tick data is still fresh enough, avoid reconnect churn.
-                        if has_usable_cache and original_tick_age < 120:
+                        # Also do not force disconnects during pre-market or weekends as ticks won't arrive.
+                        if (has_usable_cache and original_tick_age < 120) or is_premarket or is_weekend:
                             # Log once per minute that we're using REST refresh
                             if int(time_since_last_tick) % 60 == 0:
                                 self.logger.info(f"ℹ WebSocket quiet ({time_since_last_tick:.0f}s), REST keeping data fresh ({original_tick_age:.0f}s old)")
@@ -1129,6 +1201,82 @@ class BrokerInterface:
         return None
 
     # =========================================================================
+    # HISTORICAL DATA — Indicator Warm-Up
+    # =========================================================================
+
+    def get_historical_candles(self, exchange: str, token: str, interval: str = "FIVE_MINUTE", days_back: int = 2, max_retries: int = 3) -> List[Dict[str, Any]]:
+        """
+        Fetch historical OHLC data to warm up indicators.
+        Retries with backoff on transient/rate-limit failures, falling back to the
+        last known-good fetch for this symbol if every retry is exhausted.
+        Returns a list of standardized candle dicts.
+        """
+        if not self.broker_client:
+            return []
+
+        cache_key = f"{exchange}:{token}:{interval}"
+        now = datetime.now()
+        from_date = (now - timedelta(days=days_back)).strftime("%Y-%m-%d %H:%M")
+        to_date = now.strftime("%Y-%m-%d %H:%M")
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                raw_candles = self.broker_client.get_candle_data(
+                    symbol_token=token,
+                    exchange=exchange,
+                    interval=interval,
+                    from_date=from_date,
+                    to_date=to_date
+                )
+
+                formatted = []
+                if raw_candles:
+                    for c in raw_candles:
+                        if len(c) >= 6:
+                            # AngelOne format: [timestamp, open, high, low, close, volume]
+                            formatted.append({
+                                "timestamp": c[0],
+                                "open": float(c[1]),
+                                "high": float(c[2]),
+                                "low": float(c[3]),
+                                "close": float(c[4]),
+                                "volume": int(c[5])
+                            })
+
+                if formatted:
+                    self._historical_candles_cache[cache_key] = {"candles": formatted, "cached_at": now}
+                    if self.logger:
+                        self.logger.info(f"📊 Fetched {len(formatted)} historical candles for {exchange}:{token}")
+                    return formatted
+
+                if self.logger:
+                    self.logger.warning(f"⚠ Historical candle fetch returned 0 rows for {exchange}:{token}")
+                break  # Empty-but-successful response — retrying won't help, fall through to cache.
+            except Exception as e:
+                if attempt < max_retries:
+                    backoff_sec = min(2 * (2 ** (attempt - 1)), 10) + random.uniform(0, 1)
+                    if self.logger:
+                        self.logger.warning(
+                            f"⚠ Historical candle fetch failed (attempt {attempt}/{max_retries}): {e} — retrying in {backoff_sec:.1f}s"
+                        )
+                    time.sleep(backoff_sec)
+                else:
+                    if self.logger:
+                        self.logger.warning(f"⚠ Historical candle fetch failed after {max_retries} attempts: {e}")
+
+        cached = self._historical_candles_cache.get(cache_key)
+        if cached and cached.get("candles"):
+            age_sec = (datetime.now() - cached["cached_at"]).total_seconds()
+            if self.logger:
+                self.logger.warning(
+                    f"♻ Using stale cached historical candles for {exchange}:{token} "
+                    f"(age {age_sec:.0f}s, {len(cached['candles'])} candles)"
+                )
+            return cached["candles"]
+
+        return []
+
+    # =========================================================================
     # GET TICK — unified entry point
     # =========================================================================
 
@@ -1364,7 +1512,7 @@ class BrokerInterface:
             self._option_token = self._get_token(option_symbol, EXCHANGE)
             self.logger.info(f"📍 Symbol switched: {old_symbol} → {option_symbol}")
             
-            # Re-subscribe WebSocket to new symbol
+            # Re-subscribe WebSocket to new symbol using MAKE-BEFORE-BREAK (Overlapping)
             if USE_LIVE_DATA and ENABLE_WEBSOCKET and self._ws_connected:
                 if self.broker_client and self._option_token:
                     try:
@@ -1373,16 +1521,17 @@ class BrokerInterface:
                             self.last_tick = None
                             self._tick_buffer.clear()
                         
-                        # Unsubscribe old token first to avoid stale data
-                        if old_token:
-                            if not self._unsubscribe_with_verify([(EXCHANGE, old_token, 2)]):
-                                self.logger.warning(f"⚠ Old token unsubscribe failed: {old_token}")
-
+                        # 1. Subscribe to new token FIRST to ensure data flow
                         if not self._subscribe_with_retry([(EXCHANGE, self._option_token, 2)]):
                             self.logger.warning(f"⚠ WebSocket re-subscribe failed for {self._option_token}")
                             return None
 
                         self.logger.info(f"🔌 WebSocket re-subscribed to {option_symbol}")
+
+                        # 2. Unsubscribe old token SECOND
+                        if old_token and old_token != self._option_token:
+                            if not self._unsubscribe_with_verify([(EXCHANGE, old_token, 2)]):
+                                self.logger.warning(f"⚠ Old token unsubscribe failed: {old_token}")
 
                     except Exception as e:
                         self.logger.warning(f"⚠ WebSocket re-subscribe failed: {e}")
@@ -1687,18 +1836,26 @@ class BrokerInterface:
 
         pnl_inr = price_diff * qty
 
-        # FIX: If exit engine already calculated capped PnL, use it
-        # This prevents mismatch when tick sources differ
+        # Trust the real bid/ask tick-based PnL as the realized value for both
+        # wins and losses — it correctly reflects spread cost either way.
+        # Previously, any loss unconditionally used the exit engine's
+        # LTP-based estimate instead, which meant losing exits never paid
+        # spread cost while winning exits did (an inconsistent accounting,
+        # not an intentional one). The engine's capped value is still applied,
+        # but only as a hard floor so no loss ever exceeds the configured max.
         if 'current_pnl' in trade and trade['current_pnl'] != 0:
             engine_pnl = trade['current_pnl']
-            # Use engine PnL if it's a loss (exit engine caps losses properly)
-            if engine_pnl < 0:
-                pnl_inr = engine_pnl
-                self.logger.info(f"   Using exit engine PnL: ₹{pnl_inr:+.2f} (capped)")
-            # For profits, also trust exit engine when tick-based PnL is suspicious (e.g. zero)
-            elif abs(pnl_inr) < 0.01 and abs(engine_pnl) > 0.01:
+            # For profits, trust the engine when tick-based PnL is suspicious (e.g. zero).
+            if engine_pnl > 0 and abs(pnl_inr) < 0.01:
                 pnl_inr = engine_pnl
                 self.logger.info(f"   Using exit engine PnL: ₹{pnl_inr:+.2f} (tick PnL was zero)")
+
+        if pnl_inr < 0:
+            direction = trade.get('direction', 'CE')
+            max_loss = MAX_LOSS_PER_TRADE_CE if direction == 'CE' else MAX_LOSS_PER_TRADE_PE
+            if pnl_inr < -max_loss:
+                self.logger.info(f"   PnL floored: ₹{pnl_inr:+.2f} -> ₹{-max_loss:+.2f} (max loss cap)")
+                pnl_inr = -max_loss
 
         pnl_pct = (pnl_inr / total_capital) * 100
         hold_time = (datetime.now() - trade['entry_time']).total_seconds()

@@ -23,8 +23,8 @@ def test_real_trade_sequence_caps_loss(monkeypatch):
 
     # Prevent immediate TP exit by raising TP threshold
     monkeypatch.setattr(exit_engine, 'TP_POINTS_FIXED', 9999)
-    # Prevent aggressive trailing SL lock from max profit
-    monkeypatch.setattr(exit_engine, 'TRAILING_DISTANCE', 1000)
+    # Disable trailing for this regression sequence.
+    monkeypatch.setattr(exit_engine, 'TRAILING_ENABLED', False)
 
     # Tick 1: +79
     tick1 = {'ltp': entry_price + 79, 'atr': 1.0}

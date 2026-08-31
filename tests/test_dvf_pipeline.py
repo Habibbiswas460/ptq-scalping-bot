@@ -109,6 +109,74 @@ def test_decision_replay_reconstructs_timeline(monkeypatch, tmp_path):
     assert "virtual_exit" in stages
 
 
+def test_compute_trade_mfe_mae_from_ticks():
+    from core.validation.analytics import compute_trade_mfe_mae_from_ticks
+
+    trade = {"entry_price": 100.0, "direction": "CE", "qty": 2}
+    ticks = [{"ltp": 95.0}, {"ltp": 108.0}, {"ltp": 103.0}]
+
+    result = compute_trade_mfe_mae_from_ticks(trade, ticks)
+    assert result["mfe"] == 16.0
+    assert result["mae"] == -10.0
+
+
+def test_recent_sessions_trade_mfe_mae_summary(monkeypatch, tmp_path):
+    db_module = _reload_database_to_tmp(monkeypatch, tmp_path)
+    import core.validation.analytics as analytics
+
+    analytics_module = importlib.reload(analytics)
+
+    db_module.log_trade_entry({
+        "order_id": "sess-a",
+        "symbol": "NIFTY",
+        "direction": "CE",
+        "side": "BUY",
+        "qty": 1,
+        "entry_price": 100.0,
+        "entry_time": datetime(2026, 8, 3, 9, 15),
+        "entry_reason": "test",
+    })
+    db_module.log_trade_exit("sess-a", {
+        "exit_price": 105.0,
+        "exit_time": datetime(2026, 8, 3, 9, 45),
+        "exit_reason": "target",
+        "pnl": 5,
+        "pnl_pct": 5,
+        "hold_time_sec": 1800,
+        "mfe": 120.0,
+        "mae": -80.0,
+    })
+
+    db_module.log_trade_entry({
+        "order_id": "sess-b",
+        "symbol": "NIFTY",
+        "direction": "PE",
+        "side": "BUY",
+        "qty": 1,
+        "entry_price": 100.0,
+        "entry_time": datetime(2026, 8, 2, 9, 15),
+        "entry_reason": "test",
+    })
+    db_module.log_trade_exit("sess-b", {
+        "exit_price": 92.0,
+        "exit_time": datetime(2026, 8, 2, 9, 45),
+        "exit_reason": "stop",
+        "pnl": -8,
+        "pnl_pct": -8,
+        "hold_time_sec": 1800,
+        "mfe": 60.0,
+        "mae": -110.0,
+    })
+
+    summary = analytics_module.recent_sessions_trade_mfe_mae_summary(3, end_date="2026-08-03")
+    assert summary[0]["session_date"] == "2026-08-03"
+    assert summary[0]["trade_count"] == 1
+    assert summary[0]["max_mfe"] == 120.0
+    assert summary[0]["max_adverse_move"] == 80.0
+    assert summary[1]["trade_count"] == 1
+    assert summary[2]["trade_count"] == 0
+
+
 def test_calibration_and_report_and_export(monkeypatch, tmp_path):
     db_module = _reload_database_to_tmp(monkeypatch, tmp_path)
     import core.validation.signal_logger as signal_logger
@@ -139,7 +207,10 @@ def test_calibration_and_report_and_export(monkeypatch, tmp_path):
     report = validation_report.generate_daily_validation_report()
     rendered = validation_report.render_daily_validation_report(report)
     assert "DVF DAILY REPORT" in rendered
+    assert "MFE/MAE" in rendered
     assert report["signal_summary"]["total_signals"] >= 3
+    assert report["mfe_mae_summary"]["trades"] >= 3
+    assert report["mfe_mae_summary"]["avg_mfe"] >= 0
 
     historical_report = validation_report.generate_daily_validation_report("2000-01-01")
     assert historical_report["signal_summary"]["total_signals"] == 0

@@ -39,7 +39,11 @@ from config.constants import (
     MIN_SCORE_TO_TRADE, MIN_CONFIDENCE,
     MAX_CONFIDENCE_SCORE,
     MIN_ENTRY_PREMIUM, MAX_ENTRY_PREMIUM,
-    TP_MULTIPLIER
+    TP_MULTIPLIER,
+    ATR_SL_HIGH_THRESHOLD, ATR_SL_LOW_THRESHOLD,
+    ATR_HIGH_SL_ADJUSTMENT, ATR_HIGH_TP_ADJUSTMENT,
+    ATR_LOW_SL_ADJUSTMENT, ATR_LOW_TP_ADJUSTMENT,
+    ATR_SL_MIN_POINTS, ATR_TP_MIN_POINTS,
 )
 
 try:
@@ -378,31 +382,54 @@ class SmartScalpV3:
         
         Uses simulated/broker tick data for indicators.
         """
-        # Need at least 60 ticks for reliable indicators
-        if len(ticks) < 60:
-            return {}
+        prices, highs, lows, volumes = [], [], [], []
         
-        # Use spot_price for indicators (NIFTY spot), ltp for option premium
-        prices = [t.get('spot_price', t.get('ltp', 0)) for t in ticks]
-        volumes = [t.get('volume', 10000) for t in ticks]
-        
-        # Validate prices - use ltp if spot_price is invalid
-        if prices and prices[-1] < 1000:
-            prices = [t['ltp'] for t in ticks]
-        
-        # Calculate high/low from prices
-        highs = []
-        lows = []
-        chunk_size = max(1, len(prices) // 60)  # ~1 minute chunks
-        
-        for i in range(0, len(prices), chunk_size):
-            chunk_prices = prices[i:i+chunk_size]
-            if chunk_prices:
-                highs.append(max(chunk_prices))
-                lows.append(min(chunk_prices))
-        
-        if len(highs) < 30:
-            return {}
+        # P0 FIX: Prioritize true 5-min OHLC canonical candles if available in live/paper mode.
+        chunk_size = 1
+        try:
+            from core.runtime.state import runtime_state
+            canonical = runtime_state.get_canonical_candles(interval_min=5)
+            # We need at least 15 canonical candles to get a functional EMA
+            if len(canonical) >= 15:
+                prices = [c["close"] for c in canonical]
+                highs = [c["high"] for c in canonical]
+                lows = [c["low"] for c in canonical]
+                volumes = [c.get("volume", 0) for c in canonical]
+                # NOTE: chunk_size stays 1 here (its initializer above) -
+                # prices/highs/lows are already one entry per candle, unlike
+                # the legacy tick-chunking fallback below where chunk_size
+                # maps a chunk index back into a raw per-tick prices array.
+                # Overriding it to len(prices)//60 (as the legacy path does)
+                # would misalign highs[i]/lows[i] against prices[i*chunk_size]
+                # once there are more than ~120 canonical candles cached.
+        except Exception:
+            pass
+
+        # Fallback to legacy tick chunking for backtester or empty state
+        if not prices:
+            # Need at least 60 ticks for reliable indicators
+            if len(ticks) < 60:
+                return {}
+            
+            # Use spot_price for indicators (NIFTY spot), ltp for option premium
+            prices = [t.get('spot_price', t.get('ltp', 0)) for t in ticks]
+            volumes = [t.get('volume', 10000) for t in ticks]
+            
+            # Validate prices - use ltp if spot_price is invalid
+            if prices and prices[-1] < 1000:
+                prices = [t['ltp'] for t in ticks]
+            
+            # Calculate high/low from prices
+            chunk_size = max(1, len(prices) // 60)  # ~1 minute chunks
+            
+            for i in range(0, len(prices), chunk_size):
+                chunk_prices = prices[i:i+chunk_size]
+                if chunk_prices:
+                    highs.append(max(chunk_prices))
+                    lows.append(min(chunk_prices))
+            
+            if len(highs) < 30:
+                return {}
         
         indicators = {}
         
@@ -982,7 +1009,7 @@ class SmartScalpV3:
         
         # ====== PULLBACK LOGIC FOR CE (BULLISH) ======
         # Balanced scoring - conditions are independent, not nested
-        # Score 5+ needed for signal (out of 12 possible with v3.1 additions)
+        # Score 4+ needed for signal (out of 12 possible with v3.1 additions)
         
         ce_signal = False
         ce_score = 0
@@ -1241,7 +1268,8 @@ class SmartScalpV3:
                     f"Low confidence {confidence}% < {required_conf}%"
                     f" (MQ {details.get('market_quality_grade', 'NA')})"
                 )
-                return 0, "", 0, details
+                # Keep the real confidence value for DVF/analytics even though the signal is rejected.
+                return 0, "", confidence, details
             return 1, "CE", confidence, details
         elif ce_signal and ce_exhausted:
             details["reason"] = f"CE signal blocked: {details.get('exhaustion', 'Trend exhausted')}"
@@ -1267,7 +1295,8 @@ class SmartScalpV3:
                     f"Low confidence {confidence}% < {required_conf}%"
                     f" (MQ {details.get('market_quality_grade', 'NA')})"
                 )
-                return 0, "", 0, details
+                # Keep the real confidence value for DVF/analytics even though the signal is rejected.
+                return 0, "", confidence, details
             return 1, "PE", confidence, details
         elif pe_signal and pe_exhausted:
             details["reason"] = f"PE signal blocked: {details.get('exhaustion', 'Trend exhausted')}"
@@ -1298,12 +1327,12 @@ class SmartScalpV3:
         # Dynamic adjustment based on local volatility and regime
         atr = indicators.get('ATR', 0)
         if atr:
-            if atr > 8:
-                sl_points += 1
-                tp_points += 2
-            elif atr < 4:
-                sl_points = max(4, sl_points - 1)
-                tp_points = max(10, tp_points - 2)
+            if atr > ATR_SL_HIGH_THRESHOLD:
+                sl_points += ATR_HIGH_SL_ADJUSTMENT
+                tp_points += ATR_HIGH_TP_ADJUSTMENT
+            elif atr < ATR_SL_LOW_THRESHOLD:
+                sl_points = max(ATR_SL_MIN_POINTS, sl_points - ATR_LOW_SL_ADJUSTMENT)
+                tp_points = max(ATR_TP_MIN_POINTS, tp_points - ATR_LOW_TP_ADJUSTMENT)
         
         # Ensure TP maintains a minimum R:R relative to SL
         if TP_MULTIPLIER and sl_points > 0:

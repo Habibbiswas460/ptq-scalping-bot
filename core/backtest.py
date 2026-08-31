@@ -21,6 +21,10 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 from core.runtime import runtime_state
+from core.engines import exit_engine
+from core.engines.exit_engine import check_exit_conditions, HARD_SL_POINTS, TP_POINTS_FIXED
+from core.engines.state_machine import _calculate_rsi
+from utils.greeks import GreeksCalculator
 
 
 @dataclass
@@ -37,6 +41,8 @@ class BacktestTrade:
     tp_price: float = 0.0
     pnl: float = 0.0
     exit_reason: str = ''
+    mfe: float = 0.0
+    mae: float = 0.0
     signal_details: Dict = field(default_factory=dict)
 
 
@@ -70,46 +76,46 @@ class Backtester:
     Simulates historical trading with realistic execution.
     """
     
-    def __init__(self, 
+    def __init__(self,
                  initial_capital: float = 30000,
-                 sl_points: float = 7,
-                 tp_points: float = 18,
                  lot_size: int = 65,
                  max_trades_per_day: int = 15,
                  commission_per_trade: float = 40,  # ₹40 round-trip brokerage/charges
                  slippage_pct: float = 0.1,  # 0.1% slippage
-                 trailing_sl_enabled: bool = True,
-                 trailing_activation_points: float = 5,  # Activate after 5pt move
-                 trailing_step_points: float = 1.5,  # Tighter trail to protect gains
-                 use_strategy_exit_params: bool = False,
+                 day_type: str = "NORMAL",
+                 default_iv: float = 0.20,
+                 default_tte_sec: float = 3 * 24 * 3600,  # 3-day fallback; historical OHLC has no real expiry date
                  use_position_size_engine: bool = False,
                  position_size_risk_budget_pct: float = 0.02,
                  position_size_daily_cap_pct: Optional[float] = None):
-        
+
         self.initial_capital = initial_capital
         self.current_capital = initial_capital
-        self.sl_points = sl_points
-        self.tp_points = tp_points
         self.lot_size = lot_size
         self.max_trades_per_day = max_trades_per_day
         self.commission_round_trip = commission_per_trade
         self.commission_per_side = commission_per_trade / 2.0
         self.slippage_pct = slippage_pct
-        self.trailing_sl_enabled = trailing_sl_enabled
-        self.trailing_activation_points = trailing_activation_points
-        self.trailing_step_points = trailing_step_points
-        self.use_strategy_exit_params = use_strategy_exit_params
+        # Exit logic itself (SL/TP/trailing/breakeven/RSI/greeks/time) is no
+        # longer configurable here — it's delegated to
+        # core.engines.exit_engine.check_exit_conditions(), the exact function
+        # the live bot uses, sourced from the same config/constants.py +
+        # .env as live (see findings.md §2.1). This is intentional: a
+        # backtest with its own separate exit rules couldn't tell you how the
+        # real exit logic would have performed historically.
+        self.day_type = day_type
+        self.default_iv = default_iv
+        self.default_tte_sec = default_tte_sec
         self.use_position_size_engine = use_position_size_engine
         self.position_size_risk_budget_pct = position_size_risk_budget_pct
         self.position_size_daily_cap_pct = position_size_daily_cap_pct
-        
+
         # State
         self.trades: List[BacktestTrade] = []
-        self.current_trade: Optional[BacktestTrade] = None
+        self.current_trade: Optional[Dict] = None  # dict shape expected by check_exit_conditions()
         self.trade_count = 0
         self.daily_trades = 0
         self.current_date = None
-        self._trade_high_water: float = 0.0  # Track best price in current trade for TSL
         
         # Equity tracking
         self.equity_curve: List[Tuple[datetime, float]] = []
@@ -185,40 +191,53 @@ class Backtester:
         )
         return max(5.0, min(500.0, implied_option))
     
-    def _check_sl_tp(self, current_price: float) -> Tuple[bool, str, float]:
-        """
-        Check if SL, TSL, or TP is hit for current trade.
-        Includes trailing stop loss simulation.
-        Returns: (should_exit, exit_reason, exit_price)
-        """
+    def _build_greeks(self, spot_price: float, direction: str) -> Dict:
+        """Synthesize BSM greeks from spot/strike/IV/TTE for the exit engine's
+        greek_exit() check. Historical OHLC candles don't carry real option
+        expiry/IV, so this uses the same ATM-strike-from-spot approximation
+        and IV/TTE fallbacks the live exit path uses
+        (exit_engine._validated_greeks_for_exit) when it can't reach the
+        broker's own Greeks."""
+        if spot_price <= 0:
+            return {}
+        strike = round(spot_price / 50.0) * 50
+        option_type = 'PE' if direction == 'PE' else 'CE'
+        tte_years = self.default_tte_sec / (365.25 * 24 * 3600)
+        return GreeksCalculator.calculate(
+            spot_price=spot_price,
+            strike_price=strike,
+            time_to_expiry=tte_years,
+            volatility=self.default_iv,
+            option_type=option_type,
+        )
+
+    def _check_exit(self, timestamp: datetime, current_price: float, spot_price: float, ticks_history: List[Dict]) -> Tuple[bool, str]:
+        """Check exit conditions via the SAME check_exit_conditions() the live
+        bot uses (core.engines.exit_engine), fed with a synthetic tick/greeks
+        pair built from this candle. Returns (should_exit, exit_reason)."""
         if not self.current_trade:
-            return False, '', 0.0
-        
+            return False, ''
+
         trade = self.current_trade
-        
-        # Update high-water mark for trailing SL
-        if current_price > self._trade_high_water:
-            self._trade_high_water = current_price
-        
-        # Fixed SL hit
-        if current_price <= trade.sl_price:
-            return True, 'SL_HIT', trade.sl_price
-        
-        # Fixed TP hit
-        if current_price >= trade.tp_price:
-            return True, 'TP_HIT', trade.tp_price
-        
-        # Trailing Stop Loss check
-        if self.trailing_sl_enabled:
-            move_from_entry = self._trade_high_water - trade.entry_price
-            if move_from_entry >= self.trailing_activation_points:
-                # Calculate trailing SL level: high-water minus step buffer
-                trailing_sl = self._trade_high_water - self.trailing_step_points
-                # Only trail upward (trailing_sl must be above original SL)
-                if trailing_sl > trade.sl_price and current_price <= trailing_sl:
-                    return True, 'TRAILING_SL', trailing_sl
-        
-        return False, '', 0.0
+        tick = {
+            'ltp': current_price,
+            'spot_price': spot_price,
+            'iv': self.default_iv,
+            'tte_sec': self.default_tte_sec,
+        }
+        greeks = self._build_greeks(spot_price, trade.get('direction', 'CE'))
+        rsi = _calculate_rsi(ticks_history)
+
+        # exit_engine's hold-time/market-close checks use datetime.now() live
+        # (correct there — trades happen in real time). Replaying history
+        # needs those checks anchored to the candle's own timestamp instead,
+        # or every hold-time calculation would be measured against today's
+        # real wall clock. See findings.md §2.1.
+        exit_engine._clock_override = timestamp
+        try:
+            return check_exit_conditions(trade, tick, greeks, self.day_type, logger=None, rsi=rsi)
+        finally:
+            exit_engine._clock_override = None
     
     def process_candle(self, candle: Dict, ticks_history: List[Dict]) -> Optional[Dict]:
         """
@@ -239,43 +258,40 @@ class Backtester:
             self.daily_trades = 0
         
         current_price = self._resolve_option_price(candle)
-        
+        spot_price = float(candle.get('spot_price', candle.get('close', current_price)) or current_price)
+
         # Check existing position first
         if self.current_trade:
-            should_exit, exit_reason, exit_price = self._check_sl_tp(current_price)
-            
+            should_exit, exit_reason = self._check_exit(timestamp, current_price, spot_price, ticks_history)
+
             if should_exit:
-                return self._exit_trade(timestamp, exit_price, exit_reason)
-        
+                return self._exit_trade(timestamp, current_price, exit_reason)
+
         # Check for new entry signal (if no position and under daily limit)
         if self.current_trade is None and self.daily_trades < self.max_trades_per_day:
             strategy = self._get_strategy()
             signal, direction, confidence, details = strategy.generate_signal(ticks_history)
             required_conf = int(getattr(strategy, 'min_confidence', 70) or 70)
-            
+
             if signal == 1 and confidence >= required_conf:
                 indicators = runtime_state.get_indicators()
                 if not indicators:
                     indicators = strategy.calculate_indicators(ticks_history)
                 entry_params = strategy.get_entry_params(direction, confidence, indicators)
                 return self._enter_trade(timestamp, current_price, direction, confidence, details, entry_params)
-        
+
         return None
     
-    def _enter_trade(self, timestamp: datetime, price: float, direction: str, 
+    def _enter_trade(self, timestamp: datetime, price: float, direction: str,
                      confidence: int, details: Dict, entry_params: Dict) -> Optional[Dict]:
         """Enter a new trade"""
         entry_price = self._apply_slippage(price, 'BUY')
 
-        if self.use_strategy_exit_params:
-            sl_points = entry_params.get('sl_points', self.sl_points)
-            tp_points = entry_params.get('tp_points', self.tp_points)
-            qty = entry_params.get('quantity', self.lot_size)
-        else:
-            # Backtest should honor CLI/runtime SL-TP controls unless explicitly opted out.
-            sl_points = self.sl_points
-            tp_points = self.tp_points
-            qty = self.lot_size
+        # SL points here are only a position-sizing input (risk amount / SL
+        # points), not an exit trigger — the actual exit decision comes
+        # entirely from check_exit_conditions() in _check_exit(), same as live.
+        sl_points = HARD_SL_POINTS
+        qty = self.lot_size
 
         if self.use_position_size_engine and self._position_size_engine is not None:
             weighted_score = float(details.get('weighted_score', details.get('score', 0)) or 0)
@@ -306,22 +322,23 @@ class Backtester:
 
         self.trade_count += 1
         self.daily_trades += 1
-        
-        self.current_trade = BacktestTrade(
-            trade_id=self.trade_count,
-            entry_time=timestamp,
-            direction=direction,
-            entry_price=entry_price,
-            qty=qty,
-            sl_price=entry_price - sl_points,
-            tp_price=entry_price + tp_points,
-            signal_details={'confidence': confidence, **details}
-        )
-        self._trade_high_water = entry_price  # Reset high-water for new trade
-        
+
+        # Dict shape expected by check_exit_conditions()/check_hard_sl() —
+        # mutated in place with price_diff/current_pnl/mfe_inr/mae_inr/
+        # current_tsl/tsl_status/etc. as the trade progresses.
+        self.current_trade = {
+            'trade_id': self.trade_count,
+            'entry_time': timestamp,
+            'direction': direction,
+            'side': 'BUY',
+            'entry_price': entry_price,
+            'qty': qty,
+            'signal_details': {'confidence': confidence, **details},
+        }
+
         # Charge half the round-trip cost at entry and half at exit.
         self.current_capital -= self.commission_per_side
-        
+
         return None  # Trade not complete yet
     
     def _exit_trade(self, timestamp: datetime, exit_price: float, 
@@ -330,44 +347,60 @@ class Backtester:
         trade = self.current_trade
         if not trade:
             return None
-        
-        # Apply slippage
+
+        entry_price = trade['entry_price']
+        qty = trade['qty']
+
+        # Apply slippage. The exit DECISION (when/why) comes from
+        # check_exit_conditions(); the actual fill price/pnl is still
+        # backtest's own execution-cost model — mirroring how live keeps
+        # exit_engine's decision separate from broker.py's real fill price.
         actual_exit = self._apply_slippage(exit_price, 'SELL')
-        
-        # Calculate P&L
-        price_diff = actual_exit - trade.entry_price
-        pnl = price_diff * trade.qty
-        
+
+        price_diff = actual_exit - entry_price
+        pnl = price_diff * qty
+
         # Charge the remaining half of round-trip execution costs at exit.
         pnl -= self.commission_per_side
-        
-        # Update trade record
-        trade.exit_time = timestamp
-        trade.exit_price = actual_exit
-        trade.exit_reason = exit_reason
-        trade.pnl = pnl
-        
+
+        record = BacktestTrade(
+            trade_id=trade['trade_id'],
+            entry_time=trade['entry_time'],
+            exit_time=timestamp,
+            direction=trade.get('direction', 'CE'),
+            entry_price=entry_price,
+            exit_price=actual_exit,
+            qty=qty,
+            sl_price=entry_price - HARD_SL_POINTS,
+            tp_price=entry_price + TP_POINTS_FIXED,
+            pnl=pnl,
+            exit_reason=exit_reason,
+            mfe=trade.get('mfe_inr', 0.0),
+            mae=trade.get('mae_inr', 0.0),
+            signal_details=trade.get('signal_details', {}),
+        )
+
         # Update capital
         self.current_capital += pnl
-        
+
         # Update equity tracking
         self.equity_curve.append((timestamp, self.current_capital))
         if self.current_capital > self.peak_equity:
             self.peak_equity = self.current_capital
-        
+
         current_dd = self.peak_equity - self.current_capital
         if current_dd > self.max_drawdown:
             self.max_drawdown = current_dd
-        
+
         # Record trade
-        self.trades.append(trade)
+        self.trades.append(record)
         self.current_trade = None
-        
+
         return {
-            'trade_id': trade.trade_id,
+            'trade_id': record.trade_id,
             'timestamp': timestamp,
-            'direction': trade.direction,
-            'entry': trade.entry_price,
+            'direction': record.direction,
+            'entry': entry_price,
             'exit': actual_exit,
             'pnl': round(pnl, 2),
             'exit_reason': exit_reason
@@ -384,7 +417,7 @@ class Backtester:
             BacktestResult with performance metrics
         """
         print(f"🔬 Starting backtest with {len(historical_data)} candles...")
-        print(f"   Capital: ₹{self.initial_capital:,.0f} | SL: {self.sl_points}pts | TP: {self.tp_points}pts")
+        print(f"   Capital: ₹{self.initial_capital:,.0f} | Exit logic: core.engines.exit_engine (live-parity) | Day type: {self.day_type}")
 
         if not historical_data:
             self._data_start_ts = None
@@ -543,8 +576,8 @@ class Backtester:
         # Export trades CSV
         with open(f'{output_dir}/trades_{timestamp}.csv', 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['trade_id', 'entry_time', 'exit_time', 'direction', 
-                           'entry_price', 'exit_price', 'qty', 'pnl', 'exit_reason'])
+            writer.writerow(['trade_id', 'entry_time', 'exit_time', 'direction',
+                           'entry_price', 'exit_price', 'qty', 'pnl', 'exit_reason', 'mfe', 'mae'])
             for trade in result.trades:
                 writer.writerow([
                     trade.trade_id,
@@ -555,7 +588,9 @@ class Backtester:
                     trade.exit_price,
                     trade.qty,
                     round(trade.pnl, 2),
-                    trade.exit_reason
+                    trade.exit_reason,
+                    round(trade.mfe, 2),
+                    round(trade.mae, 2),
                 ])
         
         print(f"📁 Results exported to {output_dir}/")
@@ -594,25 +629,25 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PTQ Scalping Bot Backtester')
     parser.add_argument('--data', type=str, required=True, help='Path to historical data CSV')
     parser.add_argument('--capital', type=float, default=30000, help='Initial capital')
-    parser.add_argument('--sl', type=float, default=7, help='Stop loss points')
-    parser.add_argument('--tp', type=float, default=18, help='Take profit points')
+    parser.add_argument('--day-type', type=str, default='NORMAL', help='Day type passed to the exit engine (NORMAL or EXPIRY)')
     parser.add_argument('--use-position-size-engine', action='store_true', help='Use PositionSizeEngine for dynamic quantity')
     parser.add_argument('--position-size-risk-budget-pct', type=float, default=0.02, help='Risk budget pct for position size engine (e.g. 0.02 = 2%%)')
     parser.add_argument('--position-size-daily-cap-pct', type=float, default=None, help='Override allocator daily risk cap pct for testing (e.g. 0.05)')
     parser.add_argument('--output', type=str, default='logs/backtest', help='Output directory')
-    
+
     args = parser.parse_args()
-    
+
     # Load data
     print(f"📂 Loading historical data from {args.data}...")
     historical_data = load_historical_data(args.data)
     print(f"   Loaded {len(historical_data)} candles")
-    
-    # Run backtest
+
+    # Run backtest. SL/TP/trailing/breakeven/RSI/greeks/time-exit rules all
+    # come from core.engines.exit_engine (same as live) — see the Backtester
+    # docstring/comments for why this isn't a CLI-configurable knob anymore.
     backtester = Backtester(
         initial_capital=args.capital,
-        sl_points=args.sl,
-        tp_points=args.tp,
+        day_type=args.day_type,
         use_position_size_engine=args.use_position_size_engine,
         position_size_risk_budget_pct=args.position_size_risk_budget_pct,
         position_size_daily_cap_pct=args.position_size_daily_cap_pct,

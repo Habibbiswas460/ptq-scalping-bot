@@ -14,9 +14,10 @@ from typing import Dict, Optional, Tuple
 from config.constants import (
     CONFIG,
     MAX_TRADES_PER_HOUR, MAX_TRADES_PER_DAY,
-    CONSECUTIVE_LOSS_LIMIT, PAUSE_AFTER_LOSS_SEC,
+    CONSECUTIVE_LOSS_LIMIT,
     COOLDOWN_NORMAL_SEC, COOLDOWN_AFTER_SL_SEC,
-    COOLDOWN_AFTER_CONSECUTIVE_LOSS,
+    COOLDOWN_AFTER_CONSECUTIVE_LOSS, COOLDOWN_AFTER_PROFIT_SEC,
+    COOLDOWN_NON_TRADE_BLOCK_SEC,
     COOLDOWN_EXPIRY_NORMAL, COOLDOWN_EXPIRY_AFTER_SL,
     SESSION_FILTER_ENABLED, ALLOWED_SESSIONS,
     EXPIRY_ONLY_SESSIONS, BLACKOUT_SESSIONS,
@@ -257,7 +258,6 @@ class TradingState:
         self.trades_this_hour = 0
         self.total_trades_today = 0
         self.consecutive_losses = 0
-        self.consecutive_loss_pause_until: Optional[datetime] = None
         self.winning_trades = 0
         self.losing_trades = 0
         
@@ -550,32 +550,39 @@ def check_trade_limits(state: TradingState, logger) -> Tuple[bool, str]:
     if state.total_trades_today >= MAX_TRADES_PER_DAY:
         return False, "Daily limit reached"
     
-    # Consecutive loss limit with pause
-    if state.consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
-        current = now()
-        
-        if state.consecutive_loss_pause_until is None:
-            state.consecutive_loss_pause_until = current + timedelta(seconds=PAUSE_AFTER_LOSS_SEC)
-            logger.warning(f"⚠️ Consecutive loss limit hit ({state.consecutive_losses}). Pausing until {state.consecutive_loss_pause_until.strftime('%H:%M:%S')}")
-            return False, "Consecutive loss pause"
-        
-        if current < state.consecutive_loss_pause_until:
-            remaining = int((state.consecutive_loss_pause_until - current).total_seconds())
+    # Consecutive loss limit with pause — delegated entirely to
+    # RiskManager.check_streak_limits(), the single source of truth for this
+    # gate. This function used to run its own independent pause/reset clock
+    # in parallel with RiskManager's, so every trigger paused trading twice
+    # as long as intended, since RiskManager's clock only started once this
+    # one's cleared and let a signal through to reach it (see findings.md
+    # §2.9). TradingState's own consecutive_losses/consecutive_ce_losses/
+    # consecutive_pe_losses counters are unaffected — still maintained by
+    # update_pnl() and still used for cooldown-duration selection,
+    # per-direction blocking, and the dashboard; only the pause gate itself
+    # moved to RiskManager.
+    try:
+        from core.risk.risk_manager import get_risk_manager
+        rm = get_risk_manager()
+    except Exception:
+        rm = None
+
+    if rm:
+        streak_ok, streak_msg = rm.check_streak_limits()
+        if not streak_ok:
             if state.loop_count % 5000 == 0:
-                logger.info(f"⏸ Paused. Resuming in {remaining}s")
-            return False, "Consecutive loss pause"
-        else:
-            logger.info("✅ Pause ended. Resetting consecutive losses.")
-            state.consecutive_loss_pause_until = None
-            state.consecutive_losses = 0  # FIX: Reset consecutive losses after pause
-            state.consecutive_ce_losses = 0
-            state.consecutive_pe_losses = 0
-    
+                logger.info(f"⏸ {streak_msg}")
+            return False, streak_msg
+
     return True, "OK"
 
 
-def get_cooldown_duration(state: TradingState) -> int:
-    """Get appropriate cooldown duration"""
+def get_cooldown_duration(state: TradingState, is_win: bool = False) -> int:
+    """Get appropriate cooldown duration after a real trade exit.
+
+    `is_win` only matters when there's no active loss streak — a losing
+    streak's cooldown always takes priority regardless of the trade that
+    just closed (mirrors the pre-existing priority order)."""
     if state.consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
         return COOLDOWN_AFTER_CONSECUTIVE_LOSS
     elif state.consecutive_losses > 0:
@@ -583,6 +590,8 @@ def get_cooldown_duration(state: TradingState) -> int:
             return COOLDOWN_EXPIRY_AFTER_SL
         else:
             return COOLDOWN_AFTER_SL_SEC
+    elif is_win:
+        return COOLDOWN_AFTER_PROFIT_SEC
     else:
         if state.day_type == "EXPIRY":
             return COOLDOWN_EXPIRY_NORMAL
@@ -706,9 +715,22 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
             reasons = risk_details.get('reasons', ['Risk check failed'])
             logger.warning(f"⚠ RISK BLOCKED: {', '.join(reasons)}")
             logger.state_change("ENTRY_READY", "COOLDOWN", f"Risk: {reasons[0]}")
+            state.cooldown_until = now() + timedelta(seconds=COOLDOWN_NON_TRADE_BLOCK_SEC)
             return "COOLDOWN"
 
         risk_budget = risk_details.get('risk_budget', {})
+        
+        if isinstance(risk_budget, dict):
+            logger.info(
+                "📊 Risk budget: "
+                f"capital=₹{risk_budget.get('capital', 0)} | "
+                f"per_trade=₹{risk_budget.get('per_trade_risk_amount', 0)} | "
+                f"daily_cap=₹{risk_budget.get('daily_risk_budget_amount', 0)} | "
+                f"remaining=₹{risk_budget.get('remaining_risk_amount', 0)} | "
+                f"daily_loss_state={risk_budget.get('daily_loss_state', {})} | "
+                f"recovery={risk_budget.get('recovery_mode', {})}"
+            )
+
         for warning in risk_details.get('warnings', []):
             logger.info(f"📊 Risk sizing context: {warning}")
     except Exception as e:
@@ -734,6 +756,7 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
     if not exec_ok:
         logger.warning(f"⚠ ENTRY SKIPPED: {exec_reason}")
         logger.state_change("ENTRY_READY", "COOLDOWN", f"Exec guard: {exec_reason}")
+        state.cooldown_until = now() + timedelta(seconds=COOLDOWN_NON_TRADE_BLOCK_SEC)
         return "COOLDOWN"
 
     weighted_score = signal_params.get('score', details.get('weighted_score', 0)) if isinstance(signal_params, dict) else 0
@@ -763,6 +786,7 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
         cap_reason = allocation.get('cap_reason') or 'allocator_zero_quantity'
         logger.warning(f"⚠ POSITION SIZE BLOCKED: qty=0 | reason={cap_reason}")
         logger.state_change("ENTRY_READY", "COOLDOWN", f"Allocator: {cap_reason}")
+        state.cooldown_until = now() + timedelta(seconds=COOLDOWN_NON_TRADE_BLOCK_SEC)
         return "COOLDOWN"
 
     logger.info(
@@ -825,6 +849,7 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
         return "IN_TRADE"
     else:
         logger.state_change("ENTRY_READY", "COOLDOWN", "Order failed")
+        state.cooldown_until = now() + timedelta(seconds=COOLDOWN_NON_TRADE_BLOCK_SEC)
         return "COOLDOWN"
 
 
@@ -905,14 +930,40 @@ def state_in_trade(tick: Dict, greeks: Dict, state: TradingState,
         state.update_pnl(result['pnl_inr'], total_capital, is_loss, trade_direction)
 
         try:
+            from core.risk.risk_manager import get_risk_manager
+            rm = get_risk_manager()
+            if rm:
+                rm.record_trade({'pnl': result['pnl_inr'], 'direction': trade_direction})
+        except Exception as e:
+            # This is not a cosmetic failure: RiskManager's daily/weekly PnL and
+            # consecutive-loss counters (used by can_trade()'s risk gates) are
+            # only ever updated here. A swallowed exception means this trade's
+            # loss silently never counts toward those limits, so log it loudly
+            # and track the miss instead of a quiet warning.
+            state.risk_tracking_failures = getattr(state, 'risk_tracking_failures', 0) + 1
+            logger.error(
+                f"🚨 RiskManager trade recording FAILED (miss #{state.risk_tracking_failures}) - "
+                f"pnl={result.get('pnl_inr')} direction={trade_direction} not counted toward "
+                f"risk limits: {e}",
+                exc_info=True,
+            )
+
+        try:
             from core.services.database import log_trade_exit
+
+            # Trade-scoped MFE/MAE (tracked live in exit_engine.check_hard_sl on
+            # this exact trade dict) instead of the global rolling tick buffer,
+            # which isn't scoped to a single trade and was wrong ~15-19% of the
+            # time on short-lived trades.
             log_trade_exit(state.current_trade.get('order_id'), {
                 'exit_price': result.get('exit_price', tick.get('ltp')),
                 'exit_time': now(),
                 'exit_reason': result.get('exit_reason', exit_reason),
                 'pnl': result.get('pnl_inr', 0),
                 'pnl_pct': result.get('pnl_pct', 0),
-                'hold_time_sec': result.get('hold_time', 0)
+                'hold_time_sec': result.get('hold_time', 0),
+                'mfe': state.current_trade.get('mfe_inr', 0.0),
+                'mae': state.current_trade.get('mae_inr', 0.0),
             })
         except Exception as e:
             logger.warning(f"⚠ DB trade exit logging failed: {e}")
@@ -923,9 +974,9 @@ def state_in_trade(tick: Dict, greeks: Dict, state: TradingState,
             logger.info("📍 Strike rotated to stay ATM")
         
         state.current_trade = None
-        
+
         # Set cooldown
-        cooldown_sec = get_cooldown_duration(state)
+        cooldown_sec = get_cooldown_duration(state, is_win=not is_loss)
         state.cooldown_until = now() + timedelta(seconds=cooldown_sec)
         
         logger.state_change("IN_TRADE", "COOLDOWN", f"Cooldown {cooldown_sec}s")
@@ -933,9 +984,14 @@ def state_in_trade(tick: Dict, greeks: Dict, state: TradingState,
     
     return "IN_TRADE"
 
-
 def state_cooldown(state: TradingState, logger) -> str:
     """Handle COOLDOWN state"""
+    if state.cooldown_until is None:
+        cooldown_sec = get_cooldown_duration(state)
+        state.cooldown_until = now() + timedelta(seconds=cooldown_sec)
+        logger.warning(
+            f"⚠ COOLDOWN timestamp missing; initialized fallback cooldown {cooldown_sec}s"
+        )
     if now() >= state.cooldown_until:
         logger.state_change("COOLDOWN", "IDLE", "Cooldown ended")
         return "IDLE"

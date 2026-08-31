@@ -37,6 +37,7 @@ class RiskManager:
         # Streak tracking
         self.consecutive_wins = 0
         self.consecutive_losses = 0
+        self.streak_pause_until = None
         self.trades_today = []
         self.trades_this_week = []
         
@@ -48,10 +49,6 @@ class RiskManager:
         self.vix_value = None
         self.vix_last_fetch = None
         
-        # ATR cache
-        self.atr_value = None
-        self.atr_last_fetch = None
-        
         # Equity curve
         self.equity_history = []
         
@@ -59,10 +56,19 @@ class RiskManager:
         self.previous_close = None
         self.gap_detected = False
         self.gap_wait_until = None
-        
+
         # Load state if exists
+        self._last_active_date = None
         self._load_state()
-    
+
+        # The bot restarts fresh each trading day, so a new week's first
+        # session is the only reliable point to reset weekly PnL — detect it
+        # by comparing the persisted last-active date's ISO week to today's.
+        today = datetime.now().date()
+        if self._last_active_date and self._last_active_date.isocalendar()[:2] != today.isocalendar()[:2]:
+            self._log('info', f"📅 New week detected (last active {self._last_active_date}) — resetting weekly PnL")
+            self.end_of_week()
+
     def _log(self, level: str, msg: str):
         """Log message"""
         if self.logger:
@@ -82,6 +88,9 @@ class RiskManager:
                     self.peak_equity = state.get('peak_equity', self.current_equity)
                     self.recovery_mode = state.get('recovery_mode', False)
                     self.equity_history = state.get('equity_history', [])[-30:]
+                    last_updated = state.get('last_updated')
+                    if last_updated:
+                        self._last_active_date = datetime.fromisoformat(last_updated).date()
             except Exception as e:
                 self._log('warning', f"Could not load risk state: {e}")
     
@@ -104,11 +113,7 @@ class RiskManager:
             self._log('warning', f"Could not save risk state: {e}")
 
     # ==================== VIX FILTER ====================
-    
-    def set_broker_client(self, broker_client):
-        """Set broker client for fetching VIX from Angel One"""
-        self._broker_client = broker_client
-    
+
     def get_vix(self) -> float:
         """Get India VIX value
         
@@ -151,151 +156,6 @@ class RiskManager:
                 return False, 0.0, f"VIX extreme ({vix:.1f}), NO TRADE"
             else:
                 return True, 0.25, f"VIX extreme ({vix:.1f}), size 25%"
-
-    # ==================== ATR & POSITION SIZING ====================
-    
-    def get_atr(self, lookback: int = 14) -> float:
-        """
-        Get NIFTY ATR (Average True Range)
-        Uses cached value or default since live ATR calculation requires historical data.
-        In live trading, ATR is estimated from recent price volatility.
-        """
-        if self.atr_last_fetch and (datetime.now() - self.atr_last_fetch).seconds < 3600:
-            return self.atr_value or 150.0
-        
-        # Default ATR for NIFTY (~0.6% of spot)
-        # Typical NIFTY ATR ranges from 100-300 points
-        self.atr_value = 150.0
-        self.atr_last_fetch = datetime.now()
-        
-        return self.atr_value
-    
-    def calculate_position_size(self, entry_price: float = 100) -> int:
-        """
-        Calculate position size (lots) based on capital
-        
-        Logic:
-        - 1 lot = 65 qty (NIFTY)
-        - Margin per lot ~ ₹15,000
-        - Capital: ₹30,000 = max 2 lots (with buffer)
-        
-        Methods:
-        1. capital_based: Based on available margin
-        2. risk_based: Based on risk per trade / SL
-        3. atr_based: Based on ATR volatility
-        """
-        rm = self.config['risk_management']
-        capital_cfg = self.config['capital']
-        trading_cfg = self.config['trading']
-        
-        if not rm.get('position_sizing_enabled', False):
-            return trading_cfg.get('quantity', 1)
-        
-        lot_size = trading_cfg.get('lot_size', 65)  # 65 qty = 1 lot
-        total_capital = capital_cfg['total_capital'] + self.total_pnl  # Current equity
-        margin_per_lot = capital_cfg.get('margin_per_lot', 15000)
-        
-        method = rm.get('position_sizing_method', 'capital_based')
-        
-        if method == 'capital_based':
-            # Capital-based: How many lots can we afford?
-            utilization_pct = rm.get('capital_utilization_pct', 80) / 100
-            available_capital = total_capital * utilization_pct
-            
-            # Calculate max lots based on margin
-            max_affordable_lots = int(available_capital / margin_per_lot)
-            
-            # Also check option premium cost
-            option_cost_per_lot = entry_price * lot_size
-            max_lots_by_premium = int(available_capital / option_cost_per_lot) if option_cost_per_lot > 0 else 1
-            
-            # Take the minimum
-            lots = min(max_affordable_lots, max_lots_by_premium)
-            
-            self._log('debug', f"Capital sizing: ₹{total_capital:,.0f} * {utilization_pct*100:.0f}% = ₹{available_capital:,.0f}")
-            self._log('debug', f"Margin lots: {max_affordable_lots}, Premium lots: {max_lots_by_premium}")
-        
-        elif method == 'risk_based':
-            # Risk-based: How many lots with given SL?
-            risk_amount = capital_cfg['risk_per_trade_amount']
-            sl_amount = rm.get('stop_loss_amount', 250)
-            
-            # Risk per lot = SL points * lot_size
-            # But for options, SL is in option price, not points
-            risk_per_lot = sl_amount  # Already in rupees
-            
-            lots = int(risk_amount / risk_per_lot) if risk_per_lot > 0 else 1
-            
-            self._log('debug', f"Risk sizing: ₹{risk_amount} / ₹{risk_per_lot} = {lots} lots")
-        
-        elif method == 'atr':
-            # ATR-based: Volatility adjusted
-            atr = self.get_atr()
-            atr_multiplier = rm.get('atr_risk_multiplier', 2.0)
-            risk_amount = capital_cfg['risk_per_trade_amount']
-            
-            # Higher ATR = lower position size
-            risk_per_lot = (atr * atr_multiplier / 100) * lot_size  # Convert ATR to option movement
-            lots = int(risk_amount / risk_per_lot) if risk_per_lot > 0 else 1
-            
-            self._log('debug', f"ATR sizing: ATR={atr:.0f}, Risk/lot=₹{risk_per_lot:.0f}, Lots={lots}")
-        
-        else:
-            lots = trading_cfg.get('quantity', 1)
-        
-        # Apply min/max limits
-        min_lots = rm.get('min_lots', 1)
-        max_lots = rm.get('max_lots', 5)
-        
-        lots = max(min_lots, lots)
-        lots = min(max_lots, lots)
-        
-        # Final safety check: never risk more than available
-        final_cost = lots * entry_price * lot_size
-        if final_cost > total_capital * 0.9:  # 90% safety
-            lots = max(1, int((total_capital * 0.9) / (entry_price * lot_size)))
-        
-        self._log('info', f"📊 Position Size: {lots} lot(s) = {lots * lot_size} qty")
-        
-        return lots
-    
-    def get_quantity(self, lots: int = None) -> int:
-        """Convert lots to quantity"""
-        lot_size = self.config['trading'].get('lot_size', 65)
-        if lots is None:
-            lots = self.calculate_position_size()
-        return lots * lot_size
-    
-    def calculate_trailing_sl(self, entry_price: float, current_price: float, 
-                              current_sl: float, highest_price: float) -> float:
-        """Calculate trailing stop loss"""
-        rm = self.config['risk_management']
-        
-        if not rm.get('trailing_sl_enabled', False):
-            return current_sl
-        
-        profit = current_price - entry_price
-        activation = rm.get('trailing_activation_amount', 50)
-        
-        if profit < activation:
-            return current_sl
-        
-        atr = self.get_atr()
-        atr_multiplier = rm.get('trailing_atr_multiplier', 1.5)
-        
-        new_sl = highest_price - (atr * atr_multiplier / 100)
-        
-        lock_pct = rm.get('trailing_lock_pct', 40) / 100
-        min_locked_profit = profit * lock_pct
-        min_sl = entry_price + min_locked_profit
-        
-        new_sl = max(new_sl, min_sl)
-        
-        if new_sl > current_sl:
-            self._log('info', f"📈 Trailing SL: ₹{current_sl:.2f} → ₹{new_sl:.2f}")
-            return new_sl
-        
-        return current_sl
 
     # ==================== GAP PROTECTION ====================
     
@@ -423,23 +283,44 @@ class RiskManager:
     # ==================== WIN/LOSS STREAK ====================
     
     def check_streak_limits(self) -> Tuple[bool, str]:
-        """Check consecutive win/loss limits"""
+        """Check consecutive win/loss limits.
+
+        Once a streak limit is hit, entries are paused for a fixed cooldown
+        (mirrors state_machine.check_trade_limits()'s pattern) rather than
+        indefinitely — resetting a streak previously required a win/loss,
+        which could never happen while blocked from trading at all.
+        """
         rm = self.config['risk_management']
-        
+        current = datetime.now()
+
+        if self.streak_pause_until is not None:
+            if current < self.streak_pause_until:
+                remaining_min = int((self.streak_pause_until - current).total_seconds() // 60) + 1
+                return False, f"Streak pause active, {remaining_min}min remaining"
+            self._log('info', "✅ Streak pause ended. Resetting win/loss streak.")
+            self.streak_pause_until = None
+            self.consecutive_losses = 0
+            self.consecutive_wins = 0
+
+        pause_sec = rm.get('pause_after_consecutive_loss_sec', 900)
+
         if self.consecutive_losses >= rm.get('consecutive_loss_limit', 2):
-            return False, f"Consecutive losses: {self.consecutive_losses}, PAUSE"
-        
+            self.streak_pause_until = current + timedelta(seconds=pause_sec)
+            return False, f"Consecutive losses: {self.consecutive_losses}, PAUSE for {pause_sec // 60}min"
+
         if self.consecutive_wins >= rm.get('consecutive_win_limit', 5):
-            return False, f"Win streak: {self.consecutive_wins}, PAUSE (overconfidence)"
-        
+            self.streak_pause_until = current + timedelta(seconds=pause_sec)
+            return False, f"Win streak: {self.consecutive_wins}, PAUSE for {pause_sec // 60}min (overconfidence)"
+
         return True, ""
     
-    def update_streak(self, is_winner: bool):
-        """Update win/loss streak"""
-        if is_winner:
+    def update_streak(self, pnl: float):
+        """Update win/loss streak. A breakeven trade (pnl == 0) is neutral -
+        it neither extends nor resets either streak."""
+        if pnl > 0:
             self.consecutive_wins += 1
             self.consecutive_losses = 0
-        else:
+        elif pnl < 0:
             self.consecutive_losses += 1
             self.consecutive_wins = 0
 
@@ -604,20 +485,6 @@ class RiskManager:
             'lot_size': int(trading_cfg.get('lot_size', 1)),
         }
     
-    def get_final_position_size(self, entry_price: float = 100, spot_price: float = None) -> int:
-        """Get final position size after all adjustments"""
-        base_size = self.calculate_position_size(entry_price)
-        
-        can_trade, details = self.can_trade(spot_price)
-        
-        if not can_trade:
-            return 0
-        
-        final_size = int(base_size * details['size_multiplier'])
-        final_size = max(self.config['risk_management'].get('min_position_size', 1), final_size)
-        
-        return final_size
-
     # ==================== TRADE RECORDING ====================
     
     def record_trade(self, trade: Dict):
@@ -633,7 +500,7 @@ class RiskManager:
         if self.current_equity > self.peak_equity:
             self.peak_equity = self.current_equity
         
-        self.update_streak(pnl > 0)
+        self.update_streak(pnl)
         
         self.trades_today.append(trade)
         self.trades_this_week.append(trade)
@@ -657,27 +524,6 @@ class RiskManager:
         self.trades_this_week = []
         self._save_state()
 
-    # ==================== STATUS ====================
-    
-    def get_status(self) -> Dict:
-        """Get current risk status"""
-        return {
-            'daily_pnl': self.daily_pnl,
-            'weekly_pnl': self.weekly_pnl,
-            'total_pnl': self.total_pnl,
-            'current_equity': self.current_equity,
-            'peak_equity': self.peak_equity,
-            'drawdown': self.peak_equity - self.current_equity,
-            'drawdown_pct': ((self.peak_equity - self.current_equity) / self.peak_equity * 100) if self.peak_equity > 0 else 0,
-            'consecutive_wins': self.consecutive_wins,
-            'consecutive_losses': self.consecutive_losses,
-            'recovery_mode': self.recovery_mode,
-            'vix': self.vix_value,
-            'atr': self.atr_value,
-            'trades_today': len(self.trades_today),
-            'trades_this_week': len(self.trades_this_week)
-        }
-
 
 # ==================== SINGLETON & LEGACY FUNCTIONS ====================
 
@@ -696,29 +542,6 @@ def get_risk_manager(config: Dict = None, logger=None) -> RiskManager:
     if _risk_manager is None and config:
         _risk_manager = RiskManager(config, logger)
     return _risk_manager
-
-
-def check_daily_loss_limit(trades_today, CONFIG, logger, STATE, daily_loss_alerted):
-    """Legacy compatibility function"""
-    rm = get_risk_manager(CONFIG, logger)
-    if rm:
-        rm.trades_today = trades_today
-        rm.daily_pnl = sum([t.get('pnl', 0) for t in trades_today])
-    
-    daily_pnl = sum([t['pnl'] for t in trades_today])
-    max_loss = CONFIG['capital']['max_daily_loss_amount']
-    alert_threshold = CONFIG['capital']['daily_loss_alert_threshold']
-    
-    if daily_pnl <= -max_loss:
-        logger.error(f"🚑 DAILY LOSS LIMIT HIT! PnL: ₹{daily_pnl:.2f}")
-        STATE = "KILL_SWITCH"
-        return False, STATE, daily_loss_alerted
-    
-    if daily_pnl <= -alert_threshold and not daily_loss_alerted:
-        logger.warning(f"⚠️ Daily loss alert! PnL: ₹{daily_pnl:.2f}")
-        daily_loss_alerted = True
-    
-    return True, STATE, daily_loss_alerted
 
 
 def calculate_trade_pnl(trade, tick, CONFIG):

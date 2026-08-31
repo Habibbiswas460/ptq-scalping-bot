@@ -166,3 +166,17 @@ def test_state_entry_ready_blocks_zero_allocator_quantity(monkeypatch):
 
     assert next_state == "COOLDOWN"
     assert broker.last_qty is None
+
+def test_state_cooldown_initializes_missing_timestamp():
+    state = SimpleNamespace(
+        cooldown_until=None,
+        consecutive_losses=0,
+        day_type="NORMAL",
+    )
+    logger = DummyLogger()
+
+    next_state = state_machine.state_cooldown(state, logger)
+
+    assert next_state == "COOLDOWN"
+    assert state.cooldown_until is not None
+    assert any("timestamp missing" in message for level, message in logger.messages if level == "warning")

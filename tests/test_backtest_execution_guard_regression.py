@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from core.backtest import BacktestTrade, Backtester
+from core.backtest import Backtester
 from core.engines import state_machine
 
 
@@ -40,15 +40,14 @@ def test_backtest_end_of_data_exit_uses_option_resolved_price():
     backtester.process_candle = lambda candle, ticks: None
 
     entry_time = datetime(2026, 4, 2, 9, 15, tzinfo=timezone.utc)
-    backtester.current_trade = BacktestTrade(
-        trade_id=1,
-        entry_time=entry_time,
-        direction="CE",
-        entry_price=180.0,
-        qty=1,
-        sl_price=-1_000_000.0,
-        tp_price=1_000_000.0,
-    )
+    backtester.current_trade = {
+        "trade_id": 1,
+        "entry_time": entry_time,
+        "direction": "CE",
+        "side": "BUY",
+        "entry_price": 180.0,
+        "qty": 1,
+    }
 
     data = [
         {

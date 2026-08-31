@@ -21,3 +21,4 @@ from core.validation.validation_report import (
 	generate_daily_validation_report,
 	render_daily_validation_report,
 )
+from core.validation.analytics import mfe_mae_summary

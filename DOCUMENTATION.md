@@ -52,6 +52,10 @@ Operational workflow is implemented through:
 - runtime decision pipeline in [core/main.py](core/main.py)
 - evidence and reports under [archive/reports](archive/reports) and [archive/audits](archive/audits)
 
+Startup command standard:
+- Canonical launcher: ./run.sh
+- Invalid variant to avoid: ./rin.sh
+
 ## Historical and Audit Records
 All historical reports, audits, and root-cause plans are archived under [archive](archive):
 - [archive/reports](archive/reports)

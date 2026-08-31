@@ -1434,6 +1434,12 @@ class AngelOneClient:
                 f"⚠ ACK Timeout | correlation={correlation_id} | "
                 f"reason=No matching SmartAPI ACK within {timeout:.1f}s"
             )
+            # Notify broker to apply transport stress limits without crashing the socket
+            if hasattr(self, '_broker_ws_ack_timeout_cb'):
+                try:
+                    self._broker_ws_ack_timeout_cb()
+                except Exception:
+                    pass
             return False
         return result
 
@@ -1518,31 +1524,28 @@ class AngelOneClient:
                 "tokenList": token_list
             }
         }
-        self._register_ack_waiter(correlation_id)
-        
+        # NOTE: SmartAPI WebSocket 2.0 does not send a JSON acknowledgement
+        # frame for subscribe/unsubscribe — confirmed against Angel One's own
+        # official smartapi-python SDK, which is fire-and-forget for these
+        # actions too (see findings.md §2.10). Waiting on one here previously
+        # meant every subscribe blocked for the full timeout, ~95-100% of the
+        # time, every session. Real confirmation is the arrival of binary
+        # tick data for the subscribed token, verified independently by
+        # broker.py's _wait_for_first_ws_tick() after this call returns.
+        #
         # Send outside lock to avoid holding lock during I/O
         try:
             if self._ws_is_usable(ws_ref) and hasattr(ws_ref, 'send') and callable(ws_ref.send):
                 ws_ref.send(json.dumps(subscribe_msg))
-                ack_ok = self._wait_for_ack(correlation_id, timeout=5.0)
-                if ack_ok:
-                    self._sync_subscription_cache(pending_tokens, source="ack")
-                    self.logger.info(f"✅ Subscribe Success | tokens={len(pending_tokens)} | correlation={correlation_id}")
-                    return True
-                self.logger.warning(
-                    f"⚠ Subscribe Failed ACK | correlation={correlation_id} | "
-                    "fallback=local-cache"
-                )
-                self._sync_subscription_cache(pending_tokens, source="ack-timeout-fallback")
+                self._sync_subscription_cache(pending_tokens, source="sent")
+                self.logger.info(f"✅ Subscribe Sent | tokens={len(pending_tokens)} | correlation={correlation_id}")
                 return True
             else:
                 self.logger.warning("WebSocket not ready for subscribe")
-                self._clear_pending_ack_state()
                 self._request_ws_reconnect("subscribe send blocked: websocket.sock is None")
                 return False
         except Exception as e:
             self.logger.warning(f"Subscribe failed: {e}")
-            self._clear_pending_ack_state()
             self._request_ws_reconnect(f"subscribe exception: {e}")
             return False
     
@@ -1599,28 +1602,17 @@ class AngelOneClient:
                 "tokenList": token_list
             }
         }
-        self._register_ack_waiter(correlation_id)
-        
+        # See the matching NOTE in subscribe() — same fire-and-forget rationale.
         try:
             if self._ws_is_usable(ws_ref) and hasattr(ws_ref, 'send') and callable(ws_ref.send):
                 ws_ref.send(json.dumps(unsubscribe_msg))
-                ack_ok = self._wait_for_ack(correlation_id, timeout=5.0)
-                if ack_ok:
-                    self._remove_from_subscription_cache(pending_tokens, source="ack")
-                    self.logger.info(f"✅ Unsubscribe Success | tokens={len(pending_tokens)} | correlation={correlation_id}")
-                    return True
-                self.logger.warning(
-                    f"⚠ Unsubscribe ACK Timeout | correlation={correlation_id} | "
-                    "fallback=local-cache"
-                )
-                self._remove_from_subscription_cache(pending_tokens, source="ack-timeout-fallback")
+                self._remove_from_subscription_cache(pending_tokens, source="sent")
+                self.logger.info(f"✅ Unsubscribe Sent | tokens={len(pending_tokens)} | correlation={correlation_id}")
                 return True
-            self._clear_pending_ack_state()
             self._request_ws_reconnect("unsubscribe send blocked: websocket.sock is None")
             return False
         except Exception as e:
             self.logger.debug(f"Unsubscribe failed: {e}")
-            self._clear_pending_ack_state()
             self._request_ws_reconnect(f"unsubscribe exception: {e}")
             return False
     

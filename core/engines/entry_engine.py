@@ -46,18 +46,30 @@ except ImportError:
 
 try:
     from core.validation.signal_logger import log_decision_event
+    from core.validation.paper_executor import record_decision, update_open_positions
     HAS_DVF = True
 except ImportError:
     HAS_DVF = False
 
 
-def _log_signal_snapshot(params: Dict, was_taken: bool, result_message: str) -> None:
+def _log_signal_snapshot(params: Dict, was_taken: bool, result_message: str, tick: Dict = None) -> None:
     """Persist signal snapshot for market-quality analytics when DB is available."""
     if HAS_DVF:
+        decision_payload = params if isinstance(params, dict) else {}
+        if was_taken and tick is not None and not decision_payload.get('decision_id'):
+            # Same decision_id links this dvf_signals row to its dvf_trades virtual position.
+            from uuid import uuid4
+            decision_payload = dict(decision_payload)
+            decision_payload['decision_id'] = str(uuid4())
         try:
-            log_decision_event(params if isinstance(params, dict) else {}, was_taken, result_message)
+            log_decision_event(decision_payload, was_taken, result_message)
         except Exception:
             pass
+        if tick is not None:
+            try:
+                record_decision(decision_payload, was_taken, tick)
+            except Exception:
+                pass
 
     if not HAS_DB:
         return
@@ -111,7 +123,7 @@ def entry_signal(tick: Dict, day_type: str, instrument_type: str = "") -> Tuple[
     Uses multi-factor scoring system:
     - 9 bullish factors + 9 bearish factors
     - Requires 4+ score and 70%+ confidence
-    - Fixed SL 6pts / TP 12pts (R:R 1:2)
+    - Fixed SL 7pts / TP 14pts (R:R 1:2)
     
     Session Trend Logic:
     - If price > opening: BULLISH (CE allowed)
@@ -119,6 +131,11 @@ def entry_signal(tick: Dict, day_type: str, instrument_type: str = "") -> Tuple[
     - If price ≈ opening: SIDEWAYS (both allowed v3.3)
     """
     global last_signal_params
+    if HAS_DVF:
+        try:
+            update_open_positions(tick)
+        except Exception:
+            pass
     recent_ticks = runtime_state.get_recent_ticks(max_items=MAX_RECENT_TICKS)
     
     # Need minimum history - reduced since strategy uses Yahoo data
@@ -214,7 +231,7 @@ def entry_signal(tick: Dict, day_type: str, instrument_type: str = "") -> Tuple[
                     _log_signal_snapshot(enriched_params, False, f"Greeks: {greek_msg}")
                     return False, f"Greeks: {greek_msg}"
 
-            _log_signal_snapshot(enriched_params, True, full_message)
+            _log_signal_snapshot(enriched_params, True, full_message, tick=tick)
             return True, full_message
         else:
             last_signal_params = {}

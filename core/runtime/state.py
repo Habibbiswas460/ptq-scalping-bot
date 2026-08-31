@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from threading import RLock
 from typing import Any, Dict, List, Optional
+
+# Bucket labels/keys below are stamped with a literal "+05:30" suffix to
+# align with AngelOne's IST-timestamped historical candle data. Ticks carry
+# UTC epoch timestamps, so timestamps must be converted to IST explicitly -
+# datetime.fromtimestamp() alone uses the *server's* local timezone, which
+# silently mislabels buckets whenever the process isn't running with an IST
+# system clock (e.g. a UTC-default cloud host).
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 @dataclass
@@ -11,6 +19,7 @@ class RuntimeState:
     """Shared in-memory runtime state for startup and live loop reuse."""
 
     recent_ticks: List[Dict[str, Any]] = field(default_factory=list)
+    historical_candles: List[Dict[str, Any]] = field(default_factory=list)
     candle_history: List[Dict[str, Any]] = field(default_factory=list)
     indicators: Dict[str, Any] = field(default_factory=dict)
     market_snapshot: Dict[str, Any] = field(default_factory=dict)
@@ -54,6 +63,79 @@ class RuntimeState:
         with self._lock:
             self.recent_ticks = []
             self.candle_history = []
+            
+    def set_historical_candles(self, candles: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self.historical_candles = list(candles)
+
+    def get_canonical_candles(self, interval_min: int = 5) -> List[Dict[str, Any]]:
+        """Combine historical candles with the current live accumulated ticks into interval boundaries."""
+        with self._lock:
+            historical = list(self.historical_candles)
+            ticks = list(self.recent_ticks)
+
+        # Build live candles from ticks based on boundaries
+        live_candles_map: Dict[str, Dict[str, Any]] = {}
+        for tick in ticks:
+            price = float(tick.get("spot_price") or tick.get("ltp") or 0)
+            if price <= 0:
+                continue
+
+            ts = tick.get("original_timestamp") or tick.get("timestamp")
+            if isinstance(ts, (int, float)):
+                ts_sec = float(ts) / 1000.0 if float(ts) > 1e10 else float(ts)
+                dt = datetime.fromtimestamp(ts_sec, tz=IST)
+            else:
+                dt = datetime.now(tz=IST)
+
+            # Align to interval bucket
+            minute = dt.minute - (dt.minute % interval_min)
+            bucket_dt = dt.replace(minute=minute, second=0, microsecond=0)
+            
+            # Use ISO string format to align perfectly with get_historical_candles
+            bucket_str = bucket_dt.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+
+            volume = int(tick.get("volume") or 0)
+            bucket = live_candles_map.get(bucket_str)
+            
+            if bucket is None:
+                live_candles_map[bucket_str] = {
+                    "timestamp": bucket_str,
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "volume": volume,
+                    "is_live": True
+                }
+            else:
+                bucket["high"] = max(float(bucket["high"]), price)
+                bucket["low"] = min(float(bucket["low"]), price)
+                bucket["close"] = price
+                bucket["volume"] = int(bucket["volume"]) + volume
+
+        # Merge deterministic historical with live
+        merged_map = {}
+        for c in historical:
+            ts = c.get("timestamp")
+            if ts:
+                # Ensure the same string format if it varies
+                if len(ts) == 16:  # e.g., "2026-08-15 09:15"
+                    ts = ts.replace(" ", "T") + ":00+05:30"
+                merged_map[ts] = {
+                    "timestamp": ts,
+                    "open": c.get("open"),
+                    "high": c.get("high"),
+                    "low": c.get("low"),
+                    "close": c.get("close"),
+                    "volume": c.get("volume"),
+                    "is_live": False
+                }
+            
+        for ts, c in live_candles_map.items():
+            merged_map[ts] = c
+            
+        return [merged_map[key] for key in sorted(merged_map.keys())]
 
     def rebuild_candles(self, source_ticks: Optional[List[Dict[str, Any]]] = None) -> None:
         ticks = source_ticks if source_ticks is not None else self.get_recent_ticks()
@@ -67,9 +149,9 @@ class RuntimeState:
             ts = tick.get("original_timestamp") or tick.get("timestamp")
             if isinstance(ts, (int, float)):
                 ts_sec = float(ts) / 1000.0 if float(ts) > 1e10 else float(ts)
-                minute = datetime.fromtimestamp(ts_sec).strftime("%Y-%m-%d %H:%M")
+                minute = datetime.fromtimestamp(ts_sec, tz=IST).strftime("%Y-%m-%d %H:%M")
             else:
-                minute = datetime.now().strftime("%Y-%m-%d %H:%M")
+                minute = datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M")
 
             volume = int(tick.get("volume") or 0)
             bucket = candles.get(minute)

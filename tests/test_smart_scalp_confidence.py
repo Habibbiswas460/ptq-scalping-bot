@@ -117,7 +117,8 @@ def test_generate_signal_blocks_low_confidence():
 
     assert signal == 0
     assert direction == ""
-    assert confidence == 0
+    # Real confidence must still propagate for DVF/analytics even though the signal is rejected.
+    assert confidence == 60
     assert "Low confidence" in details["reason"]
 
 
