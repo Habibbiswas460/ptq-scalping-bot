@@ -243,6 +243,21 @@ def main():
         )
 
     # ════════════════════════════════════════════════════════════════════════
+    # PRUNE OLD SIGNAL/TICK ROWS — signals/dvf_signals/ticks log every
+    # strategy evaluation or real tick, not just trades, and grow unbounded.
+    # Previously only ever called from app.py's own startup, ahead of
+    # run_with_auto_reconnect() — safe here too even though that means it
+    # can now also run again on each auto-reconnect, since it's a cheap,
+    # idempotent DELETE WHERE timestamp < cutoff either way. Ensures
+    # pruning happens regardless of how main() ends up invoked.
+    # ════════════════════════════════════════════════════════════════════════
+    try:
+        from core.services.database import prune_old_signal_rows
+        prune_old_signal_rows(retention_days=7)
+    except Exception:
+        pass
+
+    # ════════════════════════════════════════════════════════════════════════
     # PRE-MARKET STANDBY MODE
     # If started before 09:10 AM, sleep until 09:10 then connect
     # This ensures fresh ScripMaster + WebSocket connection
