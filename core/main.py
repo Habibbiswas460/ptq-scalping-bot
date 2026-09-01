@@ -31,8 +31,8 @@ from core.risk.validators import (
 from core.engines.entry_engine import entry_signal, MAX_RECENT_TICKS
 from core.engines.exit_engine import check_exit_conditions
 from core.engines.state_machine import (
-    trading_state, state_idle, state_entry_ready, 
-    state_in_trade, state_cooldown
+    trading_state, state_idle, state_entry_ready,
+    state_in_trade, state_cooldown, finalize_trade_exit_accounting
 )
 from core.risk.session_trend import start_trading_session
 from core.risk.kill_switch import emergency_check, check_daily_loss_alert, track_rejected_tick, reset_rejected_tick_counter, is_stale_data_kill_active, is_high_latency_paused
@@ -219,6 +219,10 @@ def close_current_trade(state, reason, logger, current_tick=None) -> bool:
 
     is_loss = result['pnl_inr'] < 0
     state.update_pnl(result['pnl_inr'], TOTAL_CAPITAL, is_loss, trade_direction)
+    finalize_trade_exit_accounting(
+        state.current_trade.get('order_id'), trade_direction, result, reason,
+        state.current_trade, logger, state=state
+    )
     state.current_trade = None
     state.manual_intervention_required = False
     return True
@@ -226,7 +230,18 @@ def close_current_trade(state, reason, logger, current_tick=None) -> bool:
 
 def main():
     """Main trading loop - SMART SCALP v3.4"""
-    
+
+    # ════════════════════════════════════════════════════════════════════════
+    # CONFIG VALIDATION — hard-fail on broken loss-ceiling ordering etc.
+    # before doing anything else, so a bad .env is caught immediately
+    # instead of surfacing hours later as unexpected kill-switch behavior.
+    # ════════════════════════════════════════════════════════════════════════
+    from config.validator import validate_config
+    if not validate_config(auto_fix=False):
+        raise SystemExit(
+            "❌ Configuration validation failed — fix the errors above before starting the bot."
+        )
+
     # ════════════════════════════════════════════════════════════════════════
     # PRE-MARKET STANDBY MODE
     # If started before 09:10 AM, sleep until 09:10 then connect

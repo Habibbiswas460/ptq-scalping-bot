@@ -177,10 +177,28 @@ class ConfigValidator:
         
         # Capital vs max loss
         capital = float(self.get_env_value('TOTAL_CAPITAL', '30000') or '30000')
-        max_loss = float(self.get_env_value('MAX_DAILY_LOSS', '25000') or '25000')
+        # Default matches config/constants.py's MAX_DAILY_LOSS_AMOUNT default
+        # (env_int('MAX_DAILY_LOSS', 3000)) — this validator's own fallback
+        # had drifted to a stale, unrelated 25000 default.
+        max_loss = float(self.get_env_value('MAX_DAILY_LOSS', '3000') or '3000')
         if max_loss > capital * 0.5:
             self.warnings.append(
                 f"⚠️  Max daily loss (₹{max_loss:,.0f}) is more than 50% of capital (₹{capital:,.0f})"
+            )
+
+        # Loss-ceiling ordering: the pre-warning alert must fire before the
+        # soft daily-loss stop, which must fire no later than the hard kill
+        # switch. If this ordering breaks (e.g. a deleted/mistyped .env line
+        # silently falling back to a stale hardcoded default — see
+        # fixed.md §1/§17-adjacent finding), the kill switch could end up
+        # tighter than the daily-loss stop it's meant to backstop, or the
+        # alert could fire after trading has already been halted.
+        kill_switch_loss = float(self.get_env_value('KILL_SWITCH_LOSS', '3000') or '3000')
+        daily_loss_alert = float(self.get_env_value('DAILY_LOSS_ALERT', '1500') or '1500')
+        if not (daily_loss_alert < max_loss <= kill_switch_loss):
+            self.errors.append(
+                f"❌ Loss-ceiling ordering broken: expected DAILY_LOSS_ALERT (₹{daily_loss_alert:,.0f}) "
+                f"< MAX_DAILY_LOSS (₹{max_loss:,.0f}) <= KILL_SWITCH_LOSS (₹{kill_switch_loss:,.0f})"
             )
     
     def _write_fixes(self):
