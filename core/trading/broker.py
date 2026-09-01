@@ -1291,6 +1291,50 @@ class BrokerInterface:
     # GET TICK — unified entry point
     # =========================================================================
 
+    def get_tick_for_direction(self, direction: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a real tick for the option contract matching `direction`
+        (CE/PE) at the current strike — even when a different contract is
+        currently subscribed.
+
+        Every entry-decision check that reads a tick (premium filter,
+        delta filter, market-quality's spread/liquidity gate) normally
+        reads get_tick(), which reflects whichever contract is currently
+        subscribed. Pattern detection itself is spot-price-based and
+        direction-agnostic, so smart_scalp_v3.generate_signal() can — and
+        routinely does — return a signal whose direction differs from the
+        subscribed contract (e.g. subscribed to a CE, but the pattern
+        match is PE). place_order() switches the subscription to match at
+        order time, but every check before that point had already run
+        against the wrong contract's price, spread and premium. Callers
+        use this to re-validate against the contract that will actually
+        be traded before committing to the entry.
+        """
+        target_symbol = self._build_option_symbol(self.current_strike, direction)
+        if target_symbol == self.current_symbol:
+            return self.get_tick()
+
+        if not self.broker_client:
+            return None
+
+        try:
+            tick = self.broker_client.get_market_tick(symbol=target_symbol, exchange=EXCHANGE)
+        except Exception as e:
+            self.logger.warning(f"⚠ Cross-direction tick fetch failed for {target_symbol}: {e}")
+            return None
+
+        if not tick:
+            return None
+
+        tick_ts = current_time_ms()
+        tick['spot_price'] = self.spot_price
+        tick['strike'] = self.current_strike
+        tick['direction'] = direction
+        tick['symbol'] = target_symbol
+        tick['timestamp'] = tick_ts
+        tick['original_timestamp'] = tick_ts
+        return tick
+
     def get_tick(self) -> Optional[Dict[str, Any]]:
         """
         Get current market tick data (Algo Trading Optimized).
