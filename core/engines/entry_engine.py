@@ -18,7 +18,8 @@ from core.risk.session_trend import (
 )
 from config.constants import (
     MIN_CONFIDENCE, MIN_CONFIDENCE_AFTER_3SL,
-    MIN_ENTRY_PREMIUM, MAX_ENTRY_PREMIUM
+    MIN_ENTRY_PREMIUM, MAX_ENTRY_PREMIUM,
+    KILL_SWITCH_SPREAD,
 )
 from core.runtime import runtime_state
 
@@ -156,7 +157,37 @@ def entry_signal(tick: Dict, day_type: str, instrument_type: str = "") -> Tuple[
             # Get instrument type from strategy params
             instrument = params.get('direction', 'CE')
             confidence = params.get('confidence', 0)
-            
+
+            # ═══════════════════════════════════════════════════════════════
+            # CROSS-DIRECTION INSTRUMENT CHECK — pattern detection runs on
+            # spot price (calculate_indicators() prefers tick['spot_price']),
+            # so `instrument` is direction-agnostic and can differ from
+            # whichever option contract is currently subscribed (`tick` here
+            # reflects that subscription, not necessarily `instrument`).
+            # broker.place_order() switches the subscription to match at
+            # order time, but every tick-based check below this point —
+            # premium, spread — must validate against the contract that will
+            # actually be traded, not the one we happened to be streaming.
+            # See fixed.md's entry-engine audit for how this previously let
+            # sub-₹70-premium, wide-spread contracts through undetected.
+            # ═══════════════════════════════════════════════════════════════
+            execution_tick = tick
+            try:
+                from core.trading.broker import broker
+                current_symbol = getattr(broker, 'current_symbol', '') or ''
+                if current_symbol and not current_symbol.endswith(instrument):
+                    fresh_tick = broker.get_tick_for_direction(instrument)
+                    if not fresh_tick:
+                        _log_signal_snapshot(params, False, f"Cross-direction tick unavailable for {instrument}")
+                        return False, f"Cross-direction tick unavailable for {instrument}"
+                    execution_tick = fresh_tick
+            except Exception:
+                # Can't determine/fetch the cross-direction contract — fall
+                # back to the subscribed tick rather than crash the entry
+                # decision; the premium/spread checks below still run,
+                # just against the pre-fix instrument as before.
+                pass
+
             # ═══════════════════════════════════════════════════════════════
             # CONFIDENCE FILTER (v3.4) - Minimum 70%, 85% after 3 consecutive SL
             # ═══════════════════════════════════════════════════════════════
@@ -165,27 +196,42 @@ def entry_signal(tick: Dict, day_type: str, instrument_type: str = "") -> Tuple[
                 consecutive_losses = trading_state.consecutive_losses
             except:
                 consecutive_losses = 0
-            
+
             # After 3 consecutive SL, require higher confidence
             required_conf = MIN_CONFIDENCE_AFTER_3SL if consecutive_losses >= 3 else MIN_CONFIDENCE
-            
+
             if confidence < required_conf:
                 _log_signal_snapshot(params, False, f"Low confidence {confidence}% < {required_conf}%")
                 if consecutive_losses >= 3:
                     return False, f"Low conf {confidence}% < {required_conf}% (3+ SL streak)"
                 return False, f"Low confidence {confidence}% < {required_conf}%"
-            
+
             # ═══════════════════════════════════════════════════════════════
             # ENTRY PRICE FILTER (v3.1) - ATM nearby ₹90-150 range
+            # Validated against execution_tick — the contract that will
+            # actually be traded, not necessarily the subscribed one.
             # ═══════════════════════════════════════════════════════════════
-            current_premium = tick.get('ltp', 0)
+            current_premium = execution_tick.get('ltp', 0)
             if current_premium < MIN_ENTRY_PREMIUM:
                 _log_signal_snapshot(params, False, f"Premium too low ₹{current_premium:.0f} < ₹{MIN_ENTRY_PREMIUM:.0f}")
                 return False, f"Premium too low ₹{current_premium:.0f} < ₹{MIN_ENTRY_PREMIUM:.0f}"
             if current_premium > MAX_ENTRY_PREMIUM:
                 _log_signal_snapshot(params, False, f"Premium too high ₹{current_premium:.0f} > ₹{MAX_ENTRY_PREMIUM:.0f}")
                 return False, f"Premium too high ₹{current_premium:.0f} > ₹{MAX_ENTRY_PREMIUM:.0f}"
-            
+
+            # ═══════════════════════════════════════════════════════════════
+            # SPREAD SANITY CHECK — only meaningful on execution_tick; the
+            # same 0.6% ceiling the wide-spread kill switch enforces
+            # mid-trade, checked here before entry instead of after.
+            # ═══════════════════════════════════════════════════════════════
+            exec_bid = execution_tick.get('bid', 0)
+            exec_ask = execution_tick.get('ask', 0)
+            if exec_bid and exec_ask and exec_ask > exec_bid:
+                exec_spread_pct = (exec_ask - exec_bid) / exec_ask * 100
+                if exec_spread_pct > KILL_SWITCH_SPREAD:
+                    _log_signal_snapshot(params, False, f"Spread too wide {exec_spread_pct:.2f}% > {KILL_SWITCH_SPREAD:.2f}%")
+                    return False, f"Spread too wide {exec_spread_pct:.2f}% > {KILL_SWITCH_SPREAD:.2f}%"
+
             # Get RSI from strategy details for reversal detection
             details = params.get('details', {})
             rsi = details.get('rsi', 50)
@@ -206,32 +252,36 @@ def entry_signal(tick: Dict, day_type: str, instrument_type: str = "") -> Tuple[
             full_message = f"{message} | {trend_str}"
             
             # Store params with execution reference context for anti-chase guard.
-            signal_tick_ts = tick.get('original_timestamp') or tick.get('timestamp')
+            # Uses execution_tick — the drift guard must compare the same
+            # contract's price at signal time vs. fill time, not one
+            # contract's signal-time price against a different contract's
+            # fill-time price.
+            signal_tick_ts = execution_tick.get('original_timestamp') or execution_tick.get('timestamp')
             enriched_params = dict(params)
-            enriched_params['signal_ltp'] = tick.get('ltp', tick.get('price', 0))
-            enriched_params['signal_spot_price'] = tick.get('spot_price')
+            enriched_params['signal_ltp'] = execution_tick.get('ltp', execution_tick.get('price', 0))
+            enriched_params['signal_spot_price'] = execution_tick.get('spot_price')
             enriched_params['signal_timestamp'] = signal_tick_ts
             enriched_params['signal_recorded_at'] = datetime.now().isoformat()
 
             # Store params for use by trade_manager
             last_signal_params = enriched_params
-            
+
             # Additional PTQ validation (optional - for extra safety)
             if not PAPER_TRADING:
                 # Time validation
-                greeks = _calculate_greeks(tick)
+                greeks = _calculate_greeks(execution_tick)
                 time_ok, time_msg = validate_time_ptq(greeks)
                 if not time_ok:
                     _log_signal_snapshot(enriched_params, False, f"Time: {time_msg}")
                     return False, f"Time: {time_msg}"
-                
+
                 # Greeks gate
                 greek_pass, greek_msg = greek_gate(greeks, day_type)
                 if not greek_pass:
                     _log_signal_snapshot(enriched_params, False, f"Greeks: {greek_msg}")
                     return False, f"Greeks: {greek_msg}"
 
-            _log_signal_snapshot(enriched_params, True, full_message, tick=tick)
+            _log_signal_snapshot(enriched_params, True, full_message, tick=execution_tick)
             return True, full_message
         else:
             last_signal_params = {}
