@@ -16,8 +16,19 @@ calls. These tests protect that invariant.
 """
 from datetime import datetime, timedelta
 
+import pytest
+
+import core.risk.risk_manager as risk_manager_module
 from core.engines.state_machine import TradingState, check_trade_limits
 from core.risk.risk_manager import RiskManager, set_risk_manager
+
+
+@pytest.fixture(autouse=True)
+def _reset_risk_manager_singleton(monkeypatch):
+    """set_risk_manager() below writes the real module-level singleton with
+    no built-in restore — reset it after each test so these tests can't leak
+    a RiskManager instance into whatever test runs next."""
+    monkeypatch.setattr(risk_manager_module, "_risk_manager", None)
 
 
 class _NullLogger:

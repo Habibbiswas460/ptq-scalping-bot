@@ -1305,9 +1305,9 @@ run_syntax_check() {
              core/risk/kill_switch.py core/risk/risk_manager.py core/risk/greeks_calc.py \
              core/risk/session_trend.py core/risk/validators.py \
              core/services/database.py core/services/mode_switch.py \
-             core/services/session_manager.py core/services/telegram_bot.py \
+             core/services/telegram_bot.py \
              strategies/smart_scalp_v3.py config/constants.py config/validator.py \
-             utils/analytics.py utils/greeks.py utils/helpers.py utils/logger.py utils/monitoring.py \
+             utils/analytics.py utils/greeks.py utils/helpers.py utils/logger.py \
              brokers/angel_one/client.py brokers/angel_one/exceptions.py; do
         total=$((total + 1))
         if [ -f "$f" ]; then
@@ -1815,13 +1815,7 @@ menu_tools() {
             ;;
         7)
             printf "    ${BWHITE}Bot Monitor Status:${NC}\n\n"
-            "$PYTHON_BIN" -c "
-from utils.monitoring import get_monitor
-m = get_monitor()
-s = m.get_status()
-for k, v in s.items():
-    print(f'      {k:20s}: {v}')
-" 2>/dev/null || printf "    ${DIM}Monitor not available (bot not running)${NC}\n"
+            printf "    ${DIM}Not available — utils/monitoring.py was removed (confirmed unused: no code path in the live bot ever wrote to it, so this always showed an empty snapshot). Use System Health from the main menu for a real diagnostic, or [8] Market Readiness Pro here.${NC}\n"
             ;;
         8)
             run_market_readiness_check standard 35 0.5 60

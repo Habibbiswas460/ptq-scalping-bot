@@ -226,7 +226,6 @@ utils/
 ├── helpers.py
 ├── logger.py
 ├── market_readiness_checker.py
-├── monitoring.py
 ├── mq_validation_report.py
 ```
 
@@ -234,7 +233,6 @@ utils/
 - [utils/greeks.py](utils/greeks.py): Greek calculation helpers.
 - [utils/logger.py](utils/logger.py): bot logging setup.
 - [utils/market_readiness_checker.py](utils/market_readiness_checker.py): readiness checks for trading sessions.
-- [utils/monitoring.py](utils/monitoring.py): monitoring functions.
 - [utils/mq_validation_report.py](utils/mq_validation_report.py): market-quality validation reporting.
 - [utils/analytics.py](utils/analytics.py): analytics utilities.
 
