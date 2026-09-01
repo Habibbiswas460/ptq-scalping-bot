@@ -267,6 +267,26 @@ class TestClientReliabilityHardening:
         assert "NFO:12345:2" in client.ws_subscriptions
         client._wait_for_ack.assert_not_called()
 
+    def test_unsubscribe_is_fire_and_forget_no_blocking_ack_wait(self):
+        # Same fire-and-forget rationale as subscribe() above (see
+        # findings.md §2.10 / fixed.md §14.8) — unsubscribe() must not block
+        # waiting for an ack SmartAPI never sends either.
+        logger = MagicMock()
+        client = AngelOneClient("k", "c", "p", "t", logger=logger)
+        client.ws_connected = True
+        client.ws = MagicMock()
+        client.ws.sock = object()
+        client.subscriptions["12345"] = 2
+        client.ws_subscriptions["NFO:12345:2"] = {"token": "12345", "mode": 2}
+        client._wait_for_ack = MagicMock(return_value=False)
+
+        ok = client.unsubscribe([("NFO", "12345", 2)])
+
+        assert ok is True
+        assert "12345" not in client.subscriptions
+        assert "NFO:12345:2" not in client.ws_subscriptions
+        client._wait_for_ack.assert_not_called()
+
     def test_duplicate_subscribe_is_skipped(self):
         logger = MagicMock()
         client = AngelOneClient("k", "c", "p", "t", logger=logger)

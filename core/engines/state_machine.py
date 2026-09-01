@@ -886,6 +886,69 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
         return "COOLDOWN"
 
 
+def finalize_trade_exit_accounting(order_id, trade_direction, result, exit_reason,
+                                    current_trade, logger, state=None):
+    """Post-exit accounting shared by every exit path — the normal SL/TP/RSI
+    exit below in state_in_trade(), and kill-switch/emergency exits in
+    core/main.py's close_current_trade(). Previously only the normal-exit
+    path ran this (see fixed.md §17), so any kill-switch/stale-data/manual
+    exit left RiskManager's daily PnL and consecutive-loss counters
+    undercounted, the trade's DB row stuck 'OPEN' with no exit data, and its
+    active_positions row stuck 'ACTIVE' forever — the last of which is what
+    §15.11's crash-recovery halt reads on the next restart, so a stale row
+    there triggers a false-positive halt for a position that already closed
+    correctly.
+    """
+    try:
+        from core.risk.risk_manager import get_risk_manager
+        rm = get_risk_manager()
+        if rm:
+            rm.record_trade({'pnl': result['pnl_inr'], 'direction': trade_direction})
+    except Exception as e:
+        # Not a cosmetic failure: RiskManager's daily/weekly PnL and
+        # consecutive-loss counters (used by can_trade()'s risk gates) are
+        # only ever updated here. A swallowed exception means this trade's
+        # loss silently never counts toward those limits, so log it loudly
+        # and track the miss instead of a quiet warning.
+        if state is not None:
+            state.risk_tracking_failures = getattr(state, 'risk_tracking_failures', 0) + 1
+            miss_no = state.risk_tracking_failures
+        else:
+            miss_no = '?'
+        logger.error(
+            f"🚨 RiskManager trade recording FAILED (miss #{miss_no}) - "
+            f"pnl={result.get('pnl_inr')} direction={trade_direction} not counted toward "
+            f"risk limits: {e}",
+            exc_info=True,
+        )
+
+    try:
+        from core.services.database import log_trade_exit
+
+        # Trade-scoped MFE/MAE (tracked live in exit_engine.check_hard_sl on
+        # this exact trade dict) instead of the global rolling tick buffer,
+        # which isn't scoped to a single trade and was wrong ~15-19% of the
+        # time on short-lived trades.
+        log_trade_exit(order_id, {
+            'exit_price': result.get('exit_price'),
+            'exit_time': now(),
+            'exit_reason': result.get('exit_reason', exit_reason),
+            'pnl': result.get('pnl_inr', 0),
+            'pnl_pct': result.get('pnl_pct', 0),
+            'hold_time_sec': result.get('hold_time', 0),
+            'mfe': (current_trade or {}).get('mfe_inr', 0.0),
+            'mae': (current_trade or {}).get('mae_inr', 0.0),
+        })
+    except Exception as e:
+        logger.warning(f"⚠ DB trade exit logging failed: {e}")
+
+    try:
+        from core.services.database import close_position
+        close_position(order_id)
+    except Exception as e:
+        logger.warning(f"⚠ Active-position recovery record close failed: {e}")
+
+
 def state_in_trade(tick: Dict, greeks: Dict, state: TradingState,
                    exit_check_func, broker, total_capital: float, logger) -> str:
     """Handle IN_TRADE state - Monitor and exit"""
@@ -962,50 +1025,10 @@ def state_in_trade(tick: Dict, greeks: Dict, state: TradingState,
         is_loss = result['pnl_inr'] < 0
         state.update_pnl(result['pnl_inr'], total_capital, is_loss, trade_direction)
 
-        try:
-            from core.risk.risk_manager import get_risk_manager
-            rm = get_risk_manager()
-            if rm:
-                rm.record_trade({'pnl': result['pnl_inr'], 'direction': trade_direction})
-        except Exception as e:
-            # This is not a cosmetic failure: RiskManager's daily/weekly PnL and
-            # consecutive-loss counters (used by can_trade()'s risk gates) are
-            # only ever updated here. A swallowed exception means this trade's
-            # loss silently never counts toward those limits, so log it loudly
-            # and track the miss instead of a quiet warning.
-            state.risk_tracking_failures = getattr(state, 'risk_tracking_failures', 0) + 1
-            logger.error(
-                f"🚨 RiskManager trade recording FAILED (miss #{state.risk_tracking_failures}) - "
-                f"pnl={result.get('pnl_inr')} direction={trade_direction} not counted toward "
-                f"risk limits: {e}",
-                exc_info=True,
-            )
-
-        try:
-            from core.services.database import log_trade_exit
-
-            # Trade-scoped MFE/MAE (tracked live in exit_engine.check_hard_sl on
-            # this exact trade dict) instead of the global rolling tick buffer,
-            # which isn't scoped to a single trade and was wrong ~15-19% of the
-            # time on short-lived trades.
-            log_trade_exit(state.current_trade.get('order_id'), {
-                'exit_price': result.get('exit_price', tick.get('ltp')),
-                'exit_time': now(),
-                'exit_reason': result.get('exit_reason', exit_reason),
-                'pnl': result.get('pnl_inr', 0),
-                'pnl_pct': result.get('pnl_pct', 0),
-                'hold_time_sec': result.get('hold_time', 0),
-                'mfe': state.current_trade.get('mfe_inr', 0.0),
-                'mae': state.current_trade.get('mae_inr', 0.0),
-            })
-        except Exception as e:
-            logger.warning(f"⚠ DB trade exit logging failed: {e}")
-
-        try:
-            from core.services.database import close_position
-            close_position(state.current_trade.get('order_id'))
-        except Exception as e:
-            logger.warning(f"⚠ Active-position recovery record close failed: {e}")
+        finalize_trade_exit_accounting(
+            state.current_trade.get('order_id'), trade_direction, result, exit_reason,
+            state.current_trade, logger, state=state
+        )
 
         if CONFIG['telegram'].get('notify_exits'):
             try:

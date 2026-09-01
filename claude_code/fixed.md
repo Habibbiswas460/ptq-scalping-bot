@@ -477,3 +477,84 @@ User asked whether anything was left in findings.md, and — since real open ite
 `run.sh`, `PROJECT_STRUCTURE.md`, `VERSION` (new), `config/constants.py`, `core/services/mode_switch.py`, `core/services/__init__.py`, `core/services/session_manager.py` (deleted), `core/services/database.py`, `core/engines/state_machine.py`, `core/main.py`, `core/trading/broker.py`, `core/validation/paper_executor.py`, `core/validation/walk_forward_backtest.py`, `.env`, `.env.example`, `tests/test_backtest_exit_engine_parity.py` (new). `.venv/` removed from disk (untracked). Full test suite green throughout (`venv/bin/python -m pytest tests/`: 171 passed, 1 skipped — up from 168 thanks to the 3 new backtest exit-engine tests).
 
 **`claude_code/report/findings.md` has been deleted** — everything it contained is now here, in this file, either as a completed fix (above) or honestly documented as still-open-but-not-a-code-bug (§15.7, §15.13-§15.15).
+
+---
+
+## 16. Live-session audit, 2026-09-01 (paper mode) — §14.7/§14.8/§12/§15.11 all confirmed working live for the first time
+
+Post-close read-only audit of `logs/2026-09-01/` against every fix listed above. Session: paper mode, 08:14-15:30 IST, two process restarts before market open, 10 trades (4W/6L, ₹-59.80 PnL), 18 spread-based kill-switch activations, no crash mid-trade.
+
+### 16.1 §14.7/§2.9 — Consecutive-loss double-pause: confirmed fixed live
+- **Zero `"RISK BLOCKED"` lines anywhere in the session** (the old symptom of the second, stale-clock pause firing right after the first one ended).
+- Exactly one pause cycle observed: `Consec Losses` climbed 0→1→2 through the morning, then a single `"[11:05:39] [INFO] ✅ Streak pause ended. Resetting win/loss streak."` — one pause, one clean reset, no follow-on second pause immediately after. This is the first live confirmation of §14.7 since it was merged un-verified on 08-31.
+- Separately, the still-intentional per-direction CE/PE cooldown (unrelated mechanism, explicitly left alone by §14.7) also behaved correctly: `"CE blocked (2 losses, Nmin cooldown)"` counted cleanly down 14min→1min with no double-fire.
+
+### 16.2 §14.8/§2.10 — WebSocket ACK wait removal: confirmed fixed live
+- **Zero `"ACK Timeout"` and zero `"ACK Received"` lines in the entire session** — exactly the expected signature now that `subscribe()`/`unsubscribe()` are fire-and-forget and never wait on the removed `_wait_for_ack()` path. No 5s-per-call stalls observed. First live confirmation since 08-31.
+
+### 16.3 §12 — DVF orphaned-OPEN reconciliation on restart: exercised live, worked correctly
+- Bot actually restarted twice before market open (`08:14:01` and `09:10:00` full startup banners, plus an `08:20:22` auto-reconnect). The second restart logged `"[09:10:02] [INFO] DVF: reconciled 3 stale OPEN virtual position(s) from a prior run"` — the reconciler fired and force-closed the 3 stale rows exactly as designed, with no orphaned-forever rows left behind. First live restart-triggered exercise of this fix since it landed 08-30.
+
+### 16.4 §15.11 — Live-position crash-recovery: not exercised (no signal either way)
+- Both restarts happened before the first trade (`09:45:41`), so no position was ever open across a restart today. Zero `CRITICAL`/`KILL_SWITCH`(-halt)/`manual_intervention_required` lines, consistent with "never triggered" rather than "triggered and worked" or "should have triggered and didn't." **Still unverified against a real mid-trade crash** — unchanged from §15.13's standing caveat.
+
+### 16.5 §15.16 — DVF daily-report IST/UTC boundary: not exercised (outside the vulnerable window)
+- Both restarts (08:14, 09:10) and the end-of-day report generation (19:02:18) all fall well after the 05:30 IST danger window described in §15.16. Nothing to verify today.
+
+### 16.6 New observation, not a bug: entries throttled by design after the 3rd loss for the rest of the session
+- Trade 10 (`11:20:45`, 82% confidence) got through just before the 3+ SL-streak confidence gate started actively suppressing entries — the first `"📊 Low conf 82% < 85% (3+ SL streak)"` line appears at `11:55:25`, after `Consec Losses` had already reached 3. From then through `15:30` (end of session) the gate kept suppressing 82%-confidence signals against an 85% floor, and `Consec Losses` stayed pinned at 3 with no further trades. This is existing, intentional confidence-threshold behavior (not part of any fixed.md item) — flagged here only as context for why the session went quiet after 11:21 despite the bot running until 15:30, not as a finding.
+
+**Net result: the two fixes most in need of live verification (§14.7, §14.8) are now both confirmed working correctly under real live conditions, plus a bonus confirmation of §12's restart-reconciliation path. §15.11 and §15.16 remain unverified simply because today's session never exercised their trigger conditions — nothing wrong found, nothing new to fix.**
+
+---
+
+## 17. Bug found during a deep follow-up audit (2026-09-01, evening), then fixed same pass: §15.11's write-side wiring was incomplete — only the "normal" exit path closed the DB position row
+
+**Found independently by two separate lines of investigation (a live-order pre-flight-checklist review, and a broad duplicate-tracker sweep) that converged on the same root cause and the same live repro. Fixed later the same evening — see §18.**
+
+**What's wrong:** `close_position(order_id)` — the write that marks a `database.py` `active_positions` row `CLOSED`, added by §15.11 — is called from exactly one place: `state_machine.py:1006`, inside the normal SL/TP/RSI-exit block. `save_position()` (the entry-side write, same §15.11) fires unconditionally for every trade at `state_machine.py:847`, regardless of how it eventually exits — but `close_position()` does not have a matching unconditional call. `core/main.py`'s `close_current_trade()` (`main.py:199-224`) — the exit path used for every kill-switch exit, network-down emergency exit, and manual/error shutdown, 5 call sites at `main.py:529, 584, 647, 803, 823` — calls `broker.exit_position()` but never `close_position()`.
+
+**Confirmed live, right now, in the real DB:** querying `core/data/trades.db` for 2026-09-01 shows 8 of today's 10 paper trades correctly `CLOSED`, but `PAPER_1788236441_1` (09:50:41) and `PAPER_1788237050_0` (10:00:50) — both closed via `"Kill switch: Wide spread KILL"` per `trades.csv`, and genuinely flat, not actually orphaned — are still sitting `ACTIVE`.
+
+**Why it matters:** on the *next* bot restart, `core/main.py`'s startup check (`get_active_positions()`, the read-side of §15.11) will find these two rows and fire the CRITICAL / `manual_intervention_required` halt §15.11 built for genuinely-orphaned positions — a false positive, for positions that were already closed correctly. Given wide-spread kill-switches fired 18 times in a single session today (see the spread-kill-switch analysis from this same audit pass), this is not a rare edge case — any kill-switch exit followed by a restart before the next real trade will reproduce it.
+
+**A second, more consequential version of the same gap:** `RiskManager.record_trade()` (`daily_pnl +=`, `risk_manager.py:494`) and `update_streak()` (`consecutive_losses`/`consecutive_wins`) are also only called from `state_machine.py:969`, the same normal-exit-only call site. So `RiskManager.daily_pnl` — which actively feeds real gating logic today (profit-lock position sizing, `risk_manager.py:356-358`; `consumed_daily_loss`, `risk_manager.py:463`) — is currently missing every kill-switch/emergency-exit loss, and `RiskManager.consecutive_losses` (the §14.7 pause's own counter) is undercounting losses from the same exit paths for the identical reason. This is the same class of bug §14.7 fixed, on a different exit branch §14.7 never touched.
+
+**Also found in the same sweep:** a third, currently-dormant consecutive-loss tracker — `core/services/mode_switch.py`'s `ModeState.consecutive_losses` (`mode_switch.py:122`, fed from the same `TradingState.update_pnl()` call site as the other two) — is inert only because of the existing, already-documented §15.7 paper-mode bypass. In live mode it would independently drive AGGRESSIVE→SAFE mode switching on its own 60s cooldown, unsynchronized with RiskManager's pause. Not a live bug today; worth registering before live trading starts.
+
+**Status when first written: not fixed, flagged for a decision** — the fix touches the same real-money risk-gating surface §14.7 did, so this was reported rather than changed unilaterally in the same pass as a read-only audit. **User asked to fix it (and the rest of the audit's findings) the same session — see §18.1 for the actual fix.**
+
+**Files implicated:** `core/main.py`, `core/engines/state_machine.py`, `core/services/database.py`, `core/risk/risk_manager.py`.
+
+---
+
+## 18. Same-evening fix pass on the deep-audit findings (§1-§8 of the user's follow-up questions, 2026-09-01)
+
+User asked follow-up questions across 8 areas (config drift, per-session config snapshot, the day's spread kill-switches, regression-test coverage for §14.7/§14.8, a summary.json counter discrepancy, confidence-gate instrumentation, a duplicate-tracker sweep, and a live-order test plan), then said to fix everything actionable that came out of it. Full test suite (`venv/bin/python -m pytest tests/`) green before, throughout, and after every change below (171 → 181 passed, 1 skipped throughout); import smoke tests (`python3 -c "import core.main; ..."`) run after every edit per the §15.12 lesson.
+
+### 18.1 §17 fixed: exit accounting now runs on every exit path, not just the normal one
+- **Fix:** factored the three post-exit accounting calls (`RiskManager.record_trade()`, `log_trade_exit()`, `close_position()`) out of `state_machine.py`'s normal SL/TP/RSI exit block into a new shared helper, `finalize_trade_exit_accounting()`, and call it from both there and from `core/main.py`'s `close_current_trade()` — the kill-switch/stale-data/high-latency/manual-shutdown exit path that previously only called `state.update_pnl()` and stopped.
+- **Live data corrected:** the two rows this bug left stuck `ACTIVE`/`OPEN` today (`PAPER_1788236441_1`, `PAPER_1788237050_0`) were backfilled with their real exit data (from `trades.csv`, which had it correctly all along) via `log_trade_exit()`/`close_position()`, run directly against the live DB — both now `CLOSED` in `active_positions` and `trades`, matching all 10 of today's trades. This removes the false-positive-halt risk on the next restart.
+- **Not done:** `mode_switch.py`'s third, currently-dormant `ModeState.consecutive_losses` tracker (found in the same sweep) was left untouched — it's inert only because of the existing §15.7 paper-mode bypass, which is itself an open design decision needing owner sign-off, not something to fold into this fix unilaterally.
+- **Tests:** `tests/test_close_current_trade_exit_accounting.py` (new, 3 tests) — asserts `close_current_trade()` calls the shared finalizer, that a kill-switch exit reaches `close_position()` for the exited order_id, and that it reaches `RiskManager.record_trade()` with the correct pnl/direction.
+- **Files:** `core/engines/state_machine.py`, `core/main.py`, `tests/test_close_current_trade_exit_accounting.py` (new).
+
+### 18.2 §1a fixed: startup now validates the loss-ceiling ordering, and actually runs at startup
+- **What was wrong:** `config/validator.py` existed but was never called from `core/main.py` — only from `run.sh`'s manual "System Check" menu — so a broken config would never be caught by just starting the bot normally. It also didn't check the KILL_SWITCH_LOSS/MAX_DAILY_LOSS/DAILY_LOSS_ALERT relationship at all.
+- **Fix:** added a check to `ConfigValidator._validate_consistency()` asserting `DAILY_LOSS_ALERT < MAX_DAILY_LOSS <= KILL_SWITCH_LOSS`, added as a hard error (not just a warning, given it's a real-money kill-switch ordering). Wired `validate_config()` into the very top of `core/main.py`'s `main()`, before the pre-market standby sleep, so a broken config fails fast (`SystemExit`) instead of surfacing hours later as unexpected kill-switch behavior.
+- **Bonus fix found along the way:** `_validate_consistency()`'s own `MAX_DAILY_LOSS` fallback default had drifted to a stale, unrelated `25000` (vs. `config/constants.py`'s actual `3000` default) — corrected to `3000` to match.
+- **Bonus fix found along the way:** `ConfigValidator.load_env()` writes every parsed key straight into the real process `os.environ` (pre-existing behavior, left in place — appears intentional for downstream config reads) with no test-side cleanup; this was leaking values between test files (`KILL_SWITCH_LOSS`/`DAILY_LOSS_ALERT` weren't in `tests/test_config_validator.py`'s `CONFIG_ENV_KEYS` cleanup list, so one test's tmp `.env` values leaked into the next). Added both keys to that list.
+- **Tests:** `tests/test_config_validator.py` — added `test_validate_config_flags_broken_loss_ceiling_ordering` and `test_validate_config_accepts_correctly_ordered_loss_ceilings`; updated one existing fixture that had an incidental (pre-existing-check-irrelevant) ordering conflict.
+- **Files:** `config/validator.py`, `core/main.py`, `tests/test_config_validator.py`.
+
+### 18.3 §1e — `.env.example` synced to the live `.env`'s intentionally-tuned values
+- The 6 drifted variables found in the audit (`DELTA_MAX`, `ENTRY_MAX_DRIFT_PCT`, `KILL_SWITCH_LATENCY_MS`, `MIN_OPTION_PRICE`, `RSI_REVERSAL_MIN_PROFIT_POINTS`, `TICK_TIMEOUT_SEC`) are all live tunings tighter/different than the documented example — not bugs in `.env` itself. Synced `.env.example` to match so the template stops being misleading; **`.env` itself and `config/constants.py`'s in-code fallback defaults were deliberately left untouched** — changing the actual fallback-safety-net values that fire when a line goes missing from `.env` is a real behavior change to a real-money bot's safety net, not a documentation fix, and wasn't asked for.
+- **File:** `.env.example`.
+
+### 18.4 §7 cleanup — one confirmed-dead module deleted
+- `utils/monitoring.py`'s `BotMonitor`/`get_monitor()` (found fully dead in the duplicate-tracker sweep — zero callers anywhere in the codebase, confirmed again directly, including a check for the module itself never being imported anywhere) deleted outright, following the same standard as §15.10's `session_manager.py` deletion.
+- **Not done:** `database.py`'s dead `daily_pnl` schema column (also found fully unused) was **left in place** — deleting a live production SQLite column needs a migration, not just a code edit, and the value of removing an inert nullable column is low relative to that risk; noted here instead of acted on.
+- **File:** `utils/monitoring.py` (deleted).
+
+### 18.5 Net test count
+171 → **181 passed, 1 skipped** (10 new tests: 4 in §4's `test_consecutive_loss_pause_regression.py`, 1 unsubscribe test added to `test_websocket.py`, 3 in §18.1's `test_close_current_trade_exit_accounting.py`, 2 in §18.2's loss-ceiling-ordering tests).
