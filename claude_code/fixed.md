@@ -1,6 +1,15 @@
 # PTQ Scalping Bot — Fixed / Resolved Log
 
-**Split from `claude_code/report/findings.md` on 2026-08-31** to keep that document focused on what's still actually open. Everything here has been fixed, verified, confirmed as a non-issue, or is a completed/executed plan — nothing in this file needs further action unless explicitly noted otherwise. Section/item numbers are kept identical to their original numbering in the fix log (some numbers are non-contiguous — e.g. §2.2/§2.4 are missing from Section 2 below because those two are still open and live in `findings.md` instead) so existing cross-references (`see §X.Y`) still resolve correctly across both files.
+**Originally split from `claude_code/report/findings.md` on 2026-08-31.** `findings.md` was fully retired and deleted on 2026-08-31/09-01 (§15) — every item it still held was fixed or, where it was genuinely not a code bug, absorbed here as an honestly-documented open item instead. **This file is now the sole living fix/status log for the project.** Any older passage below that still says "see findings.md" is a dated snapshot from before the retirement — it means what it says at that point in the timeline, but the file it points to no longer exists; the item it refers to was either fixed later in this same document or is one of the still-open items listed just below. Section/item numbers are kept identical to their original numbering in the fix log (hence non-contiguous in places) so existing cross-references (`see §X.Y`) keep resolving correctly.
+
+**Genuinely still open right now (not code bugs — decisions or more data needed, not further code changes):**
+- **§15.7** — AGGRESSIVE↔SAFE↔LOCKDOWN paper-mode bypass: a deliberate design choice, standing until the owner explicitly decides to change it.
+- **§15.13/§2.2** — live (real-money) order path has zero execution history; needs a deliberate small-size live test before scaling. A concrete pre-flight test plan exists (from the 2026-09-01 follow-up audit) but hasn't been run.
+- **§15.14/§2.4** — one historical rate-limit occurrence; watch-and-see, no fix proposed until it recurs.
+- **§15.15/§3** — statistical/expectancy questions that need more live trading data (bigger intraday moves) than exists yet.
+- **§15.11's crash-recovery halt** — logic is in place and its write-side gap is now fully closed (§17/§18.1), but the halt path itself has still never been exercised against a real mid-trade crash.
+- **§18.1's "not done"** — `mode_switch.py`'s third, dormant consecutive-loss tracker — tied to §15.7 above, not actionable on its own.
+- **§18.3/§18.4's "not done"** — `config/constants.py`'s fallback defaults for 6 drifted vars, and `database.py`'s dead `daily_pnl` column — both deliberately left alone (real safety-net values / live schema migration risk), not oversights.
 
 ---
 
@@ -271,7 +280,7 @@ A multi-agent (8-angle) code review was run against the full scope in play: the 
 - **Verified live 2026-08-31:** the second bot process that morning (booted 09:49:46, after the first process's restart) logged `Kill: ₹3000 │ Max Loss: ₹3000` at startup, confirming the fix took effect for the rest of that session.
 - **Live-effect caveat (resolved):** the bot process already running at the time (PID 147895, started 08:07 that morning) had loaded the old `KILL_SWITCH_LOSS=600` into memory at import time — the `.env` edit didn't affect that process until restart. A restart did happen later that morning (confirmed via the log evidence above), so this is no longer a live caveat.
 - **Files:** `.env` only.
-- **Note:** three follow-up items from this fix (`.env.example` template still stale at 600, `config/constants.py`'s in-code defaults still mismatched, `check_daily_loss_alert()` still dead) are genuinely still open — see `findings.md`'s "Outstanding follow-ups" section.
+- **Note (status as of 2026-08-31):** three follow-up items from this fix (`.env.example` template still stale at 600, `config/constants.py`'s in-code defaults still mismatched, `check_daily_loss_alert()` still dead) were open at the time. **All three are now resolved:** `config/constants.py`'s defaults were updated to 3000/3000/1500 to match `.env` (confirmed by the 2026-09-01 audit, see §1b in that pass's findings); `check_daily_loss_alert()` is wired live at `core/main.py:638` (found already fixed, undocumented, by that same audit); `.env.example`'s loss-ceiling values match `.env` (600 was already gone by the time of the audit) and the 6 unrelated drifted variables found in that audit were synced in §18.3.
 
 ---
 
