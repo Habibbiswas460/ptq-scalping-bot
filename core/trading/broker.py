@@ -68,6 +68,7 @@ class BrokerInterface:
         # WebSocket tick state (thread-safe)
         self._tick_lock = threading.Lock()
         self.last_tick: Optional[Dict] = None
+        self._last_logged_tick: Optional[tuple] = None  # (symbol, ltp, bid, ask) dedup key for tick persistence
         self.last_valid_tick_time: Optional[datetime] = None  # When we last SERVED a tick
         self._ws_original_tick_time: Optional[float] = None   # When original tick data arrived
         self._ws_connected: bool = False
@@ -1340,10 +1341,42 @@ class BrokerInterface:
         Get current market tick data (Algo Trading Optimized).
         Priority: WebSocket -> REST polling -> Simulation
         Each tick is tagged with 'data_source' for tracking.
-        
+
         Note: Layer 1 heartbeat monitor handles staleness detection and
         triggers reconnect automatically. This method focuses on data delivery.
+
+        Every real (non-simulated) tick returned here is also persisted to
+        the ticks table for future strategy-layer analysis — see
+        fixed.md's tick-persistence entry. This is the single funnel point
+        all three tick sources converge through, so it's the one place
+        that needs to log rather than each source individually.
         """
+        tick = self._get_tick_uncached()
+        if tick and tick.get('data_source') != 'SIMULATION':
+            self._persist_tick(tick)
+        return tick
+
+    def _persist_tick(self, tick: Dict[str, Any]) -> None:
+        """Write a real tick to the ticks table, deduped on
+        (symbol, ltp, bid, ask) so the ~2Hz main-loop cadence re-serving an
+        unchanged cached WS tick (see the 'Refresh timestamp to NOW' path
+        below) doesn't flood the table with identical rows — every row
+        persisted here represents an actual price change.
+        """
+        symbol = tick.get('symbol')
+        if not symbol:
+            return
+        key = (symbol, tick.get('ltp'), tick.get('bid'), tick.get('ask'))
+        if key == getattr(self, '_last_logged_tick', None):
+            return
+        self._last_logged_tick = key
+        try:
+            from core.services.database import log_tick
+            log_tick(tick)
+        except Exception:
+            pass  # Persistence is analytics-only and must never block trading.
+
+    def _get_tick_uncached(self) -> Optional[Dict[str, Any]]:
         # Path 1: WebSocket tick (real-time, <100ms latency)
         if USE_LIVE_DATA and self._ws_connected and self.last_tick:
             # Check if original tick is stale - use REST to refresh
