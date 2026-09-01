@@ -444,6 +444,7 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(date(entry_time))')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticks_timestamp ON ticks(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_ticks_symbol_timestamp ON ticks(symbol, timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_dvf_signals_timestamp ON dvf_signals(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_dvf_signals_decision_id ON dvf_signals(decision_id)')
@@ -698,15 +699,53 @@ class DatabaseManager:
             conn.commit()
             return cursor.lastrowid
 
-    def prune_old_signal_rows(self, retention_days: int = 7, batch_size: int = 5000) -> Dict[str, int]:
-        """Delete per-tick rows older than retention_days from signals/dvf_signals.
+    def log_tick(self, tick: Dict) -> Optional[int]:
+        """Persist a single real market tick to the ticks table.
 
-        These two tables log every strategy evaluation (not just trades) and grow
-        unbounded — batched to keep any single DELETE transaction short so it
-        doesn't hold the WAL write lock away from a live trading loop.
+        This table existed in schema with no writer at all — every
+        strategy-layer post-exit/counterfactual analysis before this had to
+        fall back to sparse ~30-90s log-line snapshots or the underlying
+        spot series, both much coarser than the real tick stream. Called
+        from BrokerInterface.get_tick() for every real (non-simulated) tick,
+        deduped there so an idle WebSocket re-serving the same cached price
+        across the ~2Hz main-loop cadence doesn't flood this table with
+        identical rows — every row here represents an actual price change.
+        """
+        symbol = tick.get('symbol')
+        ltp = tick.get('ltp')
+        if not symbol or ltp is None:
+            return None
+        timestamp = tick.get('timestamp')
+        if isinstance(timestamp, (int, float)):
+            timestamp = datetime.fromtimestamp(timestamp / 1000.0)
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO ticks (timestamp, symbol, ltp, bid, ask, volume, spot_price, oi)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                self._db_timestamp(timestamp or datetime.now()),
+                symbol,
+                ltp,
+                tick.get('bid'),
+                tick.get('ask'),
+                tick.get('volume'),
+                tick.get('spot_price'),
+                tick.get('oi'),
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def prune_old_signal_rows(self, retention_days: int = 7, batch_size: int = 5000) -> Dict[str, int]:
+        """Delete per-tick rows older than retention_days from signals/dvf_signals/ticks.
+
+        These tables log every strategy evaluation or real tick (not just
+        trades) and grow unbounded — batched to keep any single DELETE
+        transaction short so it doesn't hold the WAL write lock away from a
+        live trading loop.
         """
         cutoff = self._db_timestamp(datetime.now() - timedelta(days=retention_days))
-        deleted = {'signals': 0, 'dvf_signals': 0}
+        deleted = {'signals': 0, 'dvf_signals': 0, 'ticks': 0}
         for table in deleted:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -1284,6 +1323,9 @@ def log_trade_entry(trade: Dict) -> int:
 
 def log_trade_exit(order_id: str, exit_data: Dict) -> bool:
     return db.log_exit(order_id, exit_data)
+
+def log_tick(tick: Dict) -> Optional[int]:
+    return db.log_tick(tick)
 
 def get_todays_summary() -> Dict:
     return db.update_daily_summary()
