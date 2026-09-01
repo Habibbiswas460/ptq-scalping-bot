@@ -567,3 +567,24 @@ User asked follow-up questions across 8 areas (config drift, per-session config 
 
 ### 18.5 Net test count
 171 → **181 passed, 1 skipped** (10 new tests: 4 in §4's `test_consecutive_loss_pause_regression.py`, 1 unsubscribe test added to `test_websocket.py`, 3 in §18.1's `test_close_current_trade_exit_accounting.py`, 2 in §18.2's loss-ceiling-ordering tests).
+
+---
+
+## 19. Self-review of §18 caught a real regression before it shipped further: §18.4's deletion missed non-`.py` callers
+
+**How this was found:** user asked to check all files before pushing. Re-verified every file in the two §17/§18 commits diff-by-diff. §18.4's "zero callers anywhere" claim for `utils/monitoring.py` had only been checked with `.py`-scoped greps (matching the original duplicate-tracker-sweep fork's own methodology) — it missed `run.sh`, which embeds Python directly in heredocs.
+
+**What was actually still using it:** `run.sh`'s Tools submenu, option `[7] Bot Monitor Status`, ran `python -c "from utils.monitoring import get_monitor; ..."` to print a live snapshot — this would now hit `ModuleNotFoundError` on every use. Also two harmless stale filename references: the `run_syntax_check` file list (already tolerant of missing files via `-f` checks, and already had one such gap from §15.10's `session_manager.py` deletion going unnoticed), and `PROJECT_STRUCTURE.md`'s file tree/description list.
+
+**Important context — this wasn't actually a regression in the "broke a working feature" sense:** `get_monitor()` was `return BotMonitor()` — a **fresh instance every call**, invoked from a **separate subprocess** with zero shared state with the running bot. Nothing in the live bot process ever called `record_tick()`/`record_trade()` on it (confirmed zero callers, unchanged from the original finding). So this menu option only ever displayed an empty, freshly-initialized status table — it was already non-functional before the deletion, just non-functional in a *quieter* way (wrong data) than after (an exception, caught by the existing `2>/dev/null || printf "Monitor not available"` fallback the menu already had).
+
+**Fix:** replaced the broken subprocess call with a direct, honest message explaining the feature was removed and pointing at the two working alternatives (System Health, Market Readiness Pro) — no renumbering of the menu (lower risk than shifting `[8]`/`[9]` down). Removed the two stale filename references from `run_syntax_check`'s file list and `PROJECT_STRUCTURE.md`.
+
+**Lesson applied:** the §15.12 lesson ("grep excluding the file being edited is not sufficient") needs a corollary — a caller-search for a deleted Python module also needs to cover non-`.py` files that embed Python (shell scripts with heredocs, notebooks, CI YAML), not just `*.py`. Plain `grep -rn ... --include="*.py"` is not sufficient on its own for this codebase, which has `run.sh` doing exactly that.
+
+**Verified:** `bash -n run.sh` (syntax check), full test suite green (181 passed, 1 skipped unchanged), exhaustive whole-repo grep (all file types, not `.py`-scoped) for `utils.monitoring`/`BotMonitor`/`get_monitor` now returns only the new explanatory string itself.
+
+**Files:** `run.sh`, `PROJECT_STRUCTURE.md`, `tests/test_consecutive_loss_pause_regression.py` (unrelated hardening found in the same review pass — see below).
+
+### 19.1 Also found and fixed in the same review pass: a test-pollution risk in §4's new regression tests
+`tests/test_consecutive_loss_pause_regression.py`'s tests call `set_risk_manager(rm)`, which writes `core.risk.risk_manager`'s real module-level `_risk_manager` singleton directly, with no built-in restore — the same class of issue as §18.2's `os.environ` test leak. Not currently causing an observed failure (nothing else in the suite reads the singleton without either injecting its own config or monkeypatching `get_risk_manager` entirely), but latent risk for a future test. Added an `autouse` fixture resetting `core.risk.risk_manager._risk_manager` to `None` after each test in that file via `monkeypatch.setattr`.
