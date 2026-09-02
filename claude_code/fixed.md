@@ -638,3 +638,25 @@ User asked follow-up questions across 8 areas (config drift, per-session config 
 **Verified:** full test suite green throughout (199 → 201 passed, 1 skipped); import smoke test.
 
 **Files:** `core/main.py`, `tests/test_main_startup_pruning.py` (new).
+
+---
+
+## 23. Execution-guard cross-direction tick mismatch fixed (2026-09-02) — blocked 100% of Day 1's entries
+
+**What was wrong:** discovered while checking on the live Day-1 run (first day of the [[project_ptq_checkpoint_20260902]] two-day data-collection window). §20 fixed the entry-*filter* checks (premium, spread, Greeks) to validate against the correct instrument when the signal's direction differs from the currently-subscribed contract, by resolving a fresh `execution_tick` via `broker.get_tick_for_direction(direction)` in `entry_engine.py`. But that resolved tick was only used to build `signal_ltp`/`signal_spot_price`/`signal_timestamp` on `last_signal_params` — it never reached the *drift guard* downstream. `state_entry_ready()` (`core/engines/state_machine.py`, called from `core/main.py:799`) passed its own `tick` argument — the raw, currently-subscribed contract's tick — straight into `_signal_execution_guard()`. Whenever the signal's direction didn't match the subscription (e.g. a PE signal while subscribed to CE), the guard compared the *correct* instrument's price at signal time against the *wrong* instrument's price at check time, always producing a large bogus "drift" and rejecting the entry. This bug predates this session (present since commit `66e5503`, before §20 even existed) — §20's fix simply never touched this second call site.
+
+**Confirmed live, in production, that same morning:** every one of 47 entry signals between bot startup (08:11 IST) and the fix (~11:26 IST) on 2026-09-02 was rejected with `Execution drift too high` (30-67%, e.g. `sig ₹112.40 -> now ₹167.35`) — `sig` was the real PE premium at signal time, `now` was the subscribed CE contract's premium, not the PE's. `trades.csv` had zero rows for the entire window. Not a market move; an instrument mismatch.
+
+**Fix:** in `state_entry_ready()`, before calling `_signal_execution_guard()`, resolve the same cross-direction tick §20 already knows how to fetch — `broker.current_symbol` vs. the signal's `direction`, `broker.get_tick_for_direction(direction)` if they differ — and use that resolved tick (`guard_tick`) for both the guard call and its metrics logging (`_record_execution_guard_metric`), instead of the raw subscribed-contract `tick`.
+
+**Caught during implementation, before it shipped:** the first version wrote `from core.trading.broker import broker` *inside* `state_entry_ready()` to get the singleton — but `broker` is already a parameter of that function, and Python's whole-function local-scope rule means a nested `from X import broker` rebinds that name for the *entire* function, not just the `try` block it's written in. That silently redirected every later `broker.place_order(...)` call in the same function to the real broker singleton instead of whatever was actually passed in (a `DummyBroker` test double, in test context) — caught immediately by `tests/test_position_size_integration.py::test_state_entry_ready_uses_allocator_quantity` failing with `'NoneType' object has no attribute 'info'` (the real singleton's uninitialized logger). Fixed by using the function's existing `broker` parameter directly instead of re-importing it.
+
+**Live remediation:** `PAPER_TRADING=true`, bot was `IDLE` with no open position, so it was safe to apply and restart mid-session — graceful `SIGINT` (the code's existing `KeyboardInterrupt` handler: broker logout, `RiskManager.end_of_day()`, clean exit) rather than a hard kill; `end_of_day()`'s reset was a no-op given zero trades/zero PnL that morning. Relaunched `app.py` directly afterward; ran normally with no new errors besides one transient broker-API "exceeding access rate" blip right at reconnect that self-resolved.
+
+**Implication for the pending Day-1 R:R analysis** (see [[project_ptq_checkpoint_20260902]]): Day 1's usable trading window starts at ~11:26 IST, not 08:11 IST — the morning session's zero trades are an instrumentation gap, not a market or strategy observation.
+
+**Tests:** `tests/test_execution_guard_cross_direction_tick.py` (new) — reproduces the exact 2026-09-02 shape (PE signal, `signal_ltp` ₹112.40 from a resolved tick, subscribed-CE tick at ₹167.35 passed as `tick`) and asserts the entry now proceeds to `IN_TRADE` instead of being blocked; verified this test fails against the pre-fix code (`COOLDOWN`) and passes against the fix (`IN_TRADE`).
+
+**Verified:** full test suite green throughout (201 → 202 passed, 1 skipped).
+
+**Files:** `core/engines/state_machine.py`, `tests/test_execution_guard_cross_direction_tick.py` (new).
