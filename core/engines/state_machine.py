@@ -748,12 +748,30 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
         direction = "CE"
 
     details = signal_params.get('details', {}) if isinstance(signal_params, dict) else {}
-    exec_ok, exec_reason, exec_details = _signal_execution_guard(signal_params if isinstance(signal_params, dict) else {}, tick)
+
+    # The drift guard must compare the traded contract's price against
+    # itself. `tick` here reflects whatever is currently subscribed, which
+    # can be the opposite instrument from `direction` (place_order() only
+    # switches subscription at order time) — same cross-direction mismatch
+    # entry_engine.py already resolves for signal_ltp. Without this, the
+    # guard compares e.g. a PE signal price to a CE "current" price and
+    # reports a bogus 30-60% drift, blocking every cross-direction entry.
+    guard_tick = tick
+    try:
+        current_symbol = getattr(broker, 'current_symbol', '') or ''
+        if current_symbol and not current_symbol.endswith(direction):
+            fresh_tick = broker.get_tick_for_direction(direction)
+            if fresh_tick:
+                guard_tick = fresh_tick
+    except Exception:
+        pass
+
+    exec_ok, exec_reason, exec_details = _signal_execution_guard(signal_params if isinstance(signal_params, dict) else {}, guard_tick)
     if exec_ok:
-        _record_execution_guard_metric("pass", "ok", exec_details, tick)
+        _record_execution_guard_metric("pass", "ok", exec_details, guard_tick)
     else:
         reason_tag = str(exec_details.get("check", "blocked")) if isinstance(exec_details, dict) else "blocked"
-        _record_execution_guard_metric("blocked", reason_tag, exec_details, tick)
+        _record_execution_guard_metric("blocked", reason_tag, exec_details, guard_tick)
     if not exec_ok:
         logger.warning(f"⚠ ENTRY SKIPPED: {exec_reason}")
         logger.state_change("ENTRY_READY", "COOLDOWN", f"Exec guard: {exec_reason}")
