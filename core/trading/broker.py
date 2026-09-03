@@ -54,6 +54,14 @@ class BrokerInterface:
         # Token map from ScripMaster (symbol -> token)
         self.token_map: Dict[str, str] = {}
 
+        # Quote-source observability (measurement only — never read by any
+        # trading decision). Counts how often bid/ask came from the real book
+        # versus the estimated-spread fallback, so the inertness of the
+        # spread-based filters can be quantified before anything is changed.
+        self._quote_source_counts: Dict[str, int] = {}
+        self._quote_source_last_log: float = 0.0
+        self._quote_source_log_interval_sec: float = 300.0
+
         # Trading state
         self.current_symbol: Optional[str] = None
         self.current_strike: int = 0
@@ -1003,10 +1011,24 @@ class BrokerInterface:
 
                 # FIX: If bid/ask equal OR not available, estimate spread
                 # This prevents inverted market (bid >= ask) rejection
+                #
+                # OBSERVABILITY ONLY (no behaviour change): tag whether the
+                # quote is a real book quote or this estimate, and count both.
+                # Nothing reads `quote_source` for any trading decision — it
+                # exists to quantify how often the spread-based filters are
+                # operating on an estimate rather than a real spread. See the
+                # synthetic-bid/ask correction record; measurement must come
+                # before any threshold decision.
+                quote_source = 'real'
                 if bid <= 0 or ask <= 0 or bid >= ask:
                     spread = max(0.05, ltp * 0.003)  # 0.3% spread estimate
                     bid = round(ltp - spread / 2, 2)
                     ask = round(ltp + spread / 2, 2)
+                    quote_source = 'estimated'
+                self._quote_source_counts[quote_source] = (
+                    self._quote_source_counts.get(quote_source, 0) + 1
+                )
+                self._maybe_log_quote_source_summary()
 
                 # ═══════════════════════════════════════════════════════════════
                 # CRITICAL FIX: Only accept ticks from CURRENT subscribed token
@@ -1040,6 +1062,7 @@ class BrokerInterface:
                     'strike': self.current_strike,
                     'direction': OPTION_TYPE,
                     'token': token,  # Include token for debugging
+                    'quote_source': quote_source,  # observability only, never read for decisions
                 }
                 
                 # Add to tick buffer for smoother data flow
@@ -1355,6 +1378,40 @@ class BrokerInterface:
         if tick and tick.get('data_source') != 'SIMULATION':
             self._persist_tick(tick)
         return tick
+
+    def get_quote_source_stats(self) -> Dict[str, Any]:
+        """Real-vs-estimated quote counts for this session (observability only).
+
+        Reported, never acted on: the spread-based filters currently receive
+        an estimated ~0.3% spread whenever the book is unavailable, which
+        makes them non-discriminating. Quantifying that is the prerequisite
+        for deciding anything about the thresholds.
+        """
+        counts = dict(self._quote_source_counts)
+        total = sum(counts.values())
+        estimated = counts.get('estimated', 0)
+        return {
+            'real': counts.get('real', 0),
+            'estimated': estimated,
+            'total': total,
+            'estimated_pct': round(100.0 * estimated / total, 2) if total else None,
+        }
+
+    def _maybe_log_quote_source_summary(self) -> None:
+        """Periodically log the real/estimated quote split. Never raises."""
+        try:
+            now = time.time()
+            if now - self._quote_source_last_log < self._quote_source_log_interval_sec:
+                return
+            self._quote_source_last_log = now
+            stats = self.get_quote_source_stats()
+            if self.logger and stats['total']:
+                self.logger.info(
+                    f"📊 Quote source: real={stats['real']} estimated={stats['estimated']} "
+                    f"({stats['estimated_pct']}% estimated)"
+                )
+        except Exception:
+            pass  # observability must never affect the feed path
 
     def _persist_tick(self, tick: Dict[str, Any]) -> None:
         """Write a real tick to the ticks table, deduped on
