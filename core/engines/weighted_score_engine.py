@@ -66,10 +66,15 @@ class WeightedScoreEngine:
         elif vol_ratio >= 1.0:
             contributions['volume'] = int(self.weights['volume'] * 0.5)
 
-        if 0.35 <= delta <= 0.65:
+        # PE deltas are negative (-0.42, -0.68 measured on real 2026-09-04 quotes), so the
+        # unsigned comparison this used to make would score every PE at zero on both of these
+        # components no matter how close to at-the-money it was. Moneyness is what the test is
+        # after, so compare on magnitude. No-op while `delta` is unpopulated (abs(0) is 0).
+        abs_delta = abs(delta)
+        if 0.35 <= abs_delta <= 0.65:
             contributions['delta'] = self.weights['delta']
             contributions['greeks'] = self.weights['greeks']
-        elif 0.30 <= delta <= 0.70:
+        elif 0.30 <= abs_delta <= 0.70:
             contributions['delta'] = int(self.weights['delta'] * 0.5)
             contributions['greeks'] = int(self.weights['greeks'] * 0.5)
 
