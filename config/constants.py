@@ -350,7 +350,11 @@ MARKET_OPEN_TIME = env_str('MARKET_OPEN', '09:15')
 MARKET_CLOSE_TIME = env_str('MARKET_CLOSE', '15:30')
 TRADING_START_TIME = env_str('TRADING_START', '09:20')
 TRADING_END_TIME = env_str('TRADING_END', '15:10')
-AVOID_FIRST_15MIN = env_bool('AVOID_FIRST_15MIN', True)
+AVOID_FIRST_15MIN = env_bool('AVOID_FIRST_15MIN', True)  # NOTE: defined but never enforced anywhere
+# Strategy-level opening block. Was hardcoded to 09:45 inside smart_scalp_v3, which meant the
+# most volatile part of the session could never be traded and could not be turned off without
+# editing code. Default keeps the old behaviour; set to MARKET_OPEN to remove the block.
+TRADING_NO_TRADE_BEFORE = env_str('TRADING_NO_TRADE_BEFORE', '09:45')
 
 # =========================================================
 # 📐 GREEKS LIMITS
