@@ -17,7 +17,8 @@ from config.constants import (
     MAX_DAILY_LOSS_AMOUNT, MAX_TRADES_PER_HOUR, MAX_TRADES_PER_DAY,
     STOP_LOSS_AMOUNT, PROFIT_TARGET_1, PROFIT_TARGET_2,
     COOLDOWN_NORMAL_SEC, COOLDOWN_AFTER_SL_SEC,
-    SL_POINTS_FIXED, TP_POINTS_FIXED, CE_QUANTITY, PE_QUANTITY
+    SL_POINTS_FIXED, TP_POINTS_FIXED, CE_QUANTITY, PE_QUANTITY,
+    TICK_DELTA_ENABLED,
 )
 
 # Import core modules (new organized paths)
@@ -731,6 +732,18 @@ def main():
             
             # Calculate Greeks
             greeks = calculate_greeks(tick, broker.spot_price, broker.current_strike)
+
+            # These Greeks were already being computed every loop, but the delta
+            # was never written back onto the tick, so weighted_score_engine's
+            # `latest_tick.get('delta', 0)` was always 0 and its delta(10) +
+            # greeks(5) components could never be earned. Writing it here costs
+            # nothing extra — same failure mode as the `atr` key.
+            if TICK_DELTA_ENABLED and greeks:
+                tick['delta'] = greeks.get('delta', 0.0)
+                tick['gamma'] = greeks.get('gamma', 0.0)
+                tick['theta'] = greeks.get('theta', 0.0)
+                tick['vega'] = greeks.get('vega', 0.0)
+                tick['greeks_source'] = greeks.get('source', 'UNKNOWN')
             
             # Detect day type
             state.day_type = detect_day_type(greeks, greeks['tte'])

@@ -35,7 +35,8 @@ from config.constants import (
     STRIKE_PREMIUM_MIN, STRIKE_PREMIUM_MAX,
     # v3.1 Order execution config
     USE_LIMIT_ORDERS, LIMIT_ORDER_OFFSET, MAX_SLIPPAGE_PCT,
-    ORDER_RETRY_ENABLED, ORDER_MAX_RETRIES, ORDER_RETRY_DELAY_MS, ORDER_PRICE_CHASE_STEP
+    ORDER_RETRY_ENABLED, ORDER_MAX_RETRIES, ORDER_RETRY_DELAY_MS, ORDER_PRICE_CHASE_STEP,
+    TICK_OI_ENABLED,
 )
 
 # ScripMaster download URL (Angel One official)
@@ -1064,6 +1065,17 @@ class BrokerInterface:
                     'token': token,  # Include token for debugging
                     'quote_source': quote_source,  # observability only, never read for decisions
                 }
+
+                # The websocket parser already decodes open interest, but it was
+                # dropped here, so `update_oi_data()` saw current_oi <= 0 and
+                # returned NEUTRAL forever — pinning the score's oi component to
+                # 0 and the confidence oi_score to 50. The persistence layer
+                # already writes tick['oi'], so this also fills the ticks.oi
+                # column that was NULL on every historical row.
+                # REST-path ticks carry no OI (the LTP endpoint does not return
+                # it), so this only populates on the websocket path.
+                if TICK_OI_ENABLED:
+                    new_tick['oi'] = tick_data.get('open_interest', 0) or 0
                 
                 # Add to tick buffer for smoother data flow
                 if self._use_tick_buffer:

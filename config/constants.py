@@ -166,6 +166,18 @@ EXIT_MFE_ROOM_POINTS = env_float('EXIT_MFE_ROOM_POINTS', 4.0)
 # LIVE BEHAVIOUR, so it is opt-in and measured separately from the above.
 EXIT_REALISED_ATR_ENABLED = env_bool('EXIT_REALISED_ATR_ENABLED', False)
 EXIT_REALISED_ATR_WINDOW_SEC = env_int('EXIT_REALISED_ATR_WINDOW_SEC', 60)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TICK INPUT REPAIR (experiment/exit-strategy-20260904)
+# `delta` and `oi` are read by the scoring engines but were never written onto
+# the tick dict, so weighted_score_engine's delta(10) + greeks(5) and oi(10)
+# components — 25 of the 105 total weight — could never be earned, and the
+# persisted ticks.oi column was NULL on every row. Same failure mode as the
+# `atr` key. Each flag is separate so each repair can be measured on its own.
+# Both default OFF: enabling either CHANGES LIVE SCORING.
+# ═══════════════════════════════════════════════════════════════════════════
+TICK_DELTA_ENABLED = env_bool('TICK_DELTA_ENABLED', False)
+TICK_OI_ENABLED = env_bool('TICK_OI_ENABLED', False)
 RSI_REVERSAL_CE_EXIT = env_float('RSI_REVERSAL_CE_EXIT', 60)      # CE: exit once RSI drops back below this
 RSI_REVERSAL_PE_EXIT = env_float('RSI_REVERSAL_PE_EXIT', 40)      # PE: exit once RSI rises back above this
 RSI_REVERSAL_CE_EXTREME = env_float('RSI_REVERSAL_CE_EXTREME', 75)  # CE: must have seen RSI above this before a reversal counts
