@@ -35,6 +35,15 @@ from config.constants import (
     RSI_REVERSAL_PE_EXIT,
     RSI_REVERSAL_CE_EXTREME,
     RSI_REVERSAL_PE_EXTREME,
+    EXIT_PROFIT_MODE,
+    EXIT_PROFIT_FLOOR_POINTS,
+    EXIT_LOSS_MODE,
+    EXIT_ATR_MULT,
+    EXIT_ATR_FLOOR_POINTS,
+    EXIT_ATR_CAP_POINTS,
+    EXIT_MFE_ARM_POINTS,
+    EXIT_MFE_TIGHT_POINTS,
+    EXIT_MFE_ROOM_POINTS,
 )
 from core.risk.greeks_validator import validate_greeks
 
@@ -286,6 +295,55 @@ def rsi_reversal_exit(trade: Dict, rsi: float = None, logger=None) -> Tuple[bool
     return False, ""
 
 
+def _early_cut_threshold(trade: Dict, tick: Dict) -> float:
+    """Early-cut distance in points.
+
+    'static' reproduces production exactly: the ATR branch below. Note that `atr` is only
+    populated when EXIT_REALISED_ATR_ENABLED is on, so by default this still resolves to the
+    low-volatility value — that is the frozen baseline's real behaviour, deliberately kept.
+
+    The experimental modes were selected by replaying the recorded 2026-09-03/04 entries
+    (claude_code/experiments/exp02_loss.py). Both point the same way: TIGHTER for a trade
+    that never worked, not wider.
+    """
+    atr = tick.get('atr', trade.get('atr', 0)) or 0
+
+    if EXIT_LOSS_MODE == 'atr_adaptive' and atr > 0:
+        return min(float(EXIT_ATR_CAP_POINTS),
+                   max(float(EXIT_ATR_FLOOR_POINTS), float(EXIT_ATR_MULT) * float(atr)))
+
+    if EXIT_LOSS_MODE == 'mfe_aware':
+        qty = trade.get('qty', 0) or 0
+        mfe_pts = (trade.get('mfe_inr', 0.0) / qty) if qty else 0.0
+        return (float(EXIT_MFE_ROOM_POINTS) if mfe_pts >= float(EXIT_MFE_ARM_POINTS)
+                else float(EXIT_MFE_TIGHT_POINTS))
+
+    if atr > 6:
+        return float(EXIT_EARLY_CUT_ATR_HIGH_POINTS)
+    if atr < 3:
+        return float(EXIT_EARLY_CUT_ATR_LOW_POINTS)
+    return EARLY_LOSS_CUT_POINTS
+
+
+def profit_floor_exit(trade: Dict) -> Tuple[bool, str]:
+    """EXPERIMENTAL (EXIT_PROFIT_MODE='floor'): take profit on the first tick past the floor.
+
+    Replay of the recorded entries showed the tick-RSI reversal condition was already
+    satisfied when the floor was crossed on 8/8 profitable RSI exits, so the RSI added delay
+    rather than information. Off by default; production keeps the RSI path.
+    """
+    if not trade or EXIT_PROFIT_MODE != 'floor':
+        return False, ""
+    price_diff = trade.get('price_diff', 0)
+    if price_diff < float(EXIT_PROFIT_FLOOR_POINTS):
+        return False, ""
+    direction = trade.get('direction', 'CE')
+    current_pnl = trade.get('current_pnl', 0)
+    return True, (f"\U0001f3af PROFIT FLOOR EXIT | {direction} | "
+                  f"+{price_diff:.1f}pts >= {float(EXIT_PROFIT_FLOOR_POINTS):.2f} | "
+                  f"Lock: \u20b9{current_pnl:.0f}")
+
+
 def early_momentum_loss_cut(trade: Dict, tick: Dict) -> Tuple[bool, str]:
     """
     PRIORITY 2b: Early Momentum Loss Cut (v3.4 — ATR-adaptive)
@@ -309,14 +367,7 @@ def early_momentum_loss_cut(trade: Dict, tick: Dict) -> Tuple[bool, str]:
     direction = trade.get('direction', 'CE')
     qty = trade.get('qty', 0)
     
-    # v3.4: ATR-adaptive early cut threshold
-    atr = tick.get('atr', trade.get('atr', 0))
-    if atr > 6:
-        cut_threshold = float(EXIT_EARLY_CUT_ATR_HIGH_POINTS)
-    elif atr < 3:
-        cut_threshold = float(EXIT_EARLY_CUT_ATR_LOW_POINTS)
-    else:
-        cut_threshold = EARLY_LOSS_CUT_POINTS
+    cut_threshold = _early_cut_threshold(trade, tick)
     
     # Fast adverse move: lost threshold+ pts within 30 seconds
     if price_diff <= -cut_threshold:
@@ -522,6 +573,12 @@ def check_exit_conditions(trade: Dict, tick: Dict, greeks: Dict,
         _cap_negative_pnl(trade)
         return True, greek_reason
     
+    # Priority 4-pre: experimental profit-floor exit (no-op unless EXIT_PROFIT_MODE='floor')
+    floor_hit, floor_reason = profit_floor_exit(trade)
+    if floor_hit:
+        _audit_exit_event(logger, "PROFIT_FLOOR", trade, {"reason": floor_reason})
+        return True, floor_reason
+
     # Priority 4: Smart RSI exit (lock profits when momentum exhausted)
     rsi_hit, rsi_reason = smart_rsi_exit(trade, rsi, logger)
     if rsi_hit:

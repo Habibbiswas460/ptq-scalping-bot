@@ -23,6 +23,8 @@ from config.constants import (
     EXPIRY_ONLY_SESSIONS, BLACKOUT_SESSIONS,
     TRADING_START_TIME,
     ENTRY_SIGNAL_MAX_AGE_MS, ENTRY_MAX_DRIFT_PCT,
+    EXIT_REALISED_ATR_ENABLED,
+    EXIT_REALISED_ATR_WINDOW_SEC,
 )
 from utils.helpers import now, calculate_position_size
 from core.runtime import runtime_state
@@ -202,6 +204,26 @@ def _check_intraday_spike(tick: dict, logger) -> bool:
         return True
     
     return False
+
+
+def _realised_option_atr(recent_ticks: list, window_sec: int) -> float:
+    """Realised range of the option's own premium over the trailing window, in points.
+
+    The `atr` key the early-cut branch reads has never been populated anywhere in the
+    codebase, so that branch has always taken its low-volatility path. This computes a real
+    volatility figure from the tick buffer the bot already holds. Enabling it CHANGES LIVE
+    BEHAVIOUR, so it is gated behind EXIT_REALISED_ATR_ENABLED and measured on its own.
+    """
+    if not recent_ticks:
+        return 0.0
+    prices = []
+    for t in recent_ticks[-int(max(window_sec, 1)):]:
+        ltp = t.get('ltp')
+        if ltp:
+            prices.append(ltp)
+    if len(prices) < 5:
+        return 0.0
+    return round(max(prices) - min(prices), 2)
 
 
 def _calculate_rsi(recent_ticks: list, period: int = 14) -> float:
@@ -1016,6 +1038,10 @@ def state_in_trade(tick: Dict, greeks: Dict, state: TradingState,
     # Calculate RSI for momentum exit
     recent_ticks = runtime_state.get_recent_ticks(max_items=MAX_RECENT_TICKS)
     rsi = _calculate_rsi(recent_ticks) if recent_ticks else None
+
+    # Experimental: populate the `atr` the early-cut branch reads (no-op unless enabled)
+    if EXIT_REALISED_ATR_ENABLED and recent_ticks:
+        tick['atr'] = _realised_option_atr(recent_ticks, EXIT_REALISED_ATR_WINDOW_SEC)
     
     # Check exit conditions (now includes RSI for momentum exit)
     should_exit, exit_reason = exit_check_func(
