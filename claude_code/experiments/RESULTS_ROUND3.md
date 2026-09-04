@@ -77,6 +77,23 @@ path did. **Ignore it — the real trades are ground truth for that layer.**
 | the gate layer adds value | **Unknown** — reconstruction unreliable |
 | PE behaviour | **Unknown** — PE contract almost never subscribed |
 
+## 5b. ROOT CAUSE — a family of unpopulated-input defects (verified in code + data)
+`grep` over `core/trading/broker.py`: the tick dict never sets **`atr`, `delta`, `oi`,
+`open_interest`, `greeks`** — zero occurrences of any of them. The persisted `oi` column is
+0/NULL on all **73,171** ticks across the three days. Consequences, each traced to a line:
+
+| input | consumer | effect |
+|---|---|---|
+| `delta` never set | `weighted_score_engine.py:69` `if 0.35 <= delta <= 0.65` | `delta`(10) **and** `greeks`(5) pinned to 0 forever — one unset key kills two components |
+| `oi` never set | `smart_scalp_v3.update_oi_data` returns `NEUTRAL` on `current_oi <= 0` | score `oi`(10) pinned to 0; confidence `oi_score` pinned to 50 |
+| `atr` never set | `exit_engine._early_cut_threshold` | Early Loss Cut pinned to 2.5 (the already-known ATR defect — same class) |
+| `MACD_Hist_Prev` | `weighted_score_engine.py:92` | `macd`(8) constant 0 on every row |
+
+**25 of the 105 score weight can never be earned**, and another 32 (`ema` 20, `premium` 5,
+`spread` 5, `regime` 2) is awarded identically every time. Roughly **57 of 105 is a fixed
+offset**; the remaining ~48 is four near-binary switches. This is the same failure mode as the
+ATR defect, three more times over, and it is the mechanical reason the score cannot rank.
+
 ## 6. Next
 1. **The scoring stack needs variance before it can be tuned.** `delta`, `greeks`, `oi`, `macd`
    award zero on every row — find out whether they are unpopulated inputs (like the `atr`
