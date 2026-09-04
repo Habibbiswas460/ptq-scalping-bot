@@ -62,7 +62,9 @@ except ImportError:
     HAS_DATABASE = False
 
 try:
-    from core.services.telegram_bot import init_telegram, get_telegram, notify_entry, notify_exit, notify_kill_switch, notify_daily_summary
+    from core.services.telegram_bot import (init_telegram, get_telegram, notify_entry,
+                                            notify_exit, notify_kill_switch,
+                                            notify_daily_summary, record_error as tg_record_error)
     HAS_TELEGRAM = True
 except ImportError:
     HAS_TELEGRAM = False
@@ -72,7 +74,13 @@ def _notify_kill_switch_telegram(reason: str, details: dict, logger) -> None:
     """Best-effort Telegram alert for a kill-switch transition, gated on
     TELEGRAM_NOTIFY_KILL_SWITCH. Never raises into the caller — this must
     not affect the kill-switch state transition itself."""
-    if not HAS_TELEGRAM or not CONFIG['telegram'].get('notify_kill_switch'):
+    if not HAS_TELEGRAM:
+        return
+    # notify_kill_switch() itself now checks the live preference, so this only needs the
+    # static .env value as the pre-init fallback. Previously the .env value was the ONLY
+    # gate and a toggle made from the Telegram menu had no effect here.
+    tg = get_telegram()
+    if tg is None and not CONFIG['telegram'].get('notify_kill_switch'):
         return
     try:
         notify_kill_switch(reason, details)
@@ -854,6 +862,8 @@ def main():
     
     except Exception as e:
         import traceback
+        if HAS_TELEGRAM:
+            tg_record_error(f"main loop: {e}", source="engine")
         error_str = str(e).lower()
         # Check if it's a network-related error
         if any(x in error_str for x in ['name resolution', 'connection', 'network', 'timeout', 'unreachable']):

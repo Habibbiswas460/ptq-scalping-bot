@@ -9,6 +9,14 @@ from core.engines.weighted_score_engine import WeightedScoreEngine
 from strategies.smart_scalp_v3 import SmartScalpV3
 
 
+def _session_ms() -> int:
+    """A timestamp inside the trading session, on today's date, in milliseconds."""
+    from datetime import datetime
+    return int(datetime.now().replace(hour=11, minute=0, second=0, microsecond=0).timestamp() * 1000)
+
+
+
+
 class DummyStrategy(SmartScalpV3):
     def __init__(self):
         # Avoid config file load warnings
@@ -105,7 +113,11 @@ def test_generate_signal_blocks_low_confidence():
     strategy.calculate_indicators = calculate_indicators_low_score
     strategy.calculate_adaptive_confidence = lambda indicators, latest_tick, score_pct, direction, oi_direction: (60, {})
 
-    now_ms = int(time.time() * 1000)
+    # Pin the tick time inside the trading session. These used to use wall-clock now(), which
+    # only passed because the old opening filter checked `hour == 9` and so ignored any time
+    # before 09:00 — running the suite at night silently skipped the filter. The filter now
+    # blocks everything before the configured start, so the time has to be explicit.
+    now_ms = _session_ms()
     ticks = [{
         'bid': 100.0,
         'ask': 100.2,
@@ -155,7 +167,11 @@ def test_generate_signal_allows_high_confidence():
     strategy.calculate_indicators = calculate_indicators_high_score
     strategy.calculate_adaptive_confidence = lambda indicators, latest_tick, score_pct, direction, oi_direction: (75, {})
 
-    now_ms = int(time.time() * 1000)
+    # Pin the tick time inside the trading session. These used to use wall-clock now(), which
+    # only passed because the old opening filter checked `hour == 9` and so ignored any time
+    # before 09:00 — running the suite at night silently skipped the filter. The filter now
+    # blocks everything before the configured start, so the time has to be explicit.
+    now_ms = _session_ms()
     ticks = [{
         'bid': 100.0,
         'ask': 100.2,

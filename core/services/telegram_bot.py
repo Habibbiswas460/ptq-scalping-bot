@@ -1,6 +1,13 @@
 """
-PTQ Scalping Bot — Professional Telegram Dashboard
-Inline keyboard controls, live log streaming, full bot management
+PTQ Scalping Bot — Telegram Dashboard
+
+Inline keyboard controls, heartbeat, session error log and preferences.
+
+Note on logs: this used to tail the bot's log files and forward any line containing one of a
+few keywords. 'SIGNAL' matched every '[DEBUG] No signal: ...' line, of which a quiet session
+produces thousands, so turning logs on flooded the chat with debug noise. Raw log forwarding
+is gone. What replaced it: a periodic heartbeat for "is it alive", and a session error buffer
+for "did something break" — both on the menu.
 """
 
 import asyncio
@@ -9,9 +16,16 @@ import threading
 import time
 import json
 import os
+from collections import deque
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Callable, List
+from typing import Any, Dict, Optional, Callable, List
 from queue import Queue, Empty
+
+from core.services.telegram_prefs import (
+    TelegramPrefs, SCHEMA as PREF_SCHEMA, INTERVAL_KEY, INTERVAL_CHOICES,
+)
+
+MAX_SESSION_ERRORS = 50
 
 
 class TelegramBot:
@@ -33,12 +47,17 @@ class TelegramBot:
         self.broker = None
         self.logger = None
 
-        # Live log streaming
-        self._live_logs_enabled = False
-        self._live_log_last_pos = {}
-        self._live_log_rate_count = 0
-        self._live_log_rate_reset = time.time()
-        self._live_log_max_per_min = 15
+        # Preferences (persisted; .env supplies the defaults)
+        self.prefs = TelegramPrefs()
+
+        # Heartbeat
+        self._last_heartbeat = 0.0
+
+        # Session errors — a bounded buffer so a failure loop cannot exhaust memory
+        self._errors: deque = deque(maxlen=MAX_SESSION_ERRORS)
+        self._error_seq = 0
+        self._errors_lock = threading.Lock()
+        self._error_log_pos = None
 
         # Dashboard message tracking (edit instead of send new)
         self._dashboard_msg_id = None
@@ -49,8 +68,12 @@ class TelegramBot:
             'status': self._cb_status,
             'pnl': self._cb_pnl,
             'trades': self._cb_trades,
-            'logs_on': self._cb_logs_on,
-            'logs_off': self._cb_logs_off,
+            'hb_on': self._cb_heartbeat_on,
+            'hb_off': self._cb_heartbeat_off,
+            'errors': self._cb_errors,
+            'errors_clear': self._cb_errors_clear,
+            'prefs': self._cb_prefs,
+            'pref_int': self._cb_pref_interval,
             'stop': self._cb_stop_trading,
             'resume': self._cb_resume_trading,
             'signals': self._cb_signals,
@@ -67,7 +90,9 @@ class TelegramBot:
             '/status': self._cmd_status,
             '/pnl': self._cmd_pnl,
             '/trades': self._cmd_trades,
-            '/logs': self._cmd_toggle_logs,
+            '/heartbeat': self._cmd_toggle_heartbeat,
+            '/errors': self._cmd_errors,
+            '/prefs': self._cmd_prefs,
             '/stop': self._cmd_stop,
             '/resume': self._cmd_resume,
             '/help': self._cmd_help,
@@ -163,13 +188,21 @@ class TelegramBot:
     # ═══════════════════════════════════════════
 
     def _main_keyboard(self) -> Dict:
-        """Build the main dashboard inline keyboard"""
-        logs_btn = ("🔴 Logs OFF", "logs_on") if not self._live_logs_enabled else ("🟢 Logs ON", "logs_off")
+        """Main dashboard keyboard.
+
+        Analytics and WS status used to be reachable only by typing /analytics and /ws — the
+        handlers existed but nothing on the menu pointed at them. They have buttons now.
+        """
+        hb_on = bool(self.prefs.get('heartbeat'))
+        hb_btn = ("💓 Heartbeat ON", "hb_off") if hb_on else ("🩶 Heartbeat OFF", "hb_on")
 
         is_stopped = self.bot_state and getattr(self.bot_state, 'state', '') == 'KILL_SWITCH'
         trade_btn = ("▶️ Resume", "resume") if is_stopped else ("⏹ Stop", "stop")
 
-        keyboard = {
+        n_err = self.error_count()
+        err_btn = f"🐞 Errors ({n_err})" if n_err else "🐞 Errors"
+
+        return {
             'inline_keyboard': [
                 [
                     {'text': '📊 Dashboard', 'callback_data': 'dash'},
@@ -181,7 +214,15 @@ class TelegramBot:
                 ],
                 [
                     {'text': '🎯 Signals', 'callback_data': 'signals'},
-                    {'text': logs_btn[0], 'callback_data': logs_btn[1]},
+                    {'text': '📉 Analytics', 'callback_data': 'analytics'},
+                ],
+                [
+                    {'text': err_btn, 'callback_data': 'errors'},
+                    {'text': '📡 Feed', 'callback_data': 'ws_status'},
+                ],
+                [
+                    {'text': hb_btn[0], 'callback_data': hb_btn[1]},
+                    {'text': '⚙️ Settings', 'callback_data': 'prefs'},
                 ],
                 [
                     {'text': trade_btn[0], 'callback_data': trade_btn[1]},
@@ -192,7 +233,6 @@ class TelegramBot:
                 ],
             ]
         }
-        return keyboard
 
     def _back_keyboard(self) -> Dict:
         """Simple back-to-dashboard keyboard"""
@@ -201,6 +241,40 @@ class TelegramBot:
                 [{'text': '« Back to Dashboard', 'callback_data': 'dash'}]
             ]
         }
+
+    def _errors_keyboard(self) -> Dict:
+        rows = []
+        if self.error_count():
+            rows.append([{'text': '🧹 Clear', 'callback_data': 'errors_clear'}])
+        rows.append([{'text': '« Back to Dashboard', 'callback_data': 'dash'}])
+        return {'inline_keyboard': rows}
+
+    def _prefs_keyboard(self) -> Dict:
+        rows = []
+        keys = list(PREF_SCHEMA.keys())
+        for i in range(0, len(keys), 2):
+            row = []
+            for key in keys[i:i + 2]:
+                label = PREF_SCHEMA[key][0]
+                mark = '✅' if self.prefs.get(key) else '⬜'
+                row.append({'text': f'{mark} {label}', 'callback_data': f'pf:{key}'})
+            rows.append(row)
+        mins = self.prefs.get(INTERVAL_KEY, 15)
+        rows.append([{'text': f'⏱ Heartbeat every {mins} min', 'callback_data': 'pref_int'}])
+        rows.append([{'text': '« Back to Dashboard', 'callback_data': 'dash'}])
+        return {'inline_keyboard': rows}
+
+    def _build_prefs_text(self) -> str:
+        lines = ["⚙️ <b>Settings</b>", ""]
+        for key, (label, _) in PREF_SCHEMA.items():
+            lines.append(f"{'✅' if self.prefs.get(key) else '⬜'} {label}")
+        lines.append("")
+        lines.append(f"⏱ Heartbeat interval: <b>{self.prefs.get(INTERVAL_KEY, 15)} min</b> "
+                     f"<i>(tap to cycle {', '.join(str(c) for c in INTERVAL_CHOICES)})</i>")
+        lines.append("")
+        lines.append("<i>Saved to disk, so these survive a restart. .env supplies the "
+                     "starting values only.</i>")
+        return "\n".join(lines)
 
     # ═══════════════════════════════════════════
     # DASHBOARD VIEWS
@@ -232,7 +306,9 @@ class TelegramBot:
             if hasattr(self.broker, 'last_tick') and self.broker.last_tick:
                 ltp = f"₹{self.broker.last_tick.get('ltp', 0):.2f}"
 
-        logs_status = "🟢 ON" if self._live_logs_enabled else "🔴 OFF"
+        hb = self.prefs.get("heartbeat")
+        hb_status = (f"🟢 every {self.prefs.get(INTERVAL_KEY, 15)}m" if hb else "🔴 OFF")
+        n_err = self.error_count()
 
         try:
             from core.services.mode_switch import get_current_mode
@@ -257,7 +333,8 @@ class TelegramBot:
             f"  Consec Loss: <code>{consec}</code>\n"
             f"  Loops: <code>{loops:,}</code>\n\n"
             f"<b>Controls</b>\n"
-            f"  Live Logs: {logs_status}\n\n"
+            f"  Heartbeat: {hb_status}\n"
+            f"  Errors: {'🐞 ' + str(n_err) if n_err else '✅ none'}\n\n"
             f"<i>Updated {datetime.now().strftime('%H:%M:%S')}</i>"
         )
         return text
@@ -408,18 +485,47 @@ class TelegramBot:
         text = self._build_signals_text()
         await self._edit_msg(msg_id, text, reply_markup=self._back_keyboard())
 
-    async def _cb_logs_on(self, callback_id: str, msg_id: int):
-        self._live_logs_enabled = True
-        self._init_log_positions()
-        await self._answer_callback(callback_id, "🟢 Live logs enabled")
-        text = self._build_dashboard_text()
-        await self._edit_msg(msg_id, text, reply_markup=self._main_keyboard())
+    async def _cb_heartbeat_on(self, callback_id: str, msg_id: int):
+        self.prefs.toggle('heartbeat') if not self.prefs.get('heartbeat') else None
+        self._last_heartbeat = 0.0          # send one immediately so the user sees it work
+        await self._answer_callback(callback_id, "💓 Heartbeat on")
+        await self._edit_msg(msg_id, self._build_dashboard_text(),
+                             reply_markup=self._main_keyboard())
 
-    async def _cb_logs_off(self, callback_id: str, msg_id: int):
-        self._live_logs_enabled = False
-        await self._answer_callback(callback_id, "🔴 Live logs disabled")
-        text = self._build_dashboard_text()
-        await self._edit_msg(msg_id, text, reply_markup=self._main_keyboard())
+    async def _cb_heartbeat_off(self, callback_id: str, msg_id: int):
+        self.prefs.toggle('heartbeat') if self.prefs.get('heartbeat') else None
+        await self._answer_callback(callback_id, "🩶 Heartbeat off")
+        await self._edit_msg(msg_id, self._build_dashboard_text(),
+                             reply_markup=self._main_keyboard())
+
+    async def _cb_errors(self, callback_id: str, msg_id: int):
+        await self._answer_callback(callback_id)
+        await self._edit_msg(msg_id, self._build_errors_text(),
+                             reply_markup=self._errors_keyboard())
+
+    async def _cb_errors_clear(self, callback_id: str, msg_id: int):
+        self.clear_errors()
+        await self._answer_callback(callback_id, "Cleared")
+        await self._edit_msg(msg_id, self._build_errors_text(),
+                             reply_markup=self._errors_keyboard())
+
+    async def _cb_prefs(self, callback_id: str, msg_id: int):
+        await self._answer_callback(callback_id)
+        await self._edit_msg(msg_id, self._build_prefs_text(),
+                             reply_markup=self._prefs_keyboard())
+
+    async def _cb_pref_toggle(self, callback_id: str, msg_id: int, key: str):
+        new_val = self.prefs.toggle(key)
+        label = PREF_SCHEMA.get(key, (key, None))[0]
+        await self._answer_callback(callback_id, f"{label}: {'on' if new_val else 'off'}")
+        await self._edit_msg(msg_id, self._build_prefs_text(),
+                             reply_markup=self._prefs_keyboard())
+
+    async def _cb_pref_interval(self, callback_id: str, msg_id: int):
+        mins = self.prefs.cycle_interval()
+        await self._answer_callback(callback_id, f"Heartbeat every {mins} min")
+        await self._edit_msg(msg_id, self._build_prefs_text(),
+                             reply_markup=self._prefs_keyboard())
 
     async def _cb_stop_trading(self, callback_id: str, msg_id: int):
         if self.bot_state:
@@ -448,26 +554,28 @@ class TelegramBot:
         text = (
             "<b>❓ HELP</b>\n"
             f"{'━'*30}\n\n"
-            "<b>Buttons:</b>\n"
+            "<b>Monitoring</b>\n"
             "  📊 Dashboard — main overview\n"
-            "  💰 P&L — profit/loss details\n"
-            "  📈 Status — engine details\n"
+            "  💰 P&amp;L — profit/loss detail\n"
+            "  📈 Status — engine detail\n"
             "  📝 Trades — today's trades\n"
             "  🎯 Signals — recent signals\n"
-            "  🟢/🔴 Logs — toggle live log stream\n"
+            "  📉 Analytics — 7-day summary\n"
+            "  📡 Feed — websocket health\n\n"
+            "<b>Alerts</b>\n"
+            "  💓 Heartbeat — periodic 'still alive' message.\n"
+            "     Debug logs are never forwarded here.\n"
+            "  🐞 Errors — anything that broke this session\n"
+            "  ⚙️ Settings — choose which alerts you get\n\n"
+            "<b>Control</b>\n"
             "  ⏹/▶️ Stop/Resume — trading control\n"
             "  🔄 Refresh — update data\n\n"
             "<b>Commands:</b>\n"
-            "  /dash — open dashboard\n"
-            "  /status — quick status\n"
-            "  /pnl — P&L\n"
-            "  /trades — trades list\n"
-            "  /logs — toggle live logs\n"
-            "  /stop — stop trading\n"
-            "  /resume — resume trading\n"
-            "  /analytics — 7-day summary\n"
-            "  /ws — WebSocket status\n"
-            "  /help — this help\n"
+            "  /dash /status /pnl /trades\n"
+            "  /heartbeat — toggle the heartbeat\n"
+            "  /errors — session errors\n"
+            "  /prefs — settings\n"
+            "  /stop /resume /analytics /ws /help\n"
         )
         await self._answer_callback(callback_id)
         await self._edit_msg(msg_id, text, reply_markup=self._back_keyboard())
@@ -582,13 +690,22 @@ class TelegramBot:
         text = self._build_trades_text()
         await self._send_msg(text, reply_markup=self._back_keyboard())
 
-    async def _cmd_toggle_logs(self, chat_id: str):
-        self._live_logs_enabled = not self._live_logs_enabled
-        if self._live_logs_enabled:
-            self._init_log_positions()
-            await self._send_msg("🟢 <b>Live logs enabled</b>\nImportant events will be streamed here.")
+    async def _cmd_toggle_heartbeat(self, chat_id: str):
+        now_on = self.prefs.toggle('heartbeat')
+        if now_on:
+            self._last_heartbeat = 0.0
+            mins = self.prefs.get(INTERVAL_KEY, 15)
+            await self._send_msg(f"💓 <b>Heartbeat on</b> — every {mins} min.\n"
+                                 f"<i>Debug logs are never forwarded; use 🐞 Errors for "
+                                 f"anything that actually broke.</i>")
         else:
-            await self._send_msg("🔴 <b>Live logs disabled</b>")
+            await self._send_msg("🩶 <b>Heartbeat off</b>")
+
+    async def _cmd_errors(self, chat_id: str):
+        await self._send_msg(self._build_errors_text(), reply_markup=self._errors_keyboard())
+
+    async def _cmd_prefs(self, chat_id: str):
+        await self._send_msg(self._build_prefs_text(), reply_markup=self._prefs_keyboard())
 
     async def _cmd_stop(self, chat_id: str):
         if self.bot_state:
@@ -609,7 +726,8 @@ class TelegramBot:
             "<b>🤖 PTQ SCALP BOT</b>\n\n"
             "Type /dash to open the interactive dashboard.\n\n"
             "<b>Quick commands:</b>\n"
-            "/status /pnl /trades /logs /stop /resume\n"
+            "/status /pnl /trades /heartbeat /errors /prefs\n"
+            "/stop /resume /analytics /ws /help\n"
             "/analytics /ws"
         )
         await self._send_msg(text)
@@ -695,6 +813,10 @@ class TelegramBot:
     # ═══════════════════════════════════════════
 
     def notify_entry(self, trade: Dict):
+        # TELEGRAM_NOTIFY_ENTRIES existed in config and .env but nothing read it,
+        # so switching it off did nothing. It is honoured here now, via prefs.
+        if not self.prefs.get('notify_entries', True):
+            return
         emoji = "🟢" if trade.get('direction', 'CE') == "CE" else "🔴"
         msg = (
             f"{emoji} <b>ENTRY</b>\n"
@@ -706,6 +828,8 @@ class TelegramBot:
         self.send_message(msg)
 
     def notify_exit(self, trade: Dict, pnl: float, exit_reason: str):
+        if not self.prefs.get('notify_exits', True):
+            return
         emoji = "✅" if pnl > 0 else "❌"
         msg = (
             f"{emoji} <b>EXIT</b> — <b>₹{pnl:+,.2f}</b>\n"
@@ -716,6 +840,8 @@ class TelegramBot:
         self.send_message(msg)
 
     def notify_kill_switch(self, reason: str, details: Dict):
+        if not self.prefs.get('notify_kill', True):
+            return
         msg = (
             f"🚨 <b>KILL SWITCH</b>\n"
             f"  Reason: {reason}\n"
@@ -724,6 +850,8 @@ class TelegramBot:
         self.send_message(msg)
 
     def notify_daily_summary(self, summary: Dict):
+        if not self.prefs.get('daily_summary', True):
+            return
         total = summary.get('total_trades', 0)
         wins = summary.get('winning_trades', 0)
         pnl = summary.get('total_pnl', 0)
@@ -761,85 +889,140 @@ class TelegramBot:
         )
         self.send_message(msg)
 
-    def notify_error(self, error: str):
-        self.send_message(f"⚠️ <b>ERROR</b>\n<code>{error[:300]}</code>")
+    def notify_error(self, error: str, source: str = "bot"):
+        """Record every error; send one only if the user wants error alerts.
 
-    # ═══════════════════════════════════════════
-    # LIVE LOG STREAMING
-    # ═══════════════════════════════════════════
-
-    def _init_log_positions(self):
-        """Set log file positions to current end (don't send old logs)"""
-        if not self.logger:
+        Recording is unconditional so the 🐞 Errors menu is always complete even when alerts
+        are muted. The text is HTML-escaped because an unescaped '<' in an exception message
+        makes the Telegram API reject the message outright — losing exactly the report that
+        mattered.
+        """
+        self.record_error(error, source=source)
+        if not self.prefs.get('notify_errors', True):
             return
-        for name, path in [('main', self.logger.main_log),
-                           ('trade', getattr(self.logger, 'trade_log', None)),
-                           ('error', getattr(self.logger, 'error_log', None))]:
-            if path and os.path.exists(path):
-                self._live_log_last_pos[name] = os.path.getsize(path)
+        self.send_message(f"⚠️ <b>ERROR</b>\n<code>{self._escape(str(error)[:300])}</code>")
 
-    def _check_live_logs(self) -> List[str]:
-        """Check for new important log lines"""
-        if not self._live_logs_enabled or not self.logger:
-            return []
+    # ═══════════════════════════════════════════
+    # SESSION ERRORS
+    # ═══════════════════════════════════════════
 
-        important_keywords = [
-            'SIGNAL', 'ENTRY', 'EXIT', 'KILL', 'ERROR',
-            'MARKET OPEN', 'Strike adjusted', 'Spread'
-        ]
+    def record_error(self, message: str, source: str = "bot") -> None:
+        """Record an error raised by the running session so it can be read from the menu.
 
-        new_messages = []
-        for name, path in [('main', self.logger.main_log),
-                           ('trade', getattr(self.logger, 'trade_log', None)),
-                           ('error', getattr(self.logger, 'error_log', None))]:
-            if not path or not os.path.exists(path):
+        Called from notify_error and from the error-log tail. Bounded and lock-guarded because
+        the trading loop, the Telegram worker and the broker callbacks all reach it.
+        """
+        text = (message or "").strip()
+        if not text:
+            return
+        with self._errors_lock:
+            self._error_seq += 1
+            self._errors.append({
+                'n': self._error_seq,
+                'at': datetime.now().strftime('%H:%M:%S'),
+                'source': source,
+                'text': text[:400],
+            })
+
+    def error_count(self) -> int:
+        with self._errors_lock:
+            return len(self._errors)
+
+    def clear_errors(self) -> None:
+        with self._errors_lock:
+            self._errors.clear()
+
+    def _tail_error_log(self) -> None:
+        """Pull anything new from the error log into the session buffer.
+
+        Only the error log is read. The main log is deliberately never tailed — that is what
+        used to push '[DEBUG] No signal: ...' into the chat by the thousand.
+        """
+        path = getattr(self.logger, 'error_log', None) if self.logger else None
+        if not path or not os.path.exists(path):
+            return
+        try:
+            size = os.path.getsize(path)
+            if self._error_log_pos is None:      # first look: start at the end, skip history
+                self._error_log_pos = size
+                return
+            if size < self._error_log_pos:       # rotated
+                self._error_log_pos = 0
+            if size == self._error_log_pos:
+                return
+            with open(path, 'r') as f:
+                f.seek(self._error_log_pos)
+                lines = f.readlines()
+                self._error_log_pos = f.tell()
+        except Exception:
+            return
+        for line in lines:
+            clean = line.strip()
+            if not clean or clean.startswith('#') or '[DEBUG]' in clean:
                 continue
+            self.record_error(clean, source='log')
 
-            last = self._live_log_last_pos.get(name, 0)
-            try:
-                with open(path, 'r') as f:
-                    f.seek(last)
-                    lines = f.readlines()
-                    self._live_log_last_pos[name] = f.tell()
-            except Exception:
-                continue
+    def _build_errors_text(self) -> str:
+        with self._errors_lock:
+            items = list(self._errors)
+        if not items:
+            return ("🐞 <b>Session Errors</b>\n\n"
+                    "✅ Nothing recorded since the bot started.\n\n"
+                    "<i>Errors raised while running appear here — the chat is not used for "
+                    "debug logs.</i>")
+        shown = items[-12:]
+        lines = [f"🐞 <b>Session Errors</b> — {len(items)} recorded"]
+        if len(items) > len(shown):
+            lines.append(f"<i>showing the last {len(shown)}</i>")
+        lines.append("")
+        for e in shown:
+            lines.append(f"<b>#{e['n']}</b> <code>{e['at']}</code> · {e['source']}")
+            lines.append(f"<code>{self._escape(e['text'][:220])}</code>")
+        return "\n".join(lines)
 
-            for line in lines:
-                clean = line.strip()
-                if not clean:
-                    continue
+    @staticmethod
+    def _escape(text: str) -> str:
+        """Escape the three characters Telegram's HTML parse mode cares about.
 
-                # Trade/error logs always important
-                is_important = name in ('trade', 'error')
-                if not is_important:
-                    is_important = any(kw in clean.upper() for kw in important_keywords)
+        Unescaped '<' in an exception message makes the API reject the whole message, so an
+        error report could silently fail to arrive — exactly when it is needed most.
+        """
+        return (text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
-                if is_important:
-                    # Strip timestamp brackets
-                    display = clean
-                    if display.startswith('[') and ']' in display:
-                        parts = display.split(']', 2)
-                        if len(parts) >= 3:
-                            display = parts[2].strip()
-                        elif len(parts) == 2:
-                            display = parts[1].strip()
+    # ═══════════════════════════════════════════
+    # HEARTBEAT
+    # ═══════════════════════════════════════════
 
-                    if len(display) > 150:
-                        display = display[:147] + "..."
-                    new_messages.append(display)
+    def _build_heartbeat_text(self) -> str:
+        """One compact line-set proving the bot is alive, sent on the chosen interval."""
+        s = self.bot_state
+        now = datetime.now().strftime('%H:%M:%S')
+        n_err = self.error_count()
+        err_line = (f"\n🐞 <b>{n_err}</b> error(s) this session — see the menu" if n_err else "")
+        if not s:
+            return (f"💓 <b>Heartbeat</b> · <code>{now}</code>\n"
+                    f"<i>Bot state not connected</i>{err_line}")
+        pnl = getattr(s, 'daily_pnl_inr', 0) or 0
+        trades = getattr(s, 'trades_today', 0) or 0
+        wins = getattr(s, 'wins_today', 0) or 0
+        state = getattr(s, 'state', '?')
+        ltp = 0
+        spot = 0
+        if self.broker:
+            spot = getattr(self.broker, 'spot_price', 0) or 0
+            tick = getattr(self.broker, 'last_tick', None) or {}
+            ltp = tick.get('ltp', 0) or 0
+        return (
+            f"💓 <b>Heartbeat</b> · <code>{now}</code>\n"
+            f"State <b>{state}</b> · NIFTY <b>{spot:,.0f}</b> · LTP <b>₹{ltp:,.2f}</b>\n"
+            f"Trades <b>{trades}</b> ({wins}W) · P&amp;L <b>₹{pnl:+,.0f}</b>{err_line}"
+        )
 
-        return new_messages[-10:]  # Max 10 per cycle
-
-    def _can_send_log(self) -> bool:
-        """Rate limit live logs"""
-        now = time.time()
-        if now - self._live_log_rate_reset > 60:
-            self._live_log_rate_count = 0
-            self._live_log_rate_reset = now
-        if self._live_log_rate_count >= self._live_log_max_per_min:
+    def _heartbeat_due(self) -> bool:
+        if not self.prefs.get('heartbeat'):
             return False
-        self._live_log_rate_count += 1
-        return True
+        interval = max(1, int(self.prefs.get(INTERVAL_KEY, 15))) * 60
+        return (time.time() - self._last_heartbeat) >= interval
 
     # ═══════════════════════════════════════════
     # BACKGROUND WORKER
@@ -866,7 +1049,7 @@ class TelegramBot:
 
         async def worker():
             last_update_id = 0
-            log_check_counter = 0
+            tick_counter = 0
 
             while self._running:
                 # 1. Send queued messages
@@ -895,17 +1078,23 @@ class TelegramBot:
                 except Exception:
                     pass
 
-                # 3. Stream live logs (every ~3 seconds)
-                log_check_counter += 1
-                if log_check_counter >= 3 and self._live_logs_enabled:
-                    log_check_counter = 0
+                # 3. Pull any new errors into the session buffer (~every 3s).
+                #    Only the error log is read — never the main log, which is what used to
+                #    push DEBUG lines into the chat.
+                tick_counter += 1
+                if tick_counter % 3 == 0:
                     try:
-                        new_logs = self._check_live_logs()
-                        if new_logs and self._can_send_log():
-                            batch = "\n".join(f"<code>▸ {l}</code>" for l in new_logs)
-                            await self._send_msg(f"📋 <b>Live</b>\n{batch}")
+                        self._tail_error_log()
                     except Exception:
                         pass
+
+                # 4. Heartbeat on the configured interval
+                try:
+                    if self._heartbeat_due():
+                        self._last_heartbeat = time.time()
+                        await self._send_msg(self._build_heartbeat_text())
+                except Exception:
+                    pass
 
                 await asyncio.sleep(1)
 
@@ -941,12 +1130,25 @@ class TelegramBot:
             if chat_id != self.chat_id:
                 return
 
+            # preference toggles carry their key in the callback data
+            if data.startswith('pf:'):
+                try:
+                    await self._cb_pref_toggle(callback_id, msg_id, data[3:])
+                except Exception as e:
+                    self.record_error(f"pref toggle {data}: {e}", source="telegram")
+                    await self._answer_callback(callback_id, "Could not save that setting")
+                return
+
             handler = self._callbacks.get(data)
             if handler:
                 try:
                     await handler(callback_id, msg_id)
                 except Exception as e:
+                    # a failing button used to vanish into the callback answer only
+                    self.record_error(f"callback {data}: {e}", source="telegram")
                     await self._answer_callback(callback_id, f"Error: {e}")
+            else:
+                await self._answer_callback(callback_id, "Unknown action")
             return
 
         # Handle text messages (commands)
@@ -964,7 +1166,8 @@ class TelegramBot:
                 try:
                     await handler(chat_id)
                 except Exception as e:
-                    await self._send_msg(f"❌ Error: {e}")
+                    self.record_error(f"command {cmd}: {e}", source="telegram")
+                    await self._send_msg(f"❌ Error: {self._escape(str(e))}")
 
 
 # ═══════════════════════════════════════════
@@ -995,6 +1198,24 @@ def send_alert(message: str):
     """Send urgent alert via Telegram (used by kill_switch, broker, state_machine)"""
     if _telegram_bot:
         _telegram_bot.send_message(f"🚨 {message}")
+
+def record_error(message: str, source: str = "bot"):
+    """Record a session error for the 🐞 Errors menu.
+
+    Safe to call from anywhere, including before Telegram is initialised — errors raised
+    during startup simply have nowhere to go yet, and must never break the caller.
+    """
+    if _telegram_bot:
+        try:
+            _telegram_bot.record_error(message, source=source)
+        except Exception:
+            pass
+
+
+def notify_error(message: str, source: str = "bot"):
+    if _telegram_bot:
+        _telegram_bot.notify_error(message, source=source)
+
 
 def notify_entry(trade: Dict):
     if _telegram_bot:
