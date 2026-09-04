@@ -16,6 +16,7 @@ from typing import List
 
 from research.data import Book
 from research import sections_market as M
+from research import sections_gates as G
 from research import sections_strategy as S
 
 CSS = """
@@ -228,6 +229,12 @@ def build(days: List[str] = None, out_dir: str = "claude_code/research_output") 
     h, fd = S.gate_ladder(book, spot_days)
     parts.append(sec(n, "Gate ladder · what the scoring stack never sees", h, fd)); n += 1
 
+    h, fd = G.prefilter_benchmark()
+    parts.append(sec(n, "Pre-filter benchmark · the gates nothing scores", h, fd)); n += 1
+
+    h, fd = G.opening_window()
+    parts.append(sec(n, "The blocked opening window", h, fd)); n += 1
+
     h, fd = S.comparison(book)
     parts.append(sec(n, "Historical session comparison", h, fd)); n += 1
 
@@ -261,7 +268,7 @@ def build(days: List[str] = None, out_dir: str = "claude_code/research_output") 
     nav = "".join(f"<span><b>{i+1:02d}</b> {t}</span>" for i, t in enumerate([
         "Market structure", "Timeframes", "Legs", "Time-of-day", "Signal stack", "CE/PE",
         "Entry windows", "Capture cascade", "Transmission", "Exits", "Blocked", "Gate ladder",
-        "Comparison", "Data quality", "dvf_trades", "Unknowns"]))
+        "Pre-filters", "Opening window", "Comparison", "Data quality", "dvf_trades", "Unknowns"]))
 
     html = f"""<title>Where the Move Goes Missing</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
