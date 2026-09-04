@@ -137,6 +137,35 @@ RSI_REVERSAL_MIN_PROFIT_POINTS = env_float('RSI_REVERSAL_MIN_PROFIT_POINTS', 1.5
 RSI_OVERBOUGHT = env_float('RSI_OVERBOUGHT', 80)      # Exit CE when RSI > this
 RSI_OVERSOLD = env_float('RSI_OVERSOLD', 20)          # Exit PE when RSI < this
 RSI_EXIT_MIN_PROFIT_POINTS = env_float('RSI_EXIT_MIN_PROFIT_POINTS', 2.0)  # Min profit before RSI overbought/oversold exit is even evaluated
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EXIT EXPERIMENT (experiment/exit-strategy-20260904)
+# Every value below defaults to the CURRENT production behaviour, so with no
+# .env entries the exit ladder is byte-for-byte what the frozen baseline does.
+# Enable one variable at a time and measure — see claude_code/experiments/.
+# ═══════════════════════════════════════════════════════════════════════════
+# 'rsi'   = production: profit is taken by smart-RSI / RSI-reversal (floor-gated)
+# 'floor' = experimental: take profit on the first tick past the floor, no RSI condition
+EXIT_PROFIT_MODE = env_str('EXIT_PROFIT_MODE', 'rsi').strip().lower()
+EXIT_PROFIT_FLOOR_POINTS = env_float('EXIT_PROFIT_FLOOR_POINTS', RSI_REVERSAL_MIN_PROFIT_POINTS)
+
+# 'static'       = production: fixed early-cut threshold (see the ATR branch below)
+# 'atr_adaptive' = experimental: threshold = mult x the option's own realised range
+# 'mfe_aware'    = experimental: tighter for a trade that never traded above entry
+EXIT_LOSS_MODE = env_str('EXIT_LOSS_MODE', 'static').strip().lower()
+EXIT_ATR_MULT = env_float('EXIT_ATR_MULT', 0.75)
+EXIT_ATR_FLOOR_POINTS = env_float('EXIT_ATR_FLOOR_POINTS', 1.5)
+EXIT_ATR_CAP_POINTS = env_float('EXIT_ATR_CAP_POINTS', 6.0)
+EXIT_MFE_ARM_POINTS = env_float('EXIT_MFE_ARM_POINTS', 1.0)
+EXIT_MFE_TIGHT_POINTS = env_float('EXIT_MFE_TIGHT_POINTS', 1.5)
+EXIT_MFE_ROOM_POINTS = env_float('EXIT_MFE_ROOM_POINTS', 4.0)
+
+# The `atr` key has never been populated on any tick, so the ATR branch of the
+# early cut has always taken its low-volatility path. Enabling this computes a
+# real realised range from the tick buffer and puts it on the tick. It CHANGES
+# LIVE BEHAVIOUR, so it is opt-in and measured separately from the above.
+EXIT_REALISED_ATR_ENABLED = env_bool('EXIT_REALISED_ATR_ENABLED', False)
+EXIT_REALISED_ATR_WINDOW_SEC = env_int('EXIT_REALISED_ATR_WINDOW_SEC', 60)
 RSI_REVERSAL_CE_EXIT = env_float('RSI_REVERSAL_CE_EXIT', 60)      # CE: exit once RSI drops back below this
 RSI_REVERSAL_PE_EXIT = env_float('RSI_REVERSAL_PE_EXIT', 40)      # PE: exit once RSI rises back above this
 RSI_REVERSAL_CE_EXTREME = env_float('RSI_REVERSAL_CE_EXTREME', 75)  # CE: must have seen RSI above this before a reversal counts
