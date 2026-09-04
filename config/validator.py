@@ -4,10 +4,33 @@ Validates .env settings at startup with warnings and auto-fixes
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 from config.configuration import ROOT_DIR
+
+
+def _strip_inline_comment(raw: str) -> str:
+    """Parse a .env value the way python-dotenv does.
+
+    This loader writes straight into os.environ, so whatever it parses wins for every module
+    that reads configuration afterwards — including anything imported after validate_config()
+    runs at startup. It used to keep inline comments in the value, so a line like
+
+        TRADING_START=09:15   # opened for the full-session experiment
+
+    became the literal string "09:15   # opened for the full-session experiment". Consumers
+    that int()-parse such a value hit a ValueError and take their silent fallback, so the
+    setting appears to be applied while the old default is actually in force. Caught by a
+    pre-flight on 2026-09-04, where it would have quietly re-closed the morning window.
+
+    A quoted value is taken verbatim; an unquoted one ends at the first whitespace-preceded '#'.
+    """
+    value = raw.strip()
+    if len(value) > 1 and value[0] in ('"', "'") and value[-1] == value[0]:
+        return value[1:-1]
+    return re.split(r'\s#', value, maxsplit=1)[0].strip()
 
 
 class ConfigValidationError(Exception):
@@ -69,8 +92,9 @@ class ConfigValidator:
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, value = line.split('=', 1)
-                        self._env_vars[key.strip()] = value.strip()
-                        os.environ[key.strip()] = value.strip()
+                        value = _strip_inline_comment(value)
+                        self._env_vars[key.strip()] = value
+                        os.environ[key.strip()] = value
 
     def get_env_value(self, key: str, default: str = '') -> str:
         """Get configuration value from parsed .env or from process environment."""
