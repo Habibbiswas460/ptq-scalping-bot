@@ -60,12 +60,16 @@ def test_error_log_tail_skips_debug_lines(tmp_path, bot):
 
 # ── heartbeat ─────────────────────────────────────────────────────────────
 def test_heartbeat_is_off_until_enabled_and_then_respects_the_interval(bot):
-    assert bot._heartbeat_due() is False        # off by default
+    # Set the starting state explicitly rather than assuming the ambient .env default —
+    # TELEGRAM_HEARTBEAT is a real setting and flips with the environment.
+    if bot.prefs.get('heartbeat'):
+        bot.prefs.toggle('heartbeat')
+    assert bot._heartbeat_due() is False         # disabled -> never due
 
-    bot.prefs.toggle('heartbeat')
-    assert bot._heartbeat_due() is True         # never sent -> due immediately
+    bot.prefs.toggle('heartbeat')                # -> on
+    assert bot._heartbeat_due() is True          # never sent -> due immediately
 
-    bot._last_heartbeat = 10**12                # pretend one just went out
+    bot._last_heartbeat = 10**12                 # pretend one just went out
     assert bot._heartbeat_due() is False
 
 
@@ -135,10 +139,10 @@ def test_errors_are_recorded_even_when_alerts_are_muted(bot):
 def test_preferences_persist_across_restarts(tmp_path):
     path = str(tmp_path / 'p.json')
     a = TelegramPrefs(path)
-    a.toggle('heartbeat')
+    flipped = a.toggle('heartbeat')              # whatever the .env default was, flip it
     target = a.cycle_interval()
     b = TelegramPrefs(path)
-    assert b.get('heartbeat') is True
+    assert b.get('heartbeat') is flipped
     assert b.get(INTERVAL_KEY) == target
 
 
@@ -179,3 +183,68 @@ def test_callback_data_stays_within_telegrams_64_byte_limit(bot):
         for row in kb['inline_keyboard']:
             for b in row:
                 assert len(b['callback_data'].encode()) <= 64
+
+
+# ── heartbeat defaults come from .env ─────────────────────────────────────
+def test_heartbeat_default_comes_from_env(monkeypatch, tmp_path):
+    """With no prefs file the heartbeat follows TELEGRAM_HEARTBEAT, so enabling it in .env is
+    enough — the user does not have to press the button after every fresh install."""
+    import importlib
+    import config.constants as C
+    import core.services.telegram_prefs as P
+
+    monkeypatch.setenv('TELEGRAM_HEARTBEAT', 'true')
+    monkeypatch.setenv('TELEGRAM_HEARTBEAT_MIN', '30')
+    importlib.reload(C)
+    importlib.reload(P)
+    try:
+        p = P.TelegramPrefs(str(tmp_path / 'a.json'))
+        assert p.get('heartbeat') is True
+        assert p.get(P.INTERVAL_KEY) == 30
+
+        monkeypatch.setenv('TELEGRAM_HEARTBEAT', 'false')
+        importlib.reload(C)
+        importlib.reload(P)
+        assert P.TelegramPrefs(str(tmp_path / 'b.json')).get('heartbeat') is False
+    finally:
+        importlib.reload(C)
+        importlib.reload(P)
+
+
+def test_out_of_range_interval_falls_back(monkeypatch, tmp_path):
+    """The menu cycles the interval by index into INTERVAL_CHOICES, so an unsupported .env
+    value would leave that button stuck."""
+    import importlib
+    import config.constants as C
+    import core.services.telegram_prefs as P
+
+    monkeypatch.setenv('TELEGRAM_HEARTBEAT_MIN', '7')
+    importlib.reload(C)
+    importlib.reload(P)
+    try:
+        p = P.TelegramPrefs(str(tmp_path / 'c.json'))
+        assert p.get(P.INTERVAL_KEY) in P.INTERVAL_CHOICES
+        assert p.cycle_interval() in P.INTERVAL_CHOICES
+    finally:
+        importlib.reload(C)
+        importlib.reload(P)
+
+
+def test_a_saved_preference_still_beats_the_env_default(monkeypatch, tmp_path):
+    """Once the user has toggled it from the chat, their choice wins over .env."""
+    import importlib
+    import config.constants as C
+    import core.services.telegram_prefs as P
+
+    monkeypatch.setenv('TELEGRAM_HEARTBEAT', 'true')
+    importlib.reload(C)
+    importlib.reload(P)
+    try:
+        path = str(tmp_path / 'd.json')
+        a = P.TelegramPrefs(path)
+        assert a.get('heartbeat') is True
+        a.toggle('heartbeat')                      # user turns it off from the menu
+        assert P.TelegramPrefs(path).get('heartbeat') is False
+    finally:
+        importlib.reload(C)
+        importlib.reload(P)

@@ -440,6 +440,11 @@ TELEGRAM_NOTIFY_ENTRIES = env_bool('TELEGRAM_NOTIFY_ENTRIES', True)
 TELEGRAM_NOTIFY_EXITS = env_bool('TELEGRAM_NOTIFY_EXITS', True)
 TELEGRAM_NOTIFY_KILL_SWITCH = env_bool('TELEGRAM_NOTIFY_KILL_SWITCH', True)
 TELEGRAM_DAILY_SUMMARY = env_bool('TELEGRAM_DAILY_SUMMARY', True)
+# Heartbeat: a periodic 'still alive' message. This replaced the old live-log forwarding,
+# which pushed every '[DEBUG] No signal: ...' line into the chat. Overridable from the
+# Telegram settings menu at runtime; these are only the starting values.
+TELEGRAM_HEARTBEAT = env_bool('TELEGRAM_HEARTBEAT', False)
+TELEGRAM_HEARTBEAT_MIN = env_int('TELEGRAM_HEARTBEAT_MIN', 15)
 
 # =========================================================
 #  DATABASE
