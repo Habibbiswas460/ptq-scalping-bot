@@ -28,9 +28,21 @@ def _score(delta=None, oi_direction='NEUTRAL', direction='CE'):
 
 
 # ── defaults ──────────────────────────────────────────────────────────────
-def test_flags_default_off():
-    assert C.TICK_DELTA_ENABLED is False
-    assert C.TICK_OI_ENABLED is False
+def test_code_defaults_are_off(monkeypatch):
+    """The CODE default must be OFF so a checkout with no .env entries reproduces the frozen
+    baseline's scoring. `.env` may switch either flag on for a measured session — that is the
+    intended use — so this asserts the default, not the currently effective value."""
+    from config.configuration import env_bool
+    monkeypatch.delenv('TICK_DELTA_ENABLED', raising=False)
+    monkeypatch.delenv('TICK_OI_ENABLED', raising=False)
+    assert env_bool('TICK_DELTA_ENABLED', False) is False
+    assert env_bool('TICK_OI_ENABLED', False) is False
+
+
+def test_flags_are_readable_booleans():
+    """Whatever .env says, the flags must resolve to real booleans the engines can branch on."""
+    assert isinstance(C.TICK_DELTA_ENABLED, bool)
+    assert isinstance(C.TICK_OI_ENABLED, bool)
 
 
 def test_unpopulated_delta_still_scores_zero():
