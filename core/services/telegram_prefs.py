@@ -19,6 +19,8 @@ from config.constants import (
     TELEGRAM_NOTIFY_EXITS,
     TELEGRAM_NOTIFY_KILL_SWITCH,
     TELEGRAM_DAILY_SUMMARY,
+    TELEGRAM_HEARTBEAT,
+    TELEGRAM_HEARTBEAT_MIN,
 )
 
 PREFS_PATH = os.path.join('data', 'telegram_prefs.json')
@@ -30,13 +32,16 @@ SCHEMA: Dict[str, tuple] = {
     'notify_kill':       ('Kill-switch alerts', TELEGRAM_NOTIFY_KILL_SWITCH),
     'daily_summary':     ('Daily summary',     TELEGRAM_DAILY_SUMMARY),
     'notify_errors':     ('Error alerts',      True),
-    'heartbeat':         ('Heartbeat',         False),
+    'heartbeat':         ('Heartbeat',         TELEGRAM_HEARTBEAT),
 }
 
 # heartbeat interval is a number, not a toggle
 INTERVAL_KEY = 'heartbeat_min'
 INTERVAL_CHOICES = (1, 5, 15, 30, 60)
-INTERVAL_DEFAULT = 15
+# An out-of-range .env value would otherwise leave the menu's cycle button stuck, since it
+# steps through INTERVAL_CHOICES by index.
+INTERVAL_DEFAULT = (TELEGRAM_HEARTBEAT_MIN
+                    if TELEGRAM_HEARTBEAT_MIN in INTERVAL_CHOICES else 15)
 
 
 class TelegramPrefs:
