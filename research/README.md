@@ -18,6 +18,7 @@ python -m research.compare_report               # all sessions side by side
 python -m research.compare_report 2026-09-03 2026-09-04   # before / after
 python -m research.experiment                   # the experiment ledger
 python -m research.experiment EXP-11            # one experiment record
+python -m research.synthesis                    # the master chain, all sessions
 ```
 
 Output lands in `claude_code/research_output/` (gitignored). Self-contained HTML: inline SVG,
@@ -40,6 +41,7 @@ no plotting dependency, no network fetch beyond webfonts.
 | `execution` | spread and quote quality — clearly separated as assumptions |
 | `compare` | session rows and before/after |
 | `ledger` | the experiment record, including retractions |
+| `synthesis` | the whole chain priced end to end |
 | `render`, `svg` | presentation |
 
 ## The two rules that matter
