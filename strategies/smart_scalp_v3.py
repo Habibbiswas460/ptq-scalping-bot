@@ -31,6 +31,18 @@ from collections import deque
 from statistics import median
 
 from core.engines.weighted_score_engine import WeightedScoreEngine
+from config.constants import TRADING_NO_TRADE_BEFORE
+
+def _parse_no_trade_before() -> tuple:
+    """(hour, minute) before which the strategy will not signal. Falls back to the historical
+    09:45 if the setting is malformed, so a typo cannot silently open the whole session."""
+    try:
+        h, m = TRADING_NO_TRADE_BEFORE.split(':')
+        return int(h), int(m)
+    except (ValueError, AttributeError):
+        return 9, 45
+
+
 from core.engines.adaptive_confidence_engine import AdaptiveConfidenceEngine
 from core.engines.market_quality_engine import MarketQualityEngine
 from config.constants import (
@@ -860,11 +872,13 @@ class SmartScalpV3:
             confidence: 0-100
             details: dict with scoring details
         """
-        # ====== TIME FILTER: No trades before 09:45 AM ======
+        # ====== TIME FILTER: no trades before TRADING_NO_TRADE_BEFORE ======
         latest_tick = ticks[-1] if ticks else {}
         current_time = self._resolve_tick_time(latest_tick)
-        if current_time.hour == 9 and current_time.minute < 45:
-            return 0, "", 0, {"reason": f"Time filter: Wait until 09:45 (now {current_time.strftime('%H:%M')})"}
+        block_h, block_m = _parse_no_trade_before()
+        if (current_time.hour, current_time.minute) < (block_h, block_m):
+            return 0, "", 0, {"reason": f"Time filter: Wait until {TRADING_NO_TRADE_BEFORE} "
+                                        f"(now {current_time.strftime('%H:%M')})"}
         
         # We use Yahoo historical data, so don't need many ticks
         if len(ticks) < 5:
