@@ -1371,3 +1371,67 @@ def test_the_post_session_command_refreshes_the_evidence_page():
     assert "Store()" in src and src.count("Store(") == 1, \
         "only the record build may open the store for writing"
     assert not re.search(r"\b20\d\d-\d\d-\d\d\b", src), "no session date may be hardcoded"
+
+
+# ── increment 6: the record as a whole ───────────────────────────────────
+def test_a_migrated_database_and_a_fresh_one_agree_as_sets_not_as_order(tmp_path):
+    """ALTER appends, the DDL places. The set must match; the order must not be relied on.
+
+    An older database is simulated faithfully — a current one with every later-added column
+    removed — rather than with a hand-written stub, which would only prove that a stub is
+    incomplete.
+    """
+    import sqlite3 as _sq
+
+    old = str(tmp_path / "old.db")
+    with Store(old) as st:
+        for table, column, _decl in vschema.ADDED_COLUMNS:
+            st.con.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        st.con.commit()
+
+    with _sq.connect(old) as probe:
+        before = {r[1] for r in probe.execute("PRAGMA table_info(visual_trade_overlays)")}
+    assert "market_quality_score" not in before, "the older schema must lack the later columns"
+
+    with Store(old) as migrated, Store(str(tmp_path / "fresh.db")) as fresh:
+        a = [r[1] for r in migrated.con.execute("PRAGMA table_info(visual_trade_overlays)")]
+        b = [r[1] for r in fresh.con.execute("PRAGMA table_info(visual_trade_overlays)")]
+    assert set(a) == set(b), "a migrated database is missing columns a fresh one has"
+    assert a != b, "the orders differ, which is exactly why nothing may read by position"
+    assert "market_quality_score" in set(a)
+
+
+def test_a_session_rebuilt_from_source_matches_the_live_record_by_name(book, tick_day, tmp_path):
+    """The record carries nothing that cannot be rebuilt from the trading database alone."""
+    import hashlib
+
+    from research.visual.schema import DB_PATH
+
+    if not os.path.exists(DB_PATH):
+        pytest.skip("no live visual records built")
+
+    fresh = str(tmp_path / "fresh.db")
+    with Store(fresh) as st:
+        build_session(book, tick_day, st)
+
+    keys = {"visual_trade_overlays": "trade_id",
+            "visual_strategy_state": "row_id",
+            "visual_evaluation_gaps": "gap_id",
+            "visual_market_legs": "threshold,leg_id",
+            "visual_data_quality": "field"}
+
+    def fingerprint(path):
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        h = hashlib.sha256()
+        for table, order in sorted(keys.items()):
+            cols = sorted(r[1] for r in con.execute(f"PRAGMA table_info({table})"))
+            sel = ",".join(f'"{c}"' for c in cols)
+            for row in con.execute(
+                    f"SELECT {sel} FROM {table} WHERE session_id=? ORDER BY {order}",
+                    (tick_day,)):
+                h.update(repr(tuple(row)).encode())
+        con.close()
+        return h.hexdigest()
+
+    assert fingerprint(fresh) == fingerprint(DB_PATH), \
+        "the live record holds something a rebuild from source does not reproduce"
