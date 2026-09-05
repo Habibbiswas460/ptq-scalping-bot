@@ -11,6 +11,9 @@ attached to a provenance state and a confidence, and no chart turns itself into 
 ## Commands
 
 ```bash
+# after a live session — runs the whole pipeline and prints the summary
+python -m research.after_session 2026-09-07
+
 python -m research.session 2026-09-04           # one session, all layers
 python -m research.session 2026-09-04 --deep    # also price what each pre-filter blocked (slow)
 python -m research.session --all                # every session that carries data
@@ -42,6 +45,7 @@ no plotting dependency, no network fetch beyond webfonts.
 | `compare` | session rows and before/after |
 | `ledger` | the experiment record, including retractions |
 | `synthesis` | the whole chain priced end to end |
+| `after_session` | the one post-session command; quality first, then selection, then outcome |
 | `render`, `svg` | presentation |
 
 ## The two rules that matter
