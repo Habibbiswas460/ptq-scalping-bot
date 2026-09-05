@@ -51,6 +51,97 @@ Detailed component documentation for RuntimeState, DVF, Market Quality, and Posi
 5. Apply market quality gate and position sizing.
 6. Execute via broker interface and log DVF decision evidence.
 
+## Daily Operation
+
+Every command assumes the repository root as the working directory.
+
+### Before a session
+
+```bash
+./venv/bin/python -c "from config.validator import validate_config; validate_config()"
+```
+
+Check `.env` **after** `validate_config()` has run, never from a fresh `config.constants`
+import: the validator's loader writes straight into `os.environ`, so that is the only place the
+effective values are visible.
+
+### Start
+
+```bash
+./run.sh                      # menu launcher
+./venv/bin/python app.py      # or start directly
+```
+
+### After the session closes
+
+One command runs the whole post-session pipeline — session report, before/after comparison,
+synthesis, experiment ledger, then the visual record, its page and the cross-session evidence
+page — and prints a summary that leads with data quality rather than P&L:
+
+```bash
+./venv/bin/python -m research.after_session 2026-09-07   # or omit the date for the newest session
+```
+
+Where two experiments ran in the same session, separate them:
+
+```bash
+./venv/bin/python claude_code/experiments/exp10_postsession.py 2026-09-07
+```
+
+## Research Instruments
+
+Two read-only layers over the trading database. Neither writes to it, neither changes strategy
+behaviour, and both discover sessions from the data rather than from a hardcoded date.
+
+### Visual record (`research/visual`)
+
+A persisted record of every session — candles at 10s/30s/1m/5m/30m/1d, market legs, indicators,
+strategy state, one row per evaluation, trade overlays and the capture cascade — with a
+provenance of REAL, RECONSTRUCTED, ESTIMATED or MISSING on every field. Records live in
+`core/data/visual_records.db`; nothing is fabricated where a source is absent.
+
+```bash
+./venv/bin/python -m research.visual audit                 # what the source data can support
+./venv/bin/python -m research.visual list                  # what is persisted
+./venv/bin/python -m research.visual backfill 2026-09-07   # build or rebuild one session
+./venv/bin/python -m research.visual backfill              # every session that carries data
+./venv/bin/python -m research.visual view 2026-09-07       # that session's page
+./venv/bin/python -m research.visual view                  # every page, plus the index
+./venv/bin/python -m research.visual compare               # cross-session evidence page
+./venv/bin/python -m research.visual compare --print       # ...and the dimensions on stdout
+```
+
+Output lands in `claude_code/research_output/visual/` (gitignored):
+
+```bash
+xdg-open claude_code/research_output/visual/index.html
+```
+
+A rebuild is idempotent, and `research.after_session` builds the record for whatever day it
+processes, so a future session needs no manual step.
+
+### Research layer (`research/`)
+
+```bash
+./venv/bin/python -m research.session 2026-09-07          # one session, all layers
+./venv/bin/python -m research.session 2026-09-07 --deep   # also price what each pre-filter blocked
+./venv/bin/python -m research.compare_report 2026-09-04 2026-09-07
+./venv/bin/python -m research.synthesis                   # the whole chain, end to end
+./venv/bin/python -m research.experiment                  # the experiment ledger
+```
+
+Both layers are documented in [research/README.md](research/README.md).
+
+## Reverting a Configuration Experiment
+
+```bash
+cp .env.bak-pre-tick-repair-20260904 .env    # tick delta/oi population off
+cp .env.bak-pre-timefilter-20260904 .env     # the earlier time gates
+```
+
+`TRADING_END` must not be raised above **15:25**: `exit_engine` force-closes at 15:25, so an
+entry taken after it exits on the next tick for the round-trip spread.
+
 ## India VIX Canonical Contract
 Authoritative contract in code:
 - exchange: NSE
@@ -113,16 +204,22 @@ Canonical launcher command policy:
 - [strategies](strategies)
 - [brokers](brokers)
 - [utils](utils)
+- [research](research) — read-only research and visual record instruments
 - [tests](tests)
 - [archive](archive)
 
 Detailed layout is maintained in [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md).
 
 ## Test Status
-RC2 Freeze verification snapshot:
-- 151 passed
-- 1 skipped
-- 0 failed
+
+```bash
+./venv/bin/python -m pytest                              # the whole suite
+./venv/bin/python -m pytest tests/test_visual_records.py  # the visual record layer
+```
+
+Current: **464 passed, 1 skipped, 0 failed**.
+
+RC2 Freeze verification snapshot, kept for history: 151 passed, 1 skipped, 0 failed.
 
 ## MFE/MAE inspection
 You can inspect the recent trade excursion summary directly with:
