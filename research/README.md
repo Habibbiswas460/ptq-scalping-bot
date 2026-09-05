@@ -47,6 +47,35 @@ no plotting dependency, no network fetch beyond webfonts.
 | `synthesis` | the whole chain priced end to end |
 | `after_session` | the one post-session command; quality first, then selection, then outcome |
 | `render`, `svg` | presentation |
+| `visual/` | the permanent record: persisted candles, legs, overlays and quality |
+
+## The permanent visual record
+
+`research/visual/` persists what the modules above derive, so a session's chart can be redrawn
+years later without re-deriving it — and so a dashboard added later is a rendering change, not
+a data-layer rewrite.
+
+```text
+Raw / historical DB -> normalized series -> as-of candle builder
+                    -> persistent visual records -> HTML/SVG viewer -> (future dashboard)
+```
+
+```bash
+python -m research.visual audit                # what the source data can support
+python -m research.visual backfill             # build every session that carries data
+python -m research.visual backfill 2026-09-04  # one session (rebuild is idempotent)
+python -m research.visual view                 # render the viewer from persisted records
+python -m research.visual list                 # what is persisted
+```
+
+Records live in `core/data/visual_records.db` — its own file, additive schema, never the
+trading database. Timeframes are 10s / 30s / 1m / 5m / 30m / daily. Every row carries a
+`source` and a `provenance` of REAL, RECONSTRUCTED, ESTIMATED or MISSING, and where a session
+cannot support a timeframe the coverage row says MISSING rather than a bar being invented.
+`research.after_session` builds the record for whatever day it processes, so a future session
+needs no manual step.
+
+The viewer imports `research.visual.store` and never `research.db`; a test asserts it.
 
 ## The two rules that matter
 

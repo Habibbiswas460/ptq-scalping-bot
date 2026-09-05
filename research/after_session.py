@@ -23,6 +23,36 @@ from research.signals import component_stats
 OUT_DIR = os.path.join("claude_code", "research_output")
 
 
+def visual_records(day: str) -> None:
+    """Persist the session's visual record and refresh the viewer.
+
+    Runs after every session, on whatever day is being processed — the session is discovered
+    from the database, never named here, so a session recorded months from now is picked up by
+    the same call. A failure is reported and does not stop the rest of the pipeline: the
+    records are additive and can always be rebuilt with `python -m research.visual backfill`.
+    """
+    try:
+        from research.visual.build import build_session
+        from research.visual.compare import write_compare
+        from research.visual.store import Reader, Store
+        from research.visual.viewer import write_index, write_session
+
+        with Store() as store:
+            counts = build_session(Book(), day, store)
+        with Reader() as reader:
+            path = write_session(reader, day)
+            write_index(reader)
+            # the cross-session evidence page is regenerated because a new session changes what
+            # every comparison is drawn from. It persists nothing: the comparison is read from
+            # the records each time and written only into the HTML.
+            compare_path = write_compare(reader)
+        print(f"  visual record: {counts['visual_candles']:,} candles, "
+              f"{counts['visual_trade_overlays']} trade overlays -> {path}")
+        print(f"  cross-session evidence refreshed -> {compare_path}")
+    except Exception as exc:                                  # noqa: BLE001 - reported, not fatal
+        print(f"  ! visual record failed: {exc}")
+
+
 def _run(mod: str, args: Sequence[str] = ()) -> Optional[str]:
     cmd = [sys.executable, "-m", mod, *args]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -109,10 +139,11 @@ def main(argv: Sequence[str]) -> int:
     _run("research.compare_report", [prev, day] if prev else [])
     _run("research.synthesis")
     _run("research.experiment")
+    visual_records(day)
     print("=" * 72)
     summary(book, day, prev)
     print()
-    print(f"reports in {OUT_DIR}/")
+    print(f"reports in {OUT_DIR}/  ·  visual records in {OUT_DIR}/visual/")
     return 0
 
 
