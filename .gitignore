@@ -97,6 +97,10 @@ test_*.py
 # LOCAL DATASET / ARTIFACT EXCLUSIONS
 # ─────────────────────────────────────────────────────────────────
 core/data/scripmaster_nifty_nfo.json
+# Runtime SQLite trade store (~380 MB) — never commit
+core/data/*.db
+core/data/*.db-wal
+core/data/*.db-shm
 data/historical/v3_5_0/*.csv
 data/historical/*.csv
 
