@@ -122,6 +122,14 @@ class Book:
         q = "SELECT * FROM trades" + (" WHERE date(entry_time)=?" if day else "") + " ORDER BY entry_time"
         return [dict(r) for r in self.cur.execute(q, (day,) if day else ())]
 
+    def positions(self, day: Optional[str] = None) -> List[Dict]:
+        """Rows from `active_positions`, which is where the live system recorded the bracket it
+        declared when a position opened. The values are real records; whether they governed the
+        exit is a separate question the visual layer answers with evidence, not assumption."""
+        q = ("SELECT * FROM active_positions"
+             + (" WHERE date(entry_time)=?" if day else "") + " ORDER BY entry_time")
+        return [dict(r) for r in self.cur.execute(q, (day,) if day else ())]
+
     def signals(self, day: str) -> List[Dict]:
         k = ("sig", day)
         if k in self._c:
@@ -130,7 +138,8 @@ class Book:
         for r in self.cur.execute(
                 "SELECT timestamp, weighted_score, confidence, accepted, reject_reason, direction,"
                 "       indicators_snapshot, score_breakdown, confidence_breakdown,"
-                "       market_quality_score, market_quality_grade, regime "
+                "       market_quality_score, market_quality_grade, regime, session_type,"
+                "       decision_id, strategy_name "
                 "FROM dvf_signals WHERE date(timestamp)=? ORDER BY timestamp", (day,)):
             d = dict(r)
             for key in ("indicators_snapshot", "score_breakdown", "confidence_breakdown"):
