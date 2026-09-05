@@ -384,6 +384,12 @@ CREATE INDEX IF NOT EXISTS ix_indicators_lookup
     ON visual_indicators (session_id, timeframe, field, ts);
 """
 
+# A migrated database and a freshly created one hold the same columns in a different physical
+# ORDER: `ALTER TABLE ADD COLUMN` appends, while the DDL below places a column where it reads
+# best. The column set is identical and the records are identical, but nothing may depend on
+# column position — every read in this package goes through `sqlite3.Row` by name, and a test
+# asserts the two schemas agree as sets.
+#
 # Columns added after SCHEMA_VERSION 1, applied to an existing database by `Store.migrate()`.
 # Additive only: a column may be appended here, never removed, renamed or retyped, because a
 # record already written must keep meaning exactly what it meant when it was written.
