@@ -9,34 +9,24 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLORS & STYLES
 # ═══════════════════════════════════════════════════════════════════════════════
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
-WHITE='\033[0;37m'
 BRED='\033[1;31m'
 BGREEN='\033[1;32m'
 BYELLOW='\033[1;33m'
-BBLUE='\033[1;34m'
 BPURPLE='\033[1;35m'
 BCYAN='\033[1;36m'
 BWHITE='\033[1;37m'
 DIM='\033[2m'
-BOLD='\033[1m'
 BG_GREEN='\033[42m'
 BG_RED='\033[41m'
-BG_BLUE='\033[44m'
 BG_PURPLE='\033[45m'
-BG_CYAN='\033[46m'
 NC='\033[0m'
 
 # Gradient colors
 G1='\033[38;5;196m'; G2='\033[38;5;202m'; G3='\033[38;5;208m'
 G4='\033[38;5;214m'; G5='\033[38;5;220m'; G6='\033[38;5;226m'
 G7='\033[38;5;118m'; G8='\033[38;5;46m';  G9='\033[38;5;51m'
-G10='\033[38;5;21m'; G11='\033[38;5;93m'; G12='\033[38;5;201m'
+G11='\033[38;5;93m'; G12='\033[38;5;201m'
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PROJECT DIRECTORY
@@ -406,7 +396,6 @@ run_full_project_check() {
     local py_bin="$PYTHON_BIN"
     local checks_passed=0
     local checks_failed=0
-    local temp_log="/tmp/ptq_preflight.log"
 
     printf "      ${CYAN}├─${NC} Critical files : "
     for f in app.py core/main.py core/risk/validators.py core/engines/exit_engine.py config/constants.py config/validator.py strategies/smart_scalp_v3.py brokers/angel_one/client.py; do
@@ -1164,8 +1153,6 @@ run_quick_backtest() {
     fi
 
     for i in "${!CSV_FILES[@]}"; do
-        local fdate
-        fdate=$(echo "${CSV_FILES[$i]}" | grep -oP '\d{4}-\d{2}-\d{2}')
         local lines
         lines=$(wc -l < "${CSV_FILES[$i]}" 2>/dev/null || echo 0)
         printf "      ${BGREEN}[%2d]${NC} ${BWHITE}%-30s${NC} ${DIM}(%s rows)${NC}\n" $((i+1)) "${CSV_FILES[$i]}" "$lines"
@@ -1895,20 +1882,18 @@ menu_tools() {
     printf "    ${BCYAN}║${NC}  ${BWHITE}🔧 PROJECT TOOLS${NC}                                        ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}╠══════════════════════════════════════════════════════════╣${NC}\n"
     printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[1]${NC} Project Structure    ${DIM}File tree overview${NC}          ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[2]${NC} Disk Usage           ${DIM}Size of project dirs${NC}        ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[3]${NC} Python Code Stats    ${DIM}Lines of code count${NC}         ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[4]${NC} Installed Packages   ${DIM}pip list${NC}                    ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[5]${NC} Run Cleanup Script   ${DIM}cleanup.sh${NC}                  ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[6]${NC} View Documentation   ${DIM}README / DOCS${NC}               ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[7]${NC} Bot Monitor Status   ${DIM}Live monitor snapshot${NC}       ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[8]${NC} Market Readiness Pro ${DIM}Pre-open gate + report${NC}      ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[9]${NC} Version & Changelog  ${DIM}Build info and recent updates${NC}  ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[1]${NC} Project Structure      ${DIM}File tree overview${NC}          ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[2]${NC} Disk Usage             ${DIM}Size of project dirs${NC}        ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[3]${NC} Python Code Stats      ${DIM}Lines of code count${NC}         ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[4]${NC} Installed Packages     ${DIM}pip list${NC}                    ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[5]${NC} Run Cleanup Script     ${DIM}cleanup.sh${NC}                  ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[6]${NC} View Documentation     ${DIM}README / DOCS${NC}               ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[7]${NC} Market Readiness Pro   ${DIM}Pre-open gate + report${NC}      ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}   ${DIM}[0]${NC} ← Back                                             ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
     echo ""
-    printf "    ${BWHITE}Select [0-9]: ${NC}"
+    printf "    ${BWHITE}Select [0-7]: ${NC}"
     read -r pchoice
 
     echo ""
@@ -1983,10 +1968,6 @@ menu_tools() {
             fi
             ;;
         7)
-            printf "    ${BWHITE}Bot Monitor Status:${NC}\n\n"
-            printf "    ${DIM}Not available — utils/monitoring.py was removed (confirmed unused: no code path in the live bot ever wrote to it, so this always showed an empty snapshot). Use System Health from the main menu for a real diagnostic, or [8] Market Readiness Pro here.${NC}\n"
-            ;;
-        8)
             printf "    ${BWHITE}Profile — [1] quick  [2] standard  [3] strict  (Enter = standard): ${NC}"
             read -r rprofile
             case "$rprofile" in
@@ -1995,9 +1976,6 @@ menu_tools() {
                 *)        rprofile="standard" ;;
             esac
             run_market_readiness_check "$rprofile"
-            ;;
-        9)
-            menu_version
             ;;
         0) show_main_menu; return ;;
         *) printf "    ${BRED}Invalid${NC}\n" ;;
