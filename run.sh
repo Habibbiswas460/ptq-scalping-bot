@@ -995,19 +995,15 @@ menu_analytics() {
         2) "$PYTHON_BIN" utils/analytics.py --weekly ;;
         3) "$PYTHON_BIN" utils/analytics.py --monthly ;;
         4) "$PYTHON_BIN" -c "from utils.analytics import print_trading_calendar; print_trading_calendar(30)" ;;
-        5) "$PYTHON_BIN" -c "
-from utils.analytics import get_best_worst_hours
-h = get_best_worst_hours()
-if h:
-    print('\n📊 BEST HOURS:')
-    for hr, s in h.get('best_hours', []):
-        print(f'  {hr}:00 - {s[\"trades\"]} trades, Rs{s[\"pnl\"]:+,.2f}')
-    print('\n📊 WORST HOURS:')
-    for hr, s in h.get('worst_hours', []):
-        print(f'  {hr}:00 - {s[\"trades\"]} trades, Rs{s[\"pnl\"]:+,.2f}')
-else:
-    print('  No hourly data available yet')
-" 2>/dev/null || printf "    ${DIM}No hourly data available yet${NC}\n" ;;
+        5)
+            # One implementation, in analytics.py, so the menu and the interactive
+            # dashboard cannot disagree about what "best" means. The block this replaces
+            # rendered the ranking here and called its top three "BEST HOURS" whichever
+            # way they pointed.
+            "$PYTHON_BIN" -c "from utils.analytics import print_hourly_performance
+print_hourly_performance()" 2>/dev/null \
+                || printf "    ${DIM}No hourly data available yet${NC}\n"
+            ;;
         6) "$PYTHON_BIN" utils/analytics.py --interactive ;;
         7) menu_dvf_trades; return ;;
         0) show_main_menu; return ;;
