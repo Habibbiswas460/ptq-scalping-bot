@@ -382,7 +382,7 @@ detect_day_type_for() {
 import sys
 from datetime import date
 
-from utils.expiry import expiry_dates, is_expiry_date
+from utils.instruments import expiry_dates, is_expiry_date
 
 if not expiry_dates():
     raise SystemExit(1)

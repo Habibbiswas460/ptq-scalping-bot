@@ -127,6 +127,9 @@ class ConfigValidator:
         
         # Check logical consistency
         self._validate_consistency()
+
+        # Check the config against the exchange's own contract list
+        self._validate_against_instrument_master()
         
         # Write fixes if any were applied
         if self.fixes_applied and auto_fix:
@@ -135,6 +138,48 @@ class ConfigValidator:
         is_valid = len(self.errors) == 0
         return is_valid, self.errors, self.warnings
     
+    def _validate_against_instrument_master(self):
+        """Compare the contract figures in .env with what the exchange actually lists.
+
+        LOT_SIZE, CE_QUANTITY and PE_QUANTITY are written by hand. They agree with the
+        master today, but nothing would notice if a lot size changed - every position
+        would simply be sized wrong. This says so instead. It is a warning, not an error:
+        with no instrument master cached yet there is nothing to compare against, and that
+        must not stop the bot from starting.
+        """
+        try:
+            from utils.instruments import describe, freeze_quantity, lot_size
+        except Exception:
+            return
+
+        listed = lot_size()
+        if listed is None:
+            return
+
+        configured = self.get_env_value('LOT_SIZE', '')
+        try:
+            configured_int = int(str(configured).strip())
+        except (TypeError, ValueError):
+            return
+        if configured_int != listed:
+            self.warnings.append(
+                f"⚠️  LOT_SIZE={configured_int} but the exchange lists {listed} "
+                f"({describe()}) - every position would be sized wrong")
+
+        freeze = freeze_quantity()
+        for key in ('CE_QUANTITY', 'PE_QUANTITY'):
+            try:
+                qty = int(str(self.get_env_value(key, '')).strip())
+            except (TypeError, ValueError):
+                continue
+            if qty % listed:
+                self.warnings.append(
+                    f"⚠️  {key}={qty} is not a multiple of the {listed}-unit lot")
+            if freeze and qty > freeze:
+                self.warnings.append(
+                    f"⚠️  {key}={qty} exceeds the exchange freeze quantity {freeze}; "
+                    f"an order that size is refused and must be split")
+
     def _validate_required(self):
         """Validate required settings"""
         paper = self.get_env_value('PAPER_TRADING', 'true').lower() == 'true'

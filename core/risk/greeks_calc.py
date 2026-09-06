@@ -23,7 +23,7 @@ _expiry_warned = False
 def _resolve_expiry_time() -> datetime:
     """When the front contract expires, at the 15:30 close.
 
-    Read from the broker's instrument master (utils/expiry.py). The three places that
+    Read from the broker's instrument master (utils/instruments.py). The three places that
     used to compute this each rolled forward to the next Thursday; NIFTY weeklies expire
     on Tuesday, so every time-to-expiry derived here - and with it theta, gamma and
     detect_day_type()'s reading of the session - was two days long.
@@ -35,7 +35,7 @@ def _resolve_expiry_time() -> datetime:
     reached the broker, in which case it is not trading anyway.
     """
     global _expiry_warned
-    from utils.expiry import describe, expiry_datetime
+    from utils.instruments import describe, expiry_datetime
 
     when = expiry_datetime()
     if when:
@@ -74,7 +74,7 @@ class GreeksFetcher:
         Returns "" when the master is unavailable; fetch_from_api() treats that as "no
         Greeks this cycle" rather than requesting a date nobody can honour.
         """
-        from utils.expiry import next_expiry_after
+        from utils.instruments import next_expiry_after
 
         nxt = next_expiry_after()
         return nxt.strftime("%d%b%Y").upper() if nxt else ""
@@ -226,7 +226,13 @@ def _calculate_greeks_bsm(tick: Dict, spot_price: float, current_strike: int,
         spot_price = tick.get('spot_price', tick['ltp'] * 100)
     
     if not current_strike or current_strike <= 0:
-        current_strike = round(spot_price / 100) * 100
+        # entry_engine and exit_engine both round the spot to 50; this rounded to 100, so
+        # the Greeks could describe a strike 50 points from the one being traded. The step
+        # now comes from the strikes the exchange actually lists on the front expiry.
+        from utils.instruments import strike_step
+
+        step = strike_step() or 50
+        current_strike = int(round(spot_price / step) * step)
     
     if not expiry_time:
         expiry_time = _resolve_expiry_time()
