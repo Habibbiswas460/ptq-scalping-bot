@@ -82,6 +82,9 @@ page — and prints a summary that leads with data quality rather than P&L:
 ./venv/bin/python -m research.after_session 2026-09-07   # or omit the date for the newest session
 ```
 
+The same command is on the launcher at **[11] Research & Visual → [1] After-Session Pipeline**,
+which lists the sessions discovered in the trade store and lets you pick one.
+
 Where two experiments ran in the same session, separate them:
 
 ```bash
@@ -92,6 +95,9 @@ Where two experiments ran in the same session, separate them:
 
 Two read-only layers over the trading database. Neither writes to it, neither changes strategy
 behaviour, and both discover sessions from the data rather than from a hardcoded date.
+
+Every command below is also reachable from the launcher under **[11] Research & Visual**, which
+prints the command it runs so it can be copied back out to a shell.
 
 ### Visual record (`research/visual`)
 
