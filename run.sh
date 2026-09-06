@@ -563,6 +563,7 @@ show_main_menu() {
     printf "    ║   ${G1}[8]${BCYAN} 🔧 Project Tools        ${DIM}Cleanup, structure, docs${BCYAN}            ║\n"
     printf "    ║   ${G12}[9]${BCYAN} 🔍 Trade MFE/MAE        ${DIM}Search by paper trade ID${BCYAN}           ║\n"
     printf "    ║   ${G9}[10]${BCYAN} 🧾 Version & Changelog ${DIM}Build info and recent updates${BCYAN}      ║\n"
+    printf "    ║   ${G11}[11]${BCYAN} 🔬 Research & Visual   ${DIM}Visual record + session reports${BCYAN}    ║\n"
     printf "    ║   ${DIM}[0]${BCYAN} 🚪 Exit                                                  ║\n"
     echo "    ║                                                                  ║"
     echo "    ╚══════════════════════════════════════════════════════════════════╝"
@@ -586,7 +587,7 @@ show_main_menu() {
     esac
     printf "${NC}\n\n"
 
-    printf "    ${BWHITE}Select [0-10]: ${NC}"
+    printf "    ${BWHITE}Select [0-11]: ${NC}"
     read -r choice
 
     case $choice in
@@ -600,6 +601,7 @@ show_main_menu() {
         8) menu_tools ;;
         9) menu_trade_mfe_mae ;;
         10) menu_version ;;
+        11) menu_research ;;
         0)
             echo ""
             printf "    ${BGREEN}Goodbye! Happy Trading! 📈${NC}\n\n"
@@ -1860,6 +1862,202 @@ menu_version() {
 
     press_enter
     show_main_menu
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ███  LEVEL 2: RESEARCH & VISUAL RECORD  ███
+# ═══════════════════════════════════════════════════════════════════════════════
+# Two read-only instruments over the trading database: research/ (session, compare,
+# synthesis, experiment ledger) and research/visual (the persisted visual record).
+# Neither writes to trades.db and neither changes strategy behaviour, so nothing
+# reachable from this menu can alter a session's record or the next run's decisions.
+# The commands here are the ones documented in README.md - kept identical on purpose,
+# so the menu and the docs can't drift apart.
+
+RESEARCH_DB="core/data/trades.db"
+RESEARCH_OUT="claude_code/research_output"
+
+# Every command below opens trades.db read-only, which raises if the file is absent.
+# Fail here with an explanation instead of showing the user a Python traceback.
+research_require_db() {
+    if [ ! -f "$RESEARCH_DB" ]; then
+        printf "    ${BRED}✗ %s not found${NC}\n" "$RESEARCH_DB"
+        printf "    ${DIM}The research layer reads the trade store; run a session first.${NC}\n"
+        return 1
+    fi
+    return 0
+}
+
+# Sessions are discovered from the data, never hardcoded - the same Book().sessions()
+# the Python CLIs use, so this list cannot drift from the dates they accept.
+research_sessions() {
+    "$PYTHON_BIN" - <<'PY' 2>/dev/null || printf "      ${DIM}(could not read the trade store)${NC}\n"
+from research.db import Book
+
+rows = Book().sessions()
+if not rows:
+    print("      (no session found in the trade store)")
+else:
+    print(f"      {'session':<12} {'kind':<12} {'ticks':>8} {'signals':>8} {'trades':>7}")
+    for s in rows:
+        print(f"      {s['day']:<12} {s['kind']:<12} {s['n_ticks']:>8,} "
+              f"{s['n_signals']:>8,} {s['n_trades']:>7}")
+PY
+}
+
+# Prompt for a session date. Echoes the chosen value on stdout - empty means "let the
+# command apply its own default" (newest session, or every session, per command). The
+# listing and the prompt go to stderr so a caller can capture just the date.
+research_ask_session() {
+    local hint="$1" day
+    {
+        echo ""
+        printf "    ${BWHITE}Sessions discovered:${NC}\n"
+        research_sessions
+        echo ""
+        printf "    ${BWHITE}Date (YYYY-MM-DD), or Enter for %s: ${NC}" "$hint"
+    } >&2
+    read -r day
+    if [ -n "$day" ] && ! printf '%s' "$day" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+        printf "    ${BRED}Not a YYYY-MM-DD date - cancelled${NC}\n" >&2
+        echo "__INVALID__"
+        return
+    fi
+    echo "$day"
+}
+
+# Run a research module with the arguments given, echoing the command first so the
+# user can reproduce it outside the menu. Empty arguments are dropped: that is how a
+# blank date at the prompt turns into the module's own default (newest session for
+# after_session, every session for the rest).
+research_run() {
+    local module="$1"
+    shift
+    local -a args=()
+    local a
+    for a in "$@"; do
+        [ -n "$a" ] && args+=("$a")
+    done
+    # Show the command in the form README.md uses, so it can be copied out of the
+    # menu and run in a shell - $PYTHON_BIN is absolute and the repo path has a space.
+    local shown="$PYTHON_BIN"
+    case "$shown" in
+        "$SCRIPT_DIR"/*) shown="./${shown#"$SCRIPT_DIR"/}" ;;
+    esac
+    local cmdline="$shown -m $module"
+    [ ${#args[@]} -gt 0 ] && cmdline="$cmdline ${args[*]}"
+    echo ""
+    printf "    ${DIM}\$ %s${NC}\n\n" "$cmdline"
+    "$PYTHON_BIN" -m "$module" "${args[@]}"
+}
+
+menu_research() {
+    clear
+    echo ""
+    printf "    ${BCYAN}╔══════════════════════════════════════════════════════════╗${NC}\n"
+    printf "    ${BCYAN}║${NC}  ${BWHITE}🔬 RESEARCH & VISUAL RECORD${NC}                             ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}╠══════════════════════════════════════════════════════════╣${NC}\n"
+    printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[1]${NC} After-Session Pipeline ${DIM}Whole chain, one command${NC}    ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[2]${NC} Visual: Audit          ${DIM}What source data supports${NC}   ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[3]${NC} Visual: List Records   ${DIM}What is persisted${NC}           ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[4]${NC} Visual: Backfill       ${DIM}Build or rebuild records${NC}    ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[5]${NC} Visual: View Pages     ${DIM}Render session HTML${NC}         ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[6]${NC} Cross-Session Compare  ${DIM}Evidence page${NC}               ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[7]${NC} Session Report         ${DIM}One session, all layers${NC}     ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[8]${NC} Synthesis & Ledger     ${DIM}Chain + experiment ledger${NC}   ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${BGREEN}[9]${NC} Open Output Folder     ${DIM}Browse rendered HTML${NC}        ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}   ${DIM}[0]${NC} ← Back                                             ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
+    printf "    ${BCYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
+    echo ""
+    printf "    ${DIM}Read-only over ${RESEARCH_DB} · output in ${RESEARCH_OUT}/${NC}\n"
+    echo ""
+    printf "    ${BWHITE}Select [0-9]: ${NC}"
+    read -r rchoice
+
+    if [ "$rchoice" != "0" ] && ! research_require_db; then
+        press_enter
+        menu_research
+        return
+    fi
+
+    local day deep
+    case $rchoice in
+        1)
+            # The one post-session command: session report, before/after comparison,
+            # synthesis, experiment ledger, then the visual record and its pages.
+            day=$(research_ask_session "the newest session with market data")
+            [ "$day" = "__INVALID__" ] || research_run research.after_session "$day"
+            ;;
+        2)
+            # What the source data can support, before anything is built from it.
+            research_run research.visual audit
+            ;;
+        3)
+            research_run research.visual list
+            ;;
+        4)
+            printf "\n    ${DIM}A rebuild is idempotent. Leaving the date blank builds every${NC}\n"
+            printf "    ${DIM}session that carries data, which takes a while.${NC}\n"
+            day=$(research_ask_session "every buildable session")
+            [ "$day" = "__INVALID__" ] || research_run research.visual backfill "$day"
+            ;;
+        5)
+            day=$(research_ask_session "every persisted session, plus the index")
+            [ "$day" = "__INVALID__" ] || research_run research.visual view "$day"
+            ;;
+        6)
+            printf "\n    ${BWHITE}Also print the dimensions to stdout? [y/N]: ${NC}"
+            read -r deep
+            if [ "$deep" = "y" ] || [ "$deep" = "Y" ]; then
+                research_run research.visual compare --print
+            else
+                research_run research.visual compare
+            fi
+            ;;
+        7)
+            # Date first, then the modifier - the same order as every other entry here.
+            day=$(research_ask_session "every session with market data")
+            if [ "$day" != "__INVALID__" ]; then
+                printf "    ${BWHITE}--deep (also price what each pre-filter blocked)? [y/N]: ${NC}"
+                read -r deep
+                if [ "$deep" = "y" ] || [ "$deep" = "Y" ]; then
+                    research_run research.session "$day" --deep
+                else
+                    research_run research.session "$day"
+                fi
+            fi
+            ;;
+        8)
+            research_run research.synthesis
+            research_run research.experiment
+            ;;
+        9)
+            echo ""
+            if [ -d "$RESEARCH_OUT" ]; then
+                printf "    ${BWHITE}%s/${NC}\n\n" "$RESEARCH_OUT"
+                ls -1t "$RESEARCH_OUT" 2>/dev/null | head -20 | while IFS= read -r f; do
+                    printf "      ${BGREEN}•${NC} %s\n" "$f"
+                done
+                if [ -f "$RESEARCH_OUT/visual/index.html" ] && command -v xdg-open >/dev/null 2>&1; then
+                    echo ""
+                    printf "    ${BWHITE}Open the visual index in a browser? [y/N]: ${NC}"
+                    read -r deep
+                    if [ "$deep" = "y" ] || [ "$deep" = "Y" ]; then
+                        xdg-open "$RESEARCH_OUT/visual/index.html" >/dev/null 2>&1 &
+                        printf "    ${BGREEN}✓ opened${NC}\n"
+                    fi
+                fi
+            else
+                printf "    ${DIM}%s/ does not exist yet — run [1] or [5] first.${NC}\n" "$RESEARCH_OUT"
+            fi
+            ;;
+        0) show_main_menu; return ;;
+        *) printf "    ${BRED}Invalid${NC}\n" ;;
+    esac
+    press_enter
+    menu_research
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
