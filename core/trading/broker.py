@@ -22,6 +22,7 @@ from typing import Optional, Dict, Any, List
 from brokers.angel_one import AngelOneClient
 from utils.logger import BotLogger
 from utils.helpers import current_time_ms
+from utils.instruments import round_to_tick
 
 from config.constants import (
     PAPER_TRADING, USE_LIVE_DATA, ENABLE_WEBSOCKET,
@@ -42,7 +43,7 @@ from config.constants import (
     SCRIP_MASTER_CACHE_FILE as _SCRIP_MASTER_CACHE_FILE,
 )
 
-# ScripMaster location comes from config.constants, because utils/expiry.py reads the
+# ScripMaster location comes from config.constants, because utils/instruments.py reads the
 # same cache to answer "when is expiry" - the file is the broker's own contract list and
 # the only authority on that, so where it lives is stated once.
 SCRIP_MASTER_CACHE_FILE = Path(_SCRIP_MASTER_CACHE_FILE)
@@ -71,6 +72,8 @@ class BrokerInterface:
         self.current_strike: int = 0
         self.spot_price: float = 0.0
         self._current_expiry: Optional[str] = None
+        # symbol -> the exchange's own contract record (expiry, strike, lot, tick, freeze)
+        self.contracts: Dict[str, Dict[str, Any]] = {}
         self._option_token: Optional[str] = None
 
         # Last known-good historical candles, keyed by "exchange:token:interval"
@@ -247,11 +250,14 @@ class BrokerInterface:
                     cached = json.load(f)
                 if isinstance(cached, dict):
                     cached_map = cached.get("token_map", {})
+                    cached_contracts = cached.get("contracts", {})
+                    if isinstance(cached_contracts, dict):
+                        self.contracts.update(cached_contracts)
                 else:
                     cached_map = {}
                 if isinstance(cached_map, dict) and cached_map:
                     self.token_map.update({str(k): str(v) for k, v in cached_map.items() if k and v})
-                    if age_sec <= SCRIP_MASTER_CACHE_TTL_SEC:
+                    if age_sec <= SCRIP_MASTER_CACHE_TTL_SEC and self.contracts:
                         self.logger.info(
                             f"✅ ScripMaster cache loaded: {len(self.token_map)} tokens "
                             f"(age {int(age_sec)}s)"
@@ -272,7 +278,10 @@ class BrokerInterface:
             response.raise_for_status()
             data = response.json()
 
-            # Cache only NIFTY NFO symbols (saves memory)
+            # Cache only NIFTY NFO symbols (saves memory), keeping the contract fields
+            # the exchange states rather than only symbol -> token. expiry, lotsize,
+            # tick_size, strike and freeze_qty had each been replaced by a constant
+            # somewhere in the codebase; utils/instruments.py reads them from here.
             count = 0
             for item in data:
                 if item.get('exch_seg') == 'NFO' and item.get('name') == 'NIFTY':
@@ -280,15 +289,26 @@ class BrokerInterface:
                     tok = item.get('token', '')
                     if sym and tok:
                         self.token_map[sym] = tok
+                        self.contracts[sym] = {
+                            'token': tok,
+                            'expiry': item.get('expiry', ''),
+                            'strike': item.get('strike', ''),
+                            'lotsize': item.get('lotsize', ''),
+                            'tick_size': item.get('tick_size', ''),
+                            'freeze_qty': item.get('freeze_qty', ''),
+                            'instrumenttype': item.get('instrumenttype', ''),
+                        }
                         count += 1
 
-            self.logger.info(f"✅ ScripMaster cached: {count} NIFTY NFO tokens")
+            self.logger.info(f"✅ ScripMaster cached: {count} NIFTY NFO contracts")
 
             # Persist to local cache for next startup.
             try:
                 SCRIP_MASTER_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
                 with SCRIP_MASTER_CACHE_FILE.open("w", encoding="utf-8") as f:
-                    json.dump({"saved_at": datetime.now().isoformat(), "token_map": self.token_map}, f)
+                    json.dump({"saved_at": datetime.now().isoformat(),
+                               "token_map": self.token_map,
+                               "contracts": self.contracts}, f)
             except Exception as cache_err:
                 self.logger.warning(f"⚠ Could not save ScripMaster cache: {cache_err}")
 
@@ -1657,6 +1677,17 @@ class BrokerInterface:
 
         self.logger.info(f"📋 Placing {side} order: {qty} {direction} contracts")
 
+        # The exchange refuses a single order above the contract's freeze quantity. Say so
+        # here rather than letting the rejection come back from the broker unexplained;
+        # splitting the order is a separate piece of work and is not attempted.
+        from utils.instruments import freeze_quantity
+
+        freeze = freeze_quantity()
+        if freeze and qty > freeze:
+            self.logger.warning(
+                f"⚠ Order quantity {qty} exceeds the exchange freeze quantity {freeze}; "
+                f"the exchange will refuse it. Reduce the size or split the order.")
+
         # Build option symbol for this direction
         option_symbol = self._build_option_symbol(self.current_strike, direction)
         self.logger.info(f"   Strike: {self.current_strike} | Symbol: {option_symbol}")
@@ -1790,8 +1821,11 @@ class BrokerInterface:
                     # For SELL: start at bid + offset, chase down on retries
                     limit_price = bid + LIMIT_ORDER_OFFSET
                 
-                limit_price = round(limit_price, 2)
-                
+                # Snap onto the exchange's tick grid. round(x, 2) put prices between
+                # ticks - NIFTY options move in 0.05 - and the exchange refuses those.
+                # BUY rounds down and SELL rounds up, so rounding never worsens the price.
+                limit_price = round_to_tick(limit_price, side)
+
                 # Retry loop with price chasing
                 order_resp = None
                 for attempt in range(ORDER_MAX_RETRIES if ORDER_RETRY_ENABLED else 1):
@@ -1834,7 +1868,7 @@ class BrokerInterface:
                                         limit_price += ORDER_PRICE_CHASE_STEP
                                     else:
                                         limit_price -= ORDER_PRICE_CHASE_STEP
-                                    limit_price = round(limit_price, 2)
+                                    limit_price = round_to_tick(limit_price, side)
                                     
                                     time.sleep(ORDER_RETRY_DELAY_MS / 1000)
                                     continue
@@ -2200,7 +2234,7 @@ class BrokerInterface:
         # Method 3: the instrument-master cache on disk, even if token_map never loaded.
         # What stood here was "next Thursday", and NIFTY weeklies expire on Tuesday, so
         # the fallback built symbols for contracts that do not exist.
-        from utils.expiry import describe, nearest_expiry
+        from utils.instruments import describe, nearest_expiry
 
         upcoming = nearest_expiry()
         if upcoming:

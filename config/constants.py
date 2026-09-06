@@ -460,7 +460,7 @@ DATABASE_LOG_TICKS = env_bool('DATABASE_LOG_TICKS', False)
 # =========================================================
 # Angel One publishes every tradable contract, each with its own expiry. That file is
 # the only authority on when NIFTY weeklies actually expire - the code used to assume
-# Thursday, which the dump disproves. broker.py refreshes the cache; utils/expiry.py
+# Thursday, which the dump disproves. broker.py refreshes the cache; utils/instruments.py
 # reads it. Both import these, so the location is stated once.
 
 SCRIP_MASTER_URL = env_str(
