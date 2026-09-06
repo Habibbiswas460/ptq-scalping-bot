@@ -154,13 +154,22 @@ LINK_JS = """
 """
 
 
+class Raw(str):
+    """Markup that is already rendered and escaped. esc() passes it through, so a
+    chip built here survives being handed to table() or kv() as a cell value -
+    without this those helpers escape it again and the reader sees the tag text
+    instead of the provenance chip."""
+
+
 def esc(s) -> str:
+    if isinstance(s, Raw):
+        return str(s)
     return html.escape(str(s), quote=True)
 
 
-def chip(field: str) -> str:
+def chip(field: str) -> Raw:
     label, state = prov.chip(field)
-    return f'<span class="chip c-{state}">{esc(label)}</span>'
+    return Raw(f'<span class="chip c-{state}">{esc(label)}</span>')
 
 
 def finding(finding_: str, evidence: str, confidence: str, action: str, next_: str) -> Dict:

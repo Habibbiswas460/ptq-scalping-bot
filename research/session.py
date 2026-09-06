@@ -86,15 +86,29 @@ def sec_quality(book: Book, day: str) -> tuple:
                 "bid/ask is the <code>ltp ± 0.3%/2</code> fallback, so no spread, slippage or "
                 "net-of-cost figure below is a measurement. Movement, transmission and capture "
                 "rest on LTP and are unaffected.</p></div>") + body
-    finds = [finding(
-        f"Quote data on {day} is fabricated; OI is {q.get('oi_populated_pct', 0)}% populated; "
-        f"{q.get('collision_pct', 0)}% of ticks share a second with another.",
-        "Midpoint-exactness, OI fill rate and timestamp uniqueness counted directly over the "
-        "session's tick rows.",
-        "High — these are counts over the schema, not inferences.",
-        "Read every rupee figure in this report as gross of an unknown execution cost. "
-        "Point-based results stand.",
-        "Collector solo run for real quotes; the OI repair lands from the next live session.")]
+    if not q.get("n"):
+        # No tick row exists for this day, so midpoint-exactness, OI fill and timestamp
+        # uniqueness have nothing to count. Reporting them as "0%" would state a
+        # measurement the session cannot support - say the data is absent instead.
+        finds = [finding(
+            f"No option or spot tick row exists for {day}, so quote quality, OI fill and "
+            f"timestamp uniqueness are not measurable on this session.",
+            f"The tick table holds no row for this date ({q.get('verdict', 'no tick data')}); "
+            "anything else in this report comes from dvf_signals and trades alone.",
+            "High — the absence is itself a count; nothing about quote quality is claimed.",
+            "Read no execution, spread or cost figure from this session, and no data-quality "
+            "trend that includes it.",
+            "Only a session recorded by the tick collector can answer these.")]
+    else:
+        finds = [finding(
+            f"Quote data on {day} is fabricated; OI is {q['oi_populated_pct']}% populated; "
+            f"{q['collision_pct']}% of ticks share a second with another.",
+            "Midpoint-exactness, OI fill rate and timestamp uniqueness counted directly over the "
+            "session's tick rows.",
+            "High — these are counts over the schema, not inferences.",
+            "Read every rupee figure in this report as gross of an unknown execution cost. "
+            "Point-based results stand.",
+            "Collector solo run for real quotes; the OI repair lands from the next live session.")]
     return body, finds
 
 
