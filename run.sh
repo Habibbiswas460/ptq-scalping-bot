@@ -1304,6 +1304,28 @@ browse_data_files() {
 # ═══════════════════════════════════════════════════════════════════════════════
 # ███  LEVEL 2: TEST SUITE  ███
 # ═══════════════════════════════════════════════════════════════════════════════
+# One row of the 58-wide test-suite box. The padding is computed from the text, because
+# the longest test filename is 44 characters and the fixed-width row this replaced had no
+# right border at all - every one of the 47 file rows ran past the edge of the box.
+tests_row() {
+    local tag="$1" label="$2" note="${3:-}" colour="${4:-$BGREEN}"
+    local used=$((3 + ${#tag} + 1 + ${#label}))
+    local gap tail
+    if [ -n "$note" ]; then
+        # Notes sit at column 30, the description column the other level-2 menus use.
+        gap=$((30 - used))
+        [ "$gap" -lt 1 ] && gap=1
+        tail=$((58 - used - gap - ${#note}))
+        [ "$tail" -lt 0 ] && tail=0
+    else
+        gap=$((58 - used))
+        [ "$gap" -lt 0 ] && gap=0
+        tail=0
+    fi
+    printf "    ${BCYAN}║${NC}   ${colour}%s${NC} %s%*s${DIM}%s${NC}%*s${BCYAN}║${NC}\n" \
+           "$tag" "$label" "$gap" "" "$note" "$tail" ""
+}
+
 menu_tests() {
     clear
     echo ""
@@ -1317,30 +1339,36 @@ menu_tests() {
         [ -n "$f" ] && test_files+=("$f")
     done < <(discover_test_files)
 
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[1]${NC} Run ALL Tests        ${DIM}Full pytest suite${NC}       ${BCYAN}║${NC}\n"
-    local idx=2
+    tests_row "[ 1]" "Run ALL Tests" "Full pytest suite"
+    tests_row "[ 2]" "Check Syntax" "Every project .py file"
+    printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
+
+    # Files start at 3, so [0] can mean Back here as it does in every other menu. It used
+    # to mean "check syntax", with Back hidden on [99] and named in no prompt.
+    local idx=3 f base
     for f in "${test_files[@]}"; do
-        local base
         base=$(basename "$f")
-        printf "    ${BCYAN}║${NC}   ${BGREEN}[%2d]${NC} %-22s ${DIM}%s${NC}\n" "$idx" "$base" "$f"
+        tests_row "[$(printf '%2d' "$idx")]" "$base"
         idx=$((idx + 1))
     done
-    printf "    ${BCYAN}║${NC}   ${BGREEN}[0]${NC} ← Check syntax file                                            ${BCYAN}║${NC}\n"
-    printf "    ${BCYAN}║${NC}   ${DIM}[99]${NC} ← Back Main Menu                                 ${BCYAN}║${NC}\n"
+
+    local last=$(( ${#test_files[@]} + 2 ))
+    printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
+    tests_row "[ 0]" "← Back" "" "$DIM"
     printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
     echo ""
-    printf "    ${BWHITE}Select [0-%d]: ${NC}" "$(( ${#test_files[@]} + 1 ))"
+    printf "    ${BWHITE}Select [0-%d]: ${NC}" "$last"
     read -r tchoice
 
     echo ""
     case $tchoice in
         1) printf "    ${BCYAN}🧪 Running full test suite...${NC}\n\n"; "$PYTHON_BIN" -m pytest tests -v ;;
-        0) run_syntax_check ;;
-        99) show_main_menu; return ;;
+        2) run_syntax_check ;;
+        0) show_main_menu; return ;;
         *)
-            if [[ "$tchoice" =~ ^[0-9]+$ ]] && [ "$tchoice" -ge 2 ] && [ "$tchoice" -le $(( ${#test_files[@]} + 1 )) ]; then
-                local selected="${test_files[$((tchoice-2))]}"
+            if [[ "$tchoice" =~ ^[0-9]+$ ]] && [ "$tchoice" -ge 3 ] && [ "$tchoice" -le "$last" ]; then
+                local selected="${test_files[$((tchoice-3))]}"
                 printf "    ${BCYAN}🧪 Running %s...${NC}\n\n" "$selected"
                 "$PYTHON_BIN" -m pytest "$selected" -v
             else
