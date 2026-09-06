@@ -83,13 +83,15 @@ class Book:
             "SELECT timestamp, spot_price FROM ticks WHERE date(timestamp)=? AND spot_price>0 "
             "ORDER BY timestamp, id", (day,)).fetchall()
         if rows:
-            seen, ser = set(), []
-            for ts, p in rows:
-                d = parse_ts(ts)
-                if d not in seen:
-                    seen.add(d)
-                    ser.append((d, float(p)))
-            res = (ser, "tick")
+            # Every tick, including several inside the same second. Timestamps are stored
+            # to the second, so ~20% collide (5,146 of 25,055 on 2026-09-04) and 89% of
+            # those pairs carry a genuinely different price. This used to keep the first of
+            # each group and drop the rest, which is not a sampling choice - it loses real
+            # prices, including extremes. Measured on 2026-09-04: the true range over all
+            # ticks is 107.80; keeping the first gave 107.70 and keeping the last 107.35.
+            # Consumers bucket, iterate or thin this series; none of them requires the
+            # timestamps to be unique.
+            res = ([(parse_ts(ts), float(p)) for ts, p in rows], "tick")
         else:
             seen, ser = set(), []
             for ts, blob in self.cur.execute(
