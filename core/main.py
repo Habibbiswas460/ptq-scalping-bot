@@ -285,9 +285,11 @@ def main():
     # Check if we need to wait for next trading day
     if current > market_close_time:
         # Market closed - wait for next day
-        next_day = current + timedelta(days=1)
-        while next_day.weekday() >= 5:  # Skip weekends
-            next_day += timedelta(days=1)
+        # Skips holidays as well as weekends.
+        from utils.trading_calendar import next_trading_day
+
+        nxt = next_trading_day(current.date())
+        next_day = datetime.combine(nxt, current.time())
         pre_market_time = (next_day.replace(hour=open_h, minute=open_m,
                                             second=0, microsecond=0)
                            - timedelta(minutes=5))

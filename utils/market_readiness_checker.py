@@ -211,7 +211,9 @@ def _source_mix_stats(sampled_ticks: List[Dict[str, Any]]) -> Dict[str, int]:
 def _is_market_open_now() -> bool:
     now = datetime.now()
     # Monday=0 ... Sunday=6
-    if now.weekday() >= 5:
+    from utils.trading_calendar import is_trading_day
+
+    if not is_trading_day(now.date()):
         return False
     from config.constants import market_hours
 

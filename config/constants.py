@@ -494,6 +494,13 @@ SCRIP_MASTER_CACHE_FILE = env_str(
     'SCRIP_MASTER_CACHE_FILE', 'core/data/scripmaster_nifty_nfo.json')
 SCRIP_MASTER_CACHE_TTL_SEC = env_int('SCRIP_MASTER_CACHE_TTL_SEC', 6 * 60 * 60)
 
+# Exchange holidays. No broker endpoint publishes these - not the Angel One client, not
+# the SmartAPI SDK, not the instrument master - so the calendar is a data file this repo
+# reads rather than something it can derive in full. utils/trading_calendar.py loads it,
+# infers what it can from expiry shifts, and treats every date it has no evidence about
+# as unknown rather than as a trading day it is sure of.
+NSE_HOLIDAY_FILE = env_str('NSE_HOLIDAY_FILE', 'config/nse_holidays.json')
+
 # =========================================================
 # 📝 LOGGING
 # =========================================================
