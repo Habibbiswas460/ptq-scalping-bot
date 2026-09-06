@@ -49,7 +49,7 @@ from core.historical.collector import (  # noqa: E402
 from core.historical.storage import HistoricalStore  # noqa: E402
 
 SCRIPMASTER_CACHE = Path("core/data/scripmaster_nifty_nfo.json")
-NIFTY_SPOT_TOKEN = "99926000"  # NSE index token for NIFTY 50
+from config.constants import NIFTY_SPOT_TOKEN  # NSE index token for "Nifty 50"
 EXPIRY_RE = re.compile(r"^NIFTY(\d{2}[A-Z]{3}\d{2})(\d+)(CE|PE)$")
 
 

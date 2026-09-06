@@ -165,8 +165,11 @@ def is_data_valid(tick: Dict) -> Tuple[bool, str]:
     # If volume is -1 (not provided) or min_volume is 0, skip this check
     if tick_volume == 0 and min_volume > 0 and not is_rest_source:
         # Check if we're in first 30 min - volume often 0 at market open
+        from config.constants import market_hours
+
+        (open_h, open_m), _ = market_hours()
         current_time = datetime.now()
-        market_start = current_time.replace(hour=9, minute=15, second=0)
+        market_start = current_time.replace(hour=open_h, minute=open_m, second=0)
         time_since_open = (current_time - market_start).total_seconds()
         
         if time_since_open > 1800:  # After first 30 minutes

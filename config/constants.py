@@ -52,6 +52,10 @@ NUM_LOTS = env_int('NUM_LOTS', 4)
 INDIA_VIX_SYMBOL = 'INDIAVIX'
 INDIA_VIX_EXCHANGE = 'NSE'
 INDIA_VIX_TOKEN = '99926017'
+# NSE index token for "Nifty 50", verified against the published instrument master. It was
+# a bare literal at seven call sites; INDIA_VIX_TOKEN above was already a named constant,
+# and there is no reason for the spot token to be spelled out each time it is needed.
+NIFTY_SPOT_TOKEN = '99926000'
 INDIA_VIX_INSTRUMENTTYPE = 'AMXIDX'
 
 # =========================================================
@@ -348,6 +352,26 @@ KILL_SWITCH_LATENCY = env_int('KILL_SWITCH_LATENCY_MS', 1500)
 
 MARKET_OPEN_TIME = env_str('MARKET_OPEN', '09:15')
 MARKET_CLOSE_TIME = env_str('MARKET_CLOSE', '15:30')
+
+
+def market_hours() -> tuple:
+    """MARKET_OPEN and MARKET_CLOSE as ((h, m), (h, m)).
+
+    These settings were documented in .env and parsed here, but the only thing that read
+    them was a print(): every place that decides whether the market is open wrote 9:15 and
+    15:30 into the code, so changing the setting changed nothing. Callers use this now, so
+    the configuration is real. A malformed value falls back to NSE's own hours rather than
+    stopping the bot.
+    """
+    def _parse(text: str, fallback: tuple) -> tuple:
+        try:
+            hh, mm = str(text).strip().split(':')
+            hh, mm = int(hh), int(mm)
+        except (AttributeError, TypeError, ValueError):
+            return fallback
+        return (hh, mm) if 0 <= hh <= 23 and 0 <= mm <= 59 else fallback
+
+    return _parse(MARKET_OPEN_TIME, (9, 15)), _parse(MARKET_CLOSE_TIME, (15, 30))
 TRADING_START_TIME = env_str('TRADING_START', '09:20')
 TRADING_END_TIME = env_str('TRADING_END', '15:10')
 AVOID_FIRST_15MIN = env_bool('AVOID_FIRST_15MIN', True)  # NOTE: defined but never enforced anywhere

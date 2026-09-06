@@ -38,6 +38,8 @@ from config.constants import (
     USE_LIMIT_ORDERS, LIMIT_ORDER_OFFSET, MAX_SLIPPAGE_PCT,
     ORDER_RETRY_ENABLED, ORDER_MAX_RETRIES, ORDER_RETRY_DELAY_MS, ORDER_PRICE_CHASE_STEP,
     TICK_OI_ENABLED,
+    MARKET_OPEN_TIME,
+    NIFTY_SPOT_TOKEN,
     SCRIP_MASTER_URL,
     SCRIP_MASTER_CACHE_TTL_SEC,
     SCRIP_MASTER_CACHE_FILE as _SCRIP_MASTER_CACHE_FILE,
@@ -112,7 +114,7 @@ class BrokerInterface:
         
         # Layer 4: Pre-Market Reconnect Timer (reconnect 2 min before market open)
         self._ws_premarket_reconnect_done: bool = False
-        self._market_open_time = "09:15"  # IST
+        self._market_open_time = MARKET_OPEN_TIME  # IST, from MARKET_OPEN
         self._premarket_reconnect_margin_sec: int = 120  # 2 min before market
         
         # Algo Trading: Tick Buffer for smoother data flow
@@ -345,7 +347,7 @@ class BrokerInterface:
         """Get NIFTY spot, find best strike by premium, find expiry, build symbol"""
         try:
             # Get real NIFTY spot price
-            real_spot = self.broker_client.get_ltp("NSE", "NIFTY", "99926000")
+            real_spot = self.broker_client.get_ltp("NSE", "NIFTY", NIFTY_SPOT_TOKEN)
             if real_spot and real_spot > 10000:
                 self.spot_price = real_spot
                 self._simulated_spot = real_spot
@@ -754,7 +756,7 @@ class BrokerInterface:
 
             # Subscribe spot first (LTP mode), then option (Quote mode)
             spot_tokens = [
-                ("NSE", "99926000", 1),  # NIFTY spot — LTP mode
+                ("NSE", NIFTY_SPOT_TOKEN, 1),  # NIFTY spot — LTP mode
             ]
             option_tokens = []
             if self._option_token:
@@ -1017,7 +1019,7 @@ class BrokerInterface:
                 self._ws_reconnect_attempts = 0
                 self._ws_reconnect_delay = 1.0  # Reset exponential backoff
 
-            if token == "99926000":
+            if token == NIFTY_SPOT_TOKEN:
                 # NIFTY spot update
                 ltp = tick_data.get('ltp', 0)
                 if ltp and ltp > 10000:
@@ -1209,7 +1211,7 @@ class BrokerInterface:
         # Fetch NIFTY spot every 30s via REST
         if time.time() - self._last_spot_fetch > 30:
             try:
-                real_spot = self.broker_client.get_ltp("NSE", "NIFTY", "99926000")
+                real_spot = self.broker_client.get_ltp("NSE", "NIFTY", NIFTY_SPOT_TOKEN)
                 if real_spot and real_spot > 10000:
                     self.spot_price = real_spot
                     self._last_spot_fetch = time.time()
@@ -1600,7 +1602,7 @@ class BrokerInterface:
         # Try real spot from broker (every 5 min)
         if self.broker_client and (time.time() - self._last_spot_fetch > 300):
             try:
-                real_spot = self.broker_client.get_ltp("NSE", "NIFTY", "99926000")
+                real_spot = self.broker_client.get_ltp("NSE", "NIFTY", NIFTY_SPOT_TOKEN)
                 if real_spot and real_spot > 10000:
                     self._simulated_spot = real_spot
                     self._base_price = real_spot
