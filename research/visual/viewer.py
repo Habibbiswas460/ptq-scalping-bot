@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional, Sequence
 
-from research.render import Page, esc, kv, table
+from research.render import Page, Raw, esc, kv, table
 from research.visual import charts
 from research.visual.schema import TF_LABELS
 from research.visual.store import DB_PATH, Reader, parse_ts
@@ -67,8 +67,8 @@ TABS_JS = """
 """
 
 
-def chip(label: str, state: str) -> str:
-    return f'<span class="chip c-{esc(state)}">{esc(label)}</span>'
+def chip(label: str, state: str) -> Raw:
+    return Raw(f'<span class="chip c-{esc(state)}">{esc(label)}</span>')
 
 
 def _fmt(v, nd=2, dash="—"):
@@ -83,7 +83,7 @@ def _gaps_dt(gaps: Sequence[Dict]) -> List[Dict]:
     return [dict(g, start=parse_ts(g["start_ts"]), end=parse_ts(g["end_ts"])) for g in gaps]
 
 
-def _declared(t: Dict) -> str:
+def _declared(t: Dict) -> Raw:
     """The bracket the position recorded at open — REAL, and shown with whether it governed."""
     if t.get("declared_stop_loss") is None and t.get("declared_take_profit") is None:
         return chip("not recorded for this trade", "missing")
@@ -91,19 +91,19 @@ def _declared(t: Dict) -> str:
     note = ("exit reached it" if gov else "exit did not reach it") if gov is not None else ""
     unreachable = ("" if t.get("declared_reachable_stop") in (None, 1)
                    else " · declared stop is below zero premium and was unreachable")
-    return (f"{chip('REAL', 'real')} SL {_fmt(t['declared_stop_loss'])} / "
-            f"TP {_fmt(t['declared_take_profit'])} "
-            f"<span class='mono'>({note}{unreachable})</span>")
+    return Raw(f"{chip('REAL', 'real')} SL {_fmt(t['declared_stop_loss'])} / "
+               f"TP {_fmt(t['declared_take_profit'])} "
+               f"<span class='mono'>({note}{unreachable})</span>")
 
 
-def _linked_eval(link: Optional[Dict]) -> str:
+def _linked_eval(link: Optional[Dict]) -> Raw:
     if not link or not link.get("linked"):
         return chip("no accepted evaluation matched", "missing")
     e = link["linked"]
-    return (f"{chip('RECONSTRUCTED', 'reconstructed')} {esc(e['ts'][11:])} "
-            f"(+{link['link_delta_sec']:.0f}s) · score {_fmt(e['score'], 0)} · "
-            f"confidence {_fmt(e['confidence'], 0)} "
-            f"<span class='mono'>({esc(link['link_method'])})</span>")
+    return Raw(f"{chip('RECONSTRUCTED', 'reconstructed')} {esc(e['ts'][11:])} "
+               f"(+{link['link_delta_sec']:.0f}s) · score {_fmt(e['score'], 0)} · "
+               f"confidence {_fmt(e['confidence'], 0)} "
+               f"<span class='mono'>({esc(link['link_method'])})</span>")
 
 
 def _tab_group(name: str, panes: Dict[str, str], default: str = DEFAULT_TF) -> str:
@@ -363,7 +363,7 @@ def session_page(reader: Reader, session_id: str) -> Page:
                   ("bar close position", _fmt((t["entry_context"] or {}).get("bar_close_pos"), 3)),
                   ("score / confidence", f"{t['score']} / {t['confidence']}"),
                   ("state at entry (as-of)",
-                   esc((t.get("state_at_entry") or {}).get("summary") or "not recorded")),
+                   (t.get("state_at_entry") or {}).get("summary") or "not recorded"),
                   ("linked evaluation", _linked_eval(links.get(t["trade_id"])))])
             + kv([("after entry (uncensored)", "post-entry layer — never used for entry logic"),
                   ("option MFE 180s",
@@ -372,9 +372,10 @@ def session_page(reader: Reader, session_id: str) -> Page:
                    _fmt(((t["post_entry"] or {}).get("option") or {}).get("mae_180"))),
                   ("MFE inside the trade", _fmt(t["mfe_in_trade"])),
                   ("operative stop / target",
-                   f"{chip('SL MISSING', 'missing')} {chip('TP MISSING', 'missing')}"),
+                   Raw(f"{chip('SL MISSING', 'missing')} "
+                       f"{chip('TP MISSING', 'missing')}")),
                   ("declared bracket", _declared(t)),
-                  ("exit", esc(t["exit_reason"] or "—"))])
+                  ("exit", t["exit_reason"] or "—")])
             + "</div></div>")
     page.add("Trade drill-down",
              table(["#", "entry", "exit", "dir", "symbol", "entry px", "exit px", "captured",
