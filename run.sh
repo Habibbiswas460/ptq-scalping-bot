@@ -100,12 +100,52 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPER: Read .env value safely
 # ═══════════════════════════════════════════════════════════════════════════════
+# Read one key out of a specific env file, parsed the way config/validator.py's
+# _strip_inline_comment() does so the launcher reports what the bot will actually load.
+# Without that parse a documented line like
+#     TRADING_START=09:15   # opened for the full-session experiment
+# is read as the whole string, comment included. A quoted value is taken verbatim; an
+# unquoted one ends at the first whitespace-preceded '#'. Returns 1 when the key is
+# absent or its value is empty, so callers can fall through to the next source.
+_env_from() {
+    local file="$1" key="$2" val
+    [ -f "$file" ] || return 1
+    val=$(grep "^${key}=" "$file" 2>/dev/null | head -1 | cut -d'=' -f2-)
+    [ -n "$val" ] || return 1
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    case "$val" in
+        \"*\"|\'*\')
+            val="${val:1:${#val}-2}"
+            ;;
+        *)
+            val="${val%%[[:space:]]#*}"
+            val="${val%"${val##*[![:space:]]}"}"
+            ;;
+    esac
+    [ -n "$val" ] || return 1
+    printf '%s' "$val"
+}
+
+# Effective value: .env first, then the tracked .env.example template, then the literal
+# default passed in. Consulting the template keeps this launcher from carrying its own
+# copy of every tuning number — those had drifted badly (CE_QUANTITY 195 against the real
+# 65, MAX_TRADES_PER_DAY 15 against 30, the cooldowns and both kill-switch limits), because
+# a literal here has to be remembered by hand every time the template moves.
 get_env() {
-    local key="$1"
-    local default="$2"
-    local val
-    val=$(grep "^${key}=" .env 2>/dev/null | head -1 | cut -d'=' -f2-)
-    echo "${val:-$default}"
+    local key="$1" default="$2" val
+    val=$(_env_from ".env" "$key") && { echo "$val"; return; }
+    val=$(_env_from ".env.example" "$key") && { echo "$val"; return; }
+    echo "$default"
+}
+
+# .env only, never the template. Credentials must not fall back: .env.example ships
+# placeholders, and "your_client_id" reaching the live-trading confirmation prompt or the
+# "missing credentials" gate would turn both into no-ops.
+get_env_strict() {
+    local key="$1" default="$2" val
+    val=$(_env_from ".env" "$key") && { echo "$val"; return; }
+    echo "$default"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -244,10 +284,10 @@ run_technical_startup_check() {
     printf "\n    ${BWHITE}▶ Running Technical Startup Check...${NC}\n"
 
     local api_key client_id password totp_secret
-    api_key=$(get_env "ANGEL_API_KEY" "")
-    client_id=$(get_env "ANGEL_CLIENT_ID" "")
-    password=$(get_env "ANGEL_PASSWORD" "")
-    totp_secret=$(get_env "ANGEL_TOTP_SECRET" "")
+    api_key=$(get_env_strict "ANGEL_API_KEY" "")
+    client_id=$(get_env_strict "ANGEL_CLIENT_ID" "")
+    password=$(get_env_strict "ANGEL_PASSWORD" "")
+    totp_secret=$(get_env_strict "ANGEL_TOTP_SECRET" "")
 
     if [ -z "$api_key" ] || [ -z "$client_id" ] || [ -z "$password" ] || [ -z "$totp_secret" ]; then
         printf "    ${BRED}✗ Technical FAIL — Missing credentials in .env${NC}\n"
@@ -304,6 +344,16 @@ get_time_to_market() {
 
 discover_test_files() {
     find tests -maxdepth 1 -type f -name 'test_*.py' 2>/dev/null | sort
+}
+
+# Every .py file this project owns, discovered rather than listed. The hardcoded list this
+# replaced named 24 files out of 121 and did not mention research/ at all, so "all project
+# files" was a claim the check could not back. venv/ and archive/ are not ours to validate.
+discover_source_files() {
+    find . -name '*.py' \
+        -not -path './venv/*' -not -path './archive/*' -not -path './.git/*' \
+        -not -path './audit_tmp/*' -not -path '*/__pycache__/*' \
+        2>/dev/null | sed 's|^\./||' | sort
 }
 
 run_full_project_check() {
@@ -453,7 +503,7 @@ boot_sequence() {
     echo -e "    ${G11}║${NC}                                                                   ${G11}║${NC}"
 
     # Subtitle pulse
-    pulse_text "⚡ SMART SCALP v3.5 │ CONTROL CENTER v5.1 ⚡"
+    pulse_text "⚡ SMART SCALP $ENGINE_VERSION │ CONTROL CENTER $BOT_VERSION ⚡"
     printf "              ${G11}║${NC}"
     printf "\n"
 
@@ -549,8 +599,13 @@ show_main_menu() {
     echo ""
     printf "${BCYAN}"
     echo "    ╔══════════════════════════════════════════════════════════════════╗"
-    printf "    ║     ${BWHITE}PTQ SCALPING BOT ─ CONTROL CENTER v5.1${BCYAN}                       ║\n"
-    printf "    ║     ${DIM}SMART SCALP v3.5 │ $(date '+%Y-%m-%d %H:%M') │ Menu Mode${BCYAN}         ║\n"
+    # Version comes from VERSION via $BOT_VERSION/$ENGINE_VERSION, and the right-hand
+    # padding is computed, so bumping the file cannot leave the banner claiming the old
+    # build or push the box edge out of line.
+    local title="PTQ SCALPING BOT ─ CONTROL CENTER $BOT_VERSION"
+    local sub="SMART SCALP $ENGINE_VERSION │ $(date '+%Y-%m-%d %H:%M') │ Menu Mode"
+    printf "    ║     ${BWHITE}%s${BCYAN}%*s║\n" "$title" $((61 - ${#title})) ""
+    printf "    ║     ${DIM}%s${BCYAN}%*s║\n" "$sub" $((61 - ${#sub})) ""
     echo "    ╠══════════════════════════════════════════════════════════════════╣"
     echo "    ║                                                                  ║"
     printf "    ║   ${G8}[1]${BCYAN} 🚀 Start Trading        ${DIM}Paper or Live mode${BCYAN}                ║\n"
@@ -665,7 +720,7 @@ menu_trading() {
             if [ "$confirm" = "YES" ]; then
                 printf "    ${BRED}⚠️  Second check — Enter your Angel One Client ID: ${NC}"
                 read -r confirm_id
-                ACTUAL_ID=$(get_env "ANGEL_CLIENT_ID" "")
+                ACTUAL_ID=$(get_env_strict "ANGEL_CLIENT_ID" "")
                 if [ -n "$ACTUAL_ID" ] && [ "$confirm_id" = "$ACTUAL_ID" ]; then
                     printf "    ${BRED}💰 LIVE TRADING ACTIVATED${NC}\n"
                     export STARTUP_READINESS_PROFILE=strict
@@ -1298,33 +1353,40 @@ menu_tests() {
 }
 
 run_syntax_check() {
-    printf "    ${BYELLOW}Checking syntax of all project files...${NC}\n\n"
-    local errors=0
-    local total=0
-    for f in app.py \
-             core/main.py core/engines/entry_engine.py core/engines/exit_engine.py \
-             core/engines/state_machine.py core/trading/broker.py core/trading/trade_manager.py \
-             core/risk/kill_switch.py core/risk/risk_manager.py core/risk/greeks_calc.py \
-             core/risk/session_trend.py core/risk/validators.py \
-             core/services/database.py core/services/mode_switch.py \
-             core/services/telegram_bot.py \
-             strategies/smart_scalp_v3.py config/constants.py config/validator.py \
-             utils/analytics.py utils/greeks.py utils/helpers.py utils/logger.py \
-             brokers/angel_one/client.py brokers/angel_one/exceptions.py; do
-        total=$((total + 1))
-        if [ -f "$f" ]; then
-            if "$PYTHON_BIN" -c "import ast; ast.parse(open('$f').read())" 2>/dev/null; then
-                printf "      ${BGREEN}✓${NC} %s\n" "$f"
-            else
-                printf "      ${BRED}✗${NC} %s ${BRED}SYNTAX ERROR${NC}\n" "$f"
-                errors=$((errors + 1))
-            fi
-        else
-            printf "      ${BYELLOW}–${NC} %s ${DIM}(not found)${NC}\n" "$f"
-        fi
-    done
+    printf "    ${BYELLOW}Checking syntax of every project .py file...${NC}\n\n"
+    local out total errors
+    # One interpreter for the whole set: at 121 files a process per file is the slow part.
+    # The list travels in the environment, not on stdin - "python -" already reads the
+    # program from stdin, so a pipe into it is swallowed by the heredoc and the check
+    # silently sees zero files.
+    out=$(PTQ_SYNTAX_PATHS="$(discover_source_files)" "$PYTHON_BIN" - <<'PYCHECK'
+import ast
+import os
+
+total = errors = 0
+for path in os.environ.get("PTQ_SYNTAX_PATHS", "").splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    total += 1
+    try:
+        ast.parse(open(path, encoding="utf-8").read(), filename=path)
+    except SyntaxError as exc:
+        errors += 1
+        print(f"FAIL\t{path}\tline {exc.lineno}: {exc.msg}")
+    except OSError as exc:
+        errors += 1
+        print(f"FAIL\t{path}\t{exc}")
+print(f"TOTAL\t{total}\t{errors}")
+PYCHECK
+)
+    while IFS=$'\t' read -r tag a b; do
+        [ "$tag" = "FAIL" ] && printf "      ${BRED}✗${NC} %s ${BRED}%s${NC}\n" "$a" "$b"
+    done <<< "$out"
+    total=$(printf '%s' "$out" | awk -F'\t' '$1=="TOTAL"{print $2}')
+    errors=$(printf '%s' "$out" | awk -F'\t' '$1=="TOTAL"{print $3}')
     echo ""
-    if [ $errors -eq 0 ]; then
+    if [ "${errors:-1}" -eq 0 ] 2>/dev/null; then
         printf "    ${BG_GREEN}${BWHITE}  ✓ All ${total} files passed syntax check  ${NC}\n"
     else
         printf "    ${BG_RED}${BWHITE}  ✗ ${errors}/${total} files have errors  ${NC}\n"
@@ -1338,7 +1400,7 @@ menu_config() {
     clear
     echo ""
     printf "    ${BCYAN}══════════════════════════════════════════════════════${NC}\n"
-    printf "    ${BWHITE}⚙️  CONFIGURATION (SMART SCALP v3.5)${NC}\n"
+    printf "    ${BWHITE}⚙️  CONFIGURATION (SMART SCALP %s)${NC}\n" "$ENGINE_VERSION"
     printf "    ${BCYAN}══════════════════════════════════════════════════════${NC}\n"
     echo ""
 
@@ -1609,20 +1671,39 @@ menu_health() {
     # Syntax
     printf "    ${BYELLOW}Syntax Check:${NC}\n"
     local sok=0 sfail=0
-    for f in app.py core/main.py core/engines/entry_engine.py core/engines/exit_engine.py \
-             core/engines/state_machine.py core/trading/broker.py core/risk/kill_switch.py \
-             strategies/smart_scalp_v3.py config/constants.py config/validator.py; do
-        if "$PYTHON_BIN" -c "import ast; ast.parse(open('$f').read())" 2>/dev/null; then
-            sok=$((sok + 1))
-        else
-            printf "      ${BRED}✗${NC} $f\n"
-            sfail=$((sfail + 1))
-        fi
-    done
-    if [ $sfail -eq 0 ]; then
-        printf "      ${BGREEN}✓ All ${sok} critical files OK${NC}\n"
+    # Discovered, not listed: the ten names this replaced were chosen before research/
+    # existed, so a diagnostic that reported "all critical files OK" had never looked at
+    # a third of the project.
+    local sres
+    sres=$(PTQ_SYNTAX_PATHS="$(discover_source_files)" "$PYTHON_BIN" - <<'PYHEALTH'
+import ast
+import os
+
+ok = bad = 0
+for path in os.environ.get("PTQ_SYNTAX_PATHS", "").splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    try:
+        ast.parse(open(path, encoding="utf-8").read(), filename=path)
+        ok += 1
+    except (SyntaxError, OSError):
+        bad += 1
+        print(path)
+print(f"__COUNT__ {ok} {bad}")
+PYHEALTH
+)
+    while IFS= read -r line; do
+        case "$line" in
+            __COUNT__*) sok=$(echo "$line" | awk '{print $2}'); sfail=$(echo "$line" | awk '{print $3}') ;;
+            "") ;;
+            *) printf "      ${BRED}✗${NC} %s\n" "$line" ;;
+        esac
+    done <<< "$sres"
+    if [ "${sfail:-1}" -eq 0 ] 2>/dev/null; then
+        printf "      ${BGREEN}✓ All ${sok} project files parse${NC}\n"
     else
-        printf "      ${BRED}✗ ${sfail} errors${NC}\n"
+        printf "      ${BRED}✗ ${sfail} of $((sok + sfail)) files failed to parse${NC}\n"
     fi
     echo ""
 
@@ -1655,10 +1736,10 @@ menu_health() {
     printf "    ${BYELLOW}API Connectivity:${NC}\n"
     printf "      Angel One API     : "
     local api_key client_id password totp_secret
-    api_key=$(get_env "ANGEL_API_KEY" "")
-    client_id=$(get_env "ANGEL_CLIENT_ID" "")
-    password=$(get_env "ANGEL_PASSWORD" "")
-    totp_secret=$(get_env "ANGEL_TOTP_SECRET" "")
+    api_key=$(get_env_strict "ANGEL_API_KEY" "")
+    client_id=$(get_env_strict "ANGEL_CLIENT_ID" "")
+    password=$(get_env_strict "ANGEL_PASSWORD" "")
+    totp_secret=$(get_env_strict "ANGEL_TOTP_SECRET" "")
 
     if [ -z "$api_key" ] || [ -z "$client_id" ] || [ -z "$password" ] || [ -z "$totp_secret" ]; then
         API_R="SKIP:Missing credentials in .env"
@@ -1762,7 +1843,11 @@ menu_tools() {
             ;;
         2)
             printf "    ${BWHITE}Disk Usage:${NC}\n\n"
-            for d in core/ strategies/ brokers/ config/ utils/ tests/ logs/ data/; do
+            # Discovered: the fixed list predated research/ and claude_code/, so the two
+            # directories carrying the newest work were the two it never sized.
+            for d in $(find . -maxdepth 1 -type d -not -name '.*' \
+                            -not -name 'venv' -not -name '__pycache__' \
+                            -printf '%f/\n' 2>/dev/null | sort); do
                 if [ -d "$d" ]; then
                     local sz
                     sz=$(du -sh "$d" 2>/dev/null | awk '{print $1}')
@@ -1798,7 +1883,9 @@ menu_tools() {
             ;;
         6)
             printf "    ${BWHITE}Documentation Files:${NC}\n\n"
-            for doc in README.md DOCUMENTATION.md PROJECT_STRUCTURE.md FILE_STRUCTURE_GUIDE.md; do
+            # Discovered: the fixed list still named FILE_STRUCTURE_GUIDE.md, deleted long
+            # ago, and silently skipped it - while never offering the reports added since.
+            for doc in $(find . -maxdepth 1 -type f -name '*.md' -printf '%f\n' 2>/dev/null | sort); do
                 if [ -f "$doc" ]; then
                     local doc_lines
                     doc_lines=$(wc -l < "$doc")
@@ -1846,12 +1933,22 @@ menu_version() {
     printf "    ${BCYAN}Mode:${NC}         ${BWHITE}%s${NC}\n" "PAPER_TRADING=$(get_env "PAPER_TRADING" "true") | USE_LIVE_DATA=$(get_env "USE_LIVE_DATA" "true")"
     echo ""
 
+    # Read from git rather than restated here: the five bullets this replaced were written
+    # for the readiness checker and never mentioned anything merged after it, so the panel
+    # described a build that had moved on months earlier.
     printf "    ${BYELLOW}Recent Updates:${NC}\n"
-    printf "      ${BGREEN}•${NC} Market Readiness checker added with quick/standard/strict profiles\n"
-    printf "      ${BGREEN}•${NC} run.sh now gates paper/live launch on readiness verdict\n"
-    printf "      ${BGREEN}•${NC} JSON + markdown readiness reports are generated automatically\n"
-    printf "      ${BGREEN}•${NC} Pre-open strategy checks now include data source quality and circuit breaker\n"
-    printf "      ${BGREEN}•${NC} UI version labels updated to v5.1 / v3.5 / v2.0.0\n"
+    if git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        git -C "$SCRIPT_DIR" log --format='%s' -6 2>/dev/null | while IFS= read -r line; do
+            printf "      ${BGREEN}•${NC} %s\n" "$line"
+        done
+        printf "      ${DIM}on %s${NC}\n" "$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    elif [ -f "$SCRIPT_DIR/CHANGELOG.md" ]; then
+        grep -m 5 '^[-*] ' "$SCRIPT_DIR/CHANGELOG.md" | while IFS= read -r line; do
+            printf "      ${BGREEN}•${NC} %s\n" "${line#* }"
+        done
+    else
+        printf "      ${DIM}No git history and no CHANGELOG.md to read.${NC}\n"
+    fi
     echo ""
 
     printf "    ${BYELLOW}Quick Commands:${NC}\n"
