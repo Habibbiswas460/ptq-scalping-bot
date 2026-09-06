@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 import time
 
-from config.constants import CONFIG
+from config.constants import CONFIG, market_hours
 
 # Fallback calculator
 from utils.greeks import GreeksCalculator
@@ -45,7 +45,8 @@ def _resolve_expiry_time() -> datetime:
         _expiry_warned = True
         print(f"[greeks] no expiry from the instrument master ({describe()}); "
               f"treating the current session as expiry day")
-    return datetime.now().replace(hour=15, minute=30, second=0, microsecond=0)
+    (_, (close_h, close_m)) = market_hours()
+    return datetime.now().replace(hour=close_h, minute=close_m, second=0, microsecond=0)
 
 
 class GreeksFetcher:

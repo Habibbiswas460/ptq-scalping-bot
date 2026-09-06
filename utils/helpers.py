@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
 
 from config.constants import (
+    market_hours,
     TEST_MODE,
     LOT_SIZE,
     INDIA_VIX_EXCHANGE,
@@ -46,9 +47,24 @@ def market_open() -> bool:
         return True  # Always open in test mode
     
     current = datetime.now()
-    # NSE: 9:15 AM - 3:30 PM
-    market_start = current.replace(hour=9, minute=15, second=0)
-    market_end = current.replace(hour=15, minute=30, second=0)
+
+    # The exchange is shut at the weekend. This checked the clock and nothing else, so it
+    # answered True at 11:00 on a Saturday or Sunday - and core/main.py gates both the
+    # "wait for open" branch and the main trading loop on it, so starting the bot midday
+    # at a weekend sent it straight into the loop. market_readiness_checker already
+    # refused weekends, so the two disagreed about the same question.
+    #
+    # Exchange holidays still read as open: that needs a calendar this repository does not
+    # have, and guessing one would be worse than the gap. See core/historical/gate.py,
+    # which documents the same limitation.
+    if current.weekday() >= 5:
+        return False
+
+    # MARKET_OPEN / MARKET_CLOSE, which default to NSE's 09:15-15:30. These were written
+    # into the code here, so the documented settings had no effect on anything.
+    (oh, om), (ch, cm) = market_hours()
+    market_start = current.replace(hour=oh, minute=om, second=0)
+    market_end = current.replace(hour=ch, minute=cm, second=0)
     return market_start <= current <= market_end
 
 
@@ -62,20 +78,22 @@ def wait_for_market_open():
         print(f"\033[2m{ts}\033[0m  {msg}")
     
     current = datetime.now()
-    market_start = current.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_end = current.replace(hour=15, minute=30, second=0, microsecond=0)
+    (oh, om), (ch, cm) = market_hours()
+    market_start = current.replace(hour=oh, minute=om, second=0, microsecond=0)
+    market_end = current.replace(hour=ch, minute=cm, second=0, microsecond=0)
     
     # If already past market close, wait for NEXT DAY's market open
     if current > market_end:
         next_day = current + timedelta(days=1)
         while next_day.weekday() >= 5:
             next_day += timedelta(days=1)
-        market_start = next_day.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_start = next_day.replace(hour=oh, minute=om, second=0, microsecond=0)
         
         wait_seconds = (market_start - current).total_seconds()
         hours = int(wait_seconds // 3600)
         minutes = int((wait_seconds % 3600) // 60)
-        _log(f"Market closed. Next open: {market_start.strftime('%Y-%m-%d')} 09:15 ({hours}h {minutes}m)")
+        _log(f"Market closed. Next open: {market_start.strftime('%Y-%m-%d %H:%M')} "
+             f"({hours}h {minutes}m)")
     
     elif current < market_start:
         wait_seconds = (market_start - current).total_seconds()

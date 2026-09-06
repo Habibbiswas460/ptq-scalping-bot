@@ -213,8 +213,12 @@ def _is_market_open_now() -> bool:
     # Monday=0 ... Sunday=6
     if now.weekday() >= 5:
         return False
+    from config.constants import market_hours
+
+    (open_h, open_m), (close_h, close_m) = market_hours()
     current_mins = now.hour * 60 + now.minute
-    return 555 <= current_mins < 930  # 09:15 to 15:30
+    # 555/930 were 09:15 and 15:30 spelled as minutes; MARKET_OPEN/MARKET_CLOSE decide now.
+    return (open_h * 60 + open_m) <= current_mins < (close_h * 60 + close_m)
 
 
 def run_readiness_check(
@@ -277,7 +281,9 @@ def run_readiness_check(
         rest_detail = "REST check skipped"
         if has_real_client:
             try:
-                ltp = broker.broker_client.get_ltp("NSE", "NIFTY", "99926000")
+                from config.constants import NIFTY_SPOT_TOKEN
+
+                ltp = broker.broker_client.get_ltp("NSE", "NIFTY", NIFTY_SPOT_TOKEN)
                 rest_ok = bool(ltp and ltp > 0)
                 rest_detail = f"NIFTY LTP={ltp}" if ltp else "NIFTY LTP unavailable"
             except Exception as e:

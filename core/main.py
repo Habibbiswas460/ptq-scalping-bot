@@ -272,9 +272,15 @@ def main():
     # This ensures fresh ScripMaster + WebSocket connection
     # ════════════════════════════════════════════════════════════════════════
     from datetime import timedelta
+    from config.constants import market_hours
+    (open_h, open_m), (close_h, close_m) = market_hours()
+    # Startup begins five minutes before the open, as it always has -- but the open now
+    # comes from MARKET_OPEN instead of being written in twice as 09:10.
+    pre_market = (datetime.now().replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+                  - timedelta(minutes=5))
     current = datetime.now()
-    pre_market_time = current.replace(hour=9, minute=10, second=0, microsecond=0)
-    market_close_time = current.replace(hour=15, minute=30, second=0, microsecond=0)
+    pre_market_time = pre_market
+    market_close_time = current.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
     
     # Check if we need to wait for next trading day
     if current > market_close_time:
@@ -282,7 +288,9 @@ def main():
         next_day = current + timedelta(days=1)
         while next_day.weekday() >= 5:  # Skip weekends
             next_day += timedelta(days=1)
-        pre_market_time = next_day.replace(hour=9, minute=10, second=0, microsecond=0)
+        pre_market_time = (next_day.replace(hour=open_h, minute=open_m,
+                                            second=0, microsecond=0)
+                           - timedelta(minutes=5))
 
     # Unit tests and CI runs should exercise startup logic immediately without sleeping until market open.
     is_pytest_run = bool(os.getenv("PYTEST_CURRENT_TEST"))
@@ -393,9 +401,11 @@ def main():
     # ════════════════════════════════════════════════════════════════════════
     logger.info("Initializing historical indicator warm-up from SmartAPI...")
     try:
-        # NIFTY spot token is 99926000
         # Use days_back=5 to safely cross weekends (Saturday/Sunday) and holiday gaps
-        historical = broker.get_historical_candles(exchange="NSE", token="99926000", interval="FIVE_MINUTE", days_back=5)
+        from config.constants import NIFTY_SPOT_TOKEN
+
+        historical = broker.get_historical_candles(exchange="NSE", token=NIFTY_SPOT_TOKEN,
+                                                   interval="FIVE_MINUTE", days_back=5)
         if historical:
             # Keep up to 100 historical candles (~1.5 days) to ensure strict indicator convergence for EMA 50
             runtime_state.set_historical_candles(historical[-100:])
