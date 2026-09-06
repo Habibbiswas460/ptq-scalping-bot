@@ -57,6 +57,7 @@ fi
 RUN_MODE="menu"
 NO_ANIMATION="false"
 TRADE_LOOKUP_ID=""
+READINESS_PROFILE="standard"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -65,6 +66,20 @@ while [ $# -gt 0 ]; do
             ;;
         --readiness)
             RUN_MODE="readiness"
+            ;;
+        --profile)
+            if [ $# -lt 2 ]; then
+                printf "Missing value for --profile\n"
+                exit 2
+            fi
+            case "$2" in
+                quick|standard|strict) READINESS_PROFILE="$2" ;;
+                *)
+                    printf "Unknown profile '%s' (expected quick, standard or strict)\n" "$2"
+                    exit 2
+                    ;;
+            esac
+            shift
             ;;
         --health)
             RUN_MODE="health"
@@ -186,13 +201,22 @@ press_enter() {
     read -r
 }
 
+# Sampling is the profile's business. utils/market_readiness_checker.py defaults
+# --sample-seconds/--tick-interval/--min-ticks to None so _resolve_profile() can set them
+# (quick 15s, standard 35s, strict 45s); both call sites here used to pass "35 0.5 60" —
+# the standard row copied out by hand — which would have quietly held strict to 35s and
+# made quick no quicker. Pass an override only when the caller actually gives one.
 run_market_readiness_check() {
     local profile="${1:-standard}"
-    local sample_seconds="${2:-35}"
-    local tick_interval="${3:-0.5}"
-    local min_ticks="${4:-60}"
+    local sample_seconds="${2:-}"
+    local tick_interval="${3:-}"
+    local min_ticks="${4:-}"
     local out_json="logs/readiness/latest_readiness.json"
     local out_md="logs/readiness/latest_readiness.md"
+    local -a tuning=()
+    [ -n "$sample_seconds" ] && tuning+=(--sample-seconds "$sample_seconds")
+    [ -n "$tick_interval" ] && tuning+=(--tick-interval "$tick_interval")
+    [ -n "$min_ticks" ] && tuning+=(--min-ticks "$min_ticks")
 
     mkdir -p "logs/readiness"
 
@@ -203,9 +227,7 @@ run_market_readiness_check() {
     printf "\n    ${BWHITE}▶ Running Market Readiness Check...${NC}\n\n"
     "$PYTHON_BIN" utils/market_readiness_checker.py \
         --profile "$profile" \
-        --sample-seconds "$sample_seconds" \
-        --tick-interval "$tick_interval" \
-        --min-ticks "$min_ticks" \
+        "${tuning[@]}" \
         --json-out "$out_json" \
         --md-out "$out_md"
 
@@ -538,7 +560,10 @@ boot_sequence() {
     source venv/bin/activate 2>/dev/null || true
 
     printf "      ${CYAN}├─${NC} Dependencies   : "
-    if [ -f "venv/.installed" ]; then
+    # The marker has to be newer than requirements.txt, not merely present: it was written
+    # once on 2026-06-14, requirements.txt changed on 2026-06-24, and every boot since has
+    # reported "Ready" without ever looking at the file again.
+    if [ -f "venv/.installed" ] && [ ! "requirements.txt" -nt "venv/.installed" ]; then
         printf "${BGREEN}✓ Ready${NC}\n"
     else
         printf "${BYELLOW}Installing...${NC}"
@@ -1935,7 +1960,14 @@ menu_tools() {
             printf "    ${DIM}Not available — utils/monitoring.py was removed (confirmed unused: no code path in the live bot ever wrote to it, so this always showed an empty snapshot). Use System Health from the main menu for a real diagnostic, or [8] Market Readiness Pro here.${NC}\n"
             ;;
         8)
-            run_market_readiness_check standard 35 0.5 60
+            printf "    ${BWHITE}Profile — [1] quick  [2] standard  [3] strict  (Enter = standard): ${NC}"
+            read -r rprofile
+            case "$rprofile" in
+                1|quick)  rprofile="quick" ;;
+                3|strict) rprofile="strict" ;;
+                *)        rprofile="standard" ;;
+            esac
+            run_market_readiness_check "$rprofile"
             ;;
         9)
             menu_version
@@ -1999,7 +2031,10 @@ menu_version() {
 # The commands here are the ones documented in README.md - kept identical on purpose,
 # so the menu and the docs can't drift apart.
 
-RESEARCH_DB="core/data/trades.db"
+# Asked for, not restated: research/db.py owns this path, the way run_dvf_trades_query
+# imports DB_PATH from core.services.database rather than naming the file itself.
+RESEARCH_DB="$("$PYTHON_BIN" -c 'from research.db import DB_PATH; print(DB_PATH)' 2>/dev/null \
+               || echo "core/data/trades.db")"
 RESEARCH_OUT="claude_code/research_output"
 
 # Every command below opens trades.db read-only, which raises if the file is absent.
@@ -2096,7 +2131,9 @@ menu_research() {
     printf "    ${BCYAN}║${NC}                                                          ${BCYAN}║${NC}\n"
     printf "    ${BCYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
     echo ""
-    printf "    ${DIM}Read-only over ${RESEARCH_DB} · output in ${RESEARCH_OUT}/${NC}\n"
+    # Shown repo-relative; RESEARCH_DB itself stays absolute so the guard works from anywhere.
+    local db_shown="${RESEARCH_DB#"$SCRIPT_DIR/"}"
+    printf "    ${DIM}Read-only over ${db_shown} · output in ${RESEARCH_OUT}/${NC}\n"
     echo ""
     printf "    ${BWHITE}Select [0-9]: ${NC}"
     read -r rchoice
@@ -2194,7 +2231,7 @@ if [ "$RUN_MODE" = "version" ]; then
 fi
 
 if [ "$RUN_MODE" = "readiness" ]; then
-    run_market_readiness_check standard 35 0.5 60
+    run_market_readiness_check "$READINESS_PROFILE"
     exit $?
 fi
 
