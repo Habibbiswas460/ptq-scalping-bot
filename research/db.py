@@ -15,6 +15,10 @@ DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
                        "core", "data", "trades.db")
 LOT = 65
 
+# Rows below this are noise, not a series - the same floor session.py, execution.py and
+# signals.py apply before they will read a spot series at all.
+MIN_SERIES = 10
+
 
 def parse_ts(s) -> _dt.datetime:
     if isinstance(s, _dt.datetime):
@@ -44,7 +48,20 @@ class Book:
             nt = self.cur.execute("SELECT count(*) FROM ticks WHERE date(timestamp)=?", (d,)).fetchone()[0]
             ns = self.cur.execute("SELECT count(*) FROM dvf_signals WHERE date(timestamp)=?", (d,)).fetchone()[0]
             ntr = self.cur.execute("SELECT count(*) FROM trades WHERE date(entry_time)=?", (d,)).fetchone()[0]
-            kind = "tick" if nt else ("coarse" if ns else "trades-only")
+
+            # A handful of rows is not a series. This used to read `"tick" if nt`, so a
+            # single stray tick made a day the newest "tick session" in the book - which is
+            # exactly what happened on 2026-09-06, when an accidental 38-second paper run
+            # wrote one row and every consumer that asks for "the latest tick session"
+            # picked a day with no evaluations and no trades. MIN_SERIES is the threshold
+            # research/session.py, execution.py and signals.py already use for the same
+            # question ("is there a usable series here").
+            kind = ("tick" if nt >= MIN_SERIES
+                    else "coarse" if ns >= MIN_SERIES
+                    else "trades-only")
+            if kind == "trades-only" and not ntr:
+                # Nothing usable and nothing traded: not a session, however it got here.
+                continue
             out.append({"day": d, "kind": kind, "n_ticks": nt, "n_signals": ns, "n_trades": ntr})
         return out
 
