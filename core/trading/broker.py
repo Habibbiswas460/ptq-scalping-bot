@@ -37,12 +37,15 @@ from config.constants import (
     USE_LIMIT_ORDERS, LIMIT_ORDER_OFFSET, MAX_SLIPPAGE_PCT,
     ORDER_RETRY_ENABLED, ORDER_MAX_RETRIES, ORDER_RETRY_DELAY_MS, ORDER_PRICE_CHASE_STEP,
     TICK_OI_ENABLED,
+    SCRIP_MASTER_URL,
+    SCRIP_MASTER_CACHE_TTL_SEC,
+    SCRIP_MASTER_CACHE_FILE as _SCRIP_MASTER_CACHE_FILE,
 )
 
-# ScripMaster download URL (Angel One official)
-SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-SCRIP_MASTER_CACHE_FILE = Path("core/data/scripmaster_nifty_nfo.json")
-SCRIP_MASTER_CACHE_TTL_SEC = 6 * 60 * 60
+# ScripMaster location comes from config.constants, because utils/expiry.py reads the
+# same cache to answer "when is expiry" - the file is the broker's own contract list and
+# the only authority on that, so where it lives is stated once.
+SCRIP_MASTER_CACHE_FILE = Path(_SCRIP_MASTER_CACHE_FILE)
 
 
 class BrokerInterface:
@@ -2194,18 +2197,32 @@ class BrokerInterface:
                     self.logger.warning(f"Expiry search error: {e}")
                     time.sleep(1)
 
-        # Fallback: next Thursday
-        today = datetime.now()
-        days_ahead = 3 - today.weekday()
-        if days_ahead <= 0:
-            days_ahead += 7
-        expiry_date = today + timedelta(days=days_ahead)
-        return expiry_date.strftime("%d%b%y").upper()
+        # Method 3: the instrument-master cache on disk, even if token_map never loaded.
+        # What stood here was "next Thursday", and NIFTY weeklies expire on Tuesday, so
+        # the fallback built symbols for contracts that do not exist.
+        from utils.expiry import describe, nearest_expiry
+
+        upcoming = nearest_expiry()
+        if upcoming:
+            self.logger.info(f"✓ Expiry from instrument master cache: {upcoming.isoformat()}")
+            return upcoming.strftime("%d%b%y").upper()
+
+        # Nothing left to read. Reaching here means neither the ScripMaster nor the search
+        # API answered, so no symbol could be resolved to a token either - the session is
+        # not tradable. Say so instead of returning a date nothing expires on.
+        self.logger.error(f"✗ Cannot determine expiry: {describe()}")
+        return ""
 
     def _build_option_symbol(self, strike: int, option_type: str = "CE") -> str:
-        """Build NIFTY option symbol: NIFTY{DDMMMYY}{STRIKE}{CE/PE}"""
+        """Build NIFTY option symbol: NIFTY{DDMMMYY}{STRIKE}{CE/PE}
+
+        Returns "" when the expiry is unknown, so the caller's token lookup fails on a
+        symbol that was never built rather than on one assembled around a guessed date.
+        """
         if not self._current_expiry:
             self._current_expiry = self._find_nearest_expiry()
+        if not self._current_expiry:
+            return ""
         return f"NIFTY{self._current_expiry}{strike}{option_type}"
 
     # =========================================================================

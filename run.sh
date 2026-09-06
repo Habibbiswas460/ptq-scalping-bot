@@ -371,6 +371,26 @@ discover_test_files() {
 # Every .py file this project owns, discovered rather than listed. The hardcoded list this
 # replaced named 24 files out of 121 and did not mention research/ at all, so "all project
 # files" was a claim the check could not back. venv/ and archive/ are not ours to validate.
+# The day type a session's own date implies, asked of the broker's contract list rather
+# than typed in from memory. Echoes NORMAL or EXPIRY; returns 1 when the path carries no
+# date or the instrument master cannot answer, so the caller keeps its own default.
+detect_day_type_for() {
+    local path="$1" day
+    day=$(printf '%s' "$path" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)
+    [ -n "$day" ] || return 1
+    "$PYTHON_BIN" - "$day" <<'PYDAY' 2>/dev/null
+import sys
+from datetime import date
+
+from utils.expiry import expiry_dates, is_expiry_date
+
+if not expiry_dates():
+    raise SystemExit(1)
+y, m, d = (int(part) for part in sys.argv[1].split("-"))
+print("EXPIRY" if is_expiry_date(date(y, m, d)) else "NORMAL")
+PYDAY
+}
+
 discover_source_files() {
     find . -name '*.py' \
         -not -path './venv/*' -not -path './archive/*' -not -path './.git/*' \
@@ -1220,9 +1240,16 @@ run_custom_backtest() {
     # simulation anymore, see findings.md/fixed.md §14.1)
     printf "    ${BYELLOW}Step 3: Day Type${NC}\n"
     printf "    ${DIM}Passed to the exit engine (NORMAL or EXPIRY)${NC}\n"
-    printf "    ${BWHITE}Day type [NORMAL]: ${NC}"
+    local def_day_type
+    if def_day_type=$(detect_day_type_for "$bt_data"); then
+        printf "    ${DIM}Detected from the instrument master for this session's date${NC}\n"
+    else
+        def_day_type="NORMAL"
+        printf "    ${DIM}No date in the filename, or no instrument master to check it against${NC}\n"
+    fi
+    printf "    ${BWHITE}Day type [%s]: ${NC}" "$def_day_type"
     read -r bt_day_type
-    bt_day_type="${bt_day_type:-NORMAL}"
+    bt_day_type="${bt_day_type:-$def_day_type}"
     printf "    ${BGREEN}✓${NC} ${bt_day_type}\n\n"
 
     # Step 4: Output directory

@@ -27,8 +27,17 @@ def now() -> datetime:
 
 
 def is_expiry_date() -> bool:
-    """Check if today is expiry date (weekly: Thursday)"""
-    return datetime.now().weekday() == 3  # 3 = Thursday
+    """Is today an expiry, according to the broker's instrument master?
+
+    This used to return `weekday() == 3`. Every NIFTY weekly Angel One lists is a
+    Tuesday, so the hardcoded Thursday was true only on days that are never expiry and
+    false on every day that is. The answer now comes from the contracts themselves; see
+    utils/expiry.py. False when that data is unavailable - an unknown expiry must not be
+    reported as one, and detect_day_type() still has theta, gamma and time-to-expiry to
+    fall back on.
+    """
+    from utils.expiry import is_expiry_date as _from_master
+    return _from_master()
 
 
 def market_open() -> bool:

@@ -456,6 +456,21 @@ DATABASE_LOG_SIGNALS = env_bool('DATABASE_LOG_SIGNALS', True)
 DATABASE_LOG_TICKS = env_bool('DATABASE_LOG_TICKS', False)
 
 # =========================================================
+#  INSTRUMENT MASTER (expiry is read from here, never assumed)
+# =========================================================
+# Angel One publishes every tradable contract, each with its own expiry. That file is
+# the only authority on when NIFTY weeklies actually expire - the code used to assume
+# Thursday, which the dump disproves. broker.py refreshes the cache; utils/expiry.py
+# reads it. Both import these, so the location is stated once.
+
+SCRIP_MASTER_URL = env_str(
+    'SCRIP_MASTER_URL',
+    'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json')
+SCRIP_MASTER_CACHE_FILE = env_str(
+    'SCRIP_MASTER_CACHE_FILE', 'core/data/scripmaster_nifty_nfo.json')
+SCRIP_MASTER_CACHE_TTL_SEC = env_int('SCRIP_MASTER_CACHE_TTL_SEC', 6 * 60 * 60)
+
+# =========================================================
 # 📝 LOGGING
 # =========================================================
 
