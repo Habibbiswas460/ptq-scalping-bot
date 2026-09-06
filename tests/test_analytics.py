@@ -118,38 +118,55 @@ class TestReportGeneration:
 
 
 class TestExitReasonCategorization:
-    """Test exit reason categorization"""
-    
+    """Exit reasons are grouped by the label the engine stamps on them.
+
+    These cases used to be written against strings nobody produces -- "Stop Loss hit",
+    "TP-1 partial", "Trailing stop hit". None of the six appears in exit_engine.py or in
+    any of the 131 recorded trades, so the classifier was being checked against an
+    invented vocabulary while its behaviour on the real one went unexamined: it filed 62%
+    of trades as "Other", put Early Loss Cut under Stop Loss because the explanation ends
+    "(saved 2.8pts vs SL)", and reported trades with no exit as clean market closes.
+
+    Every string below is verbatim from core/data/trades.db. tests/test_exit_reason_
+    categories.py covers the edges and pins the table against the engine's own labels.
+    """
+
     def test_categorize_exit_reason_stop_loss(self):
-        """Test stop loss categorization"""
         from utils.analytics import TradeAnalytics
         analytics = TradeAnalytics()
-        
-        assert analytics._categorize_exit_reason("Stop Loss hit") == "Stop Loss"
-        assert analytics._categorize_exit_reason("SL triggered") == "Stop Loss"
-    
+
+        assert analytics._categorize_exit_reason(
+            "\U0001f6d1 HARD SL HIT | PE | -6pts @ \u20b9178.45 | Loss: \u20b9390") == "Hard Stop Loss"
+
     def test_categorize_exit_reason_take_profit(self):
-        """Test take profit categorization"""
+        # This engine takes profit in one step; the TP-1/TP-2/TP-3 tiers the old cases
+        # asserted are not something it can emit.
         from utils.analytics import TradeAnalytics
         analytics = TradeAnalytics()
-        
-        assert analytics._categorize_exit_reason("TP-1 partial") == "TP-1 (Partial)"
-        assert analytics._categorize_exit_reason("TP-2 hit") == "TP-2 (Partial)"
-        assert analytics._categorize_exit_reason("TP-3 full exit") == "TP-3 (Full)"
-    
+
+        assert analytics._categorize_exit_reason(
+            "\U0001f3af TAKE PROFIT | CE | +13.8pts @ \u20b9141.32 | Profit: \u20b9894") == "Take Profit"
+
     def test_categorize_exit_reason_trailing(self):
-        """Test trailing stop categorization"""
         from utils.analytics import TradeAnalytics
         analytics = TradeAnalytics()
-        
-        assert analytics._categorize_exit_reason("Trailing stop hit") == "Trailing Stop"
-    
+
+        assert analytics._categorize_exit_reason(
+            "\u2705 TRAILING PROFIT | CE | +9pts | Locked: \u20b9585") == "Trailing Profit"
+
     def test_categorize_exit_reason_kill_switch(self):
-        """Test kill switch categorization"""
         from utils.analytics import TradeAnalytics
         analytics = TradeAnalytics()
-        
-        assert analytics._categorize_exit_reason("Kill switch activated") == "Kill Switch"
+
+        assert analytics._categorize_exit_reason("Kill switch: Wide spread KILL") == "Kill Switch"
+
+    def test_categorize_exit_reason_rsi(self):
+        # The most common exit in the book, and the one the old table could not see.
+        from utils.analytics import TradeAnalytics
+        analytics = TradeAnalytics()
+
+        assert analytics._categorize_exit_reason(
+            "\U0001f504 RSI REVERSAL EXIT | PE | RSI 7\u219255 | Lock: \u20b9107") == "RSI Reversal"
 
 
 class TestInteractiveAnalytics:
