@@ -1,0 +1,6 @@
+{
+  "note": "NSE trading holidays. Dates here are treated as authoritative: market_open() returns False on them and next_trading_day() skips them. Anything not listed is 'unknown', not 'trading' - utils/trading_calendar.py never invents a date. Populate it from the broker with: ./venv/bin/python -m utils.trading_calendar fetch 2026-01-01 2026-12-31 (asks for NIFTY spot candles and records the weekdays that produced none), or add entries by hand from the NSE circular.",
+  "source": "",
+  "updated": "",
+  "holidays": []
+}

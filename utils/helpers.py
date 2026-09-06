@@ -4,7 +4,7 @@ Utility functions used across the bot
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, time as dtime
 from typing import Dict, Any, Optional, Tuple
 
 from config.constants import (
@@ -48,16 +48,14 @@ def market_open() -> bool:
     
     current = datetime.now()
 
-    # The exchange is shut at the weekend. This checked the clock and nothing else, so it
-    # answered True at 11:00 on a Saturday or Sunday - and core/main.py gates both the
-    # "wait for open" branch and the main trading loop on it, so starting the bot midday
-    # at a weekend sent it straight into the loop. market_readiness_checker already
-    # refused weekends, so the two disagreed about the same question.
-    #
-    # Exchange holidays still read as open: that needs a calendar this repository does not
-    # have, and guessing one would be worse than the gap. See core/historical/gate.py,
-    # which documents the same limitation.
-    if current.weekday() >= 5:
+    # The exchange is shut at the weekend and on holidays. This checked the clock and
+    # nothing else, so it answered True at 11:00 on a Saturday or Sunday - and
+    # core/main.py gates both the "wait for open" branch and the main trading loop on it.
+    # utils/trading_calendar.py owns both questions now; a holiday it has no evidence for
+    # still reads as open, and it can say when that is the case.
+    from utils.trading_calendar import is_trading_day
+
+    if not is_trading_day(current.date()):
         return False
 
     # MARKET_OPEN / MARKET_CLOSE, which default to NSE's 09:15-15:30. These were written
@@ -84,10 +82,13 @@ def wait_for_market_open():
     
     # If already past market close, wait for NEXT DAY's market open
     if current > market_end:
-        next_day = current + timedelta(days=1)
-        while next_day.weekday() >= 5:
-            next_day += timedelta(days=1)
-        market_start = next_day.replace(hour=oh, minute=om, second=0, microsecond=0)
+        # Skips holidays as well as weekends: this loop stepped over Saturday and Sunday
+        # only, so it would aim the bot at a holiday and wait overnight for a session that
+        # never opens.
+        from utils.trading_calendar import next_trading_day
+
+        nxt = next_trading_day(current.date())
+        market_start = datetime.combine(nxt, dtime(hour=oh, minute=om))
         
         wait_seconds = (market_start - current).total_seconds()
         hours = int(wait_seconds // 3600)
