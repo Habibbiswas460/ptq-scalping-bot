@@ -490,14 +490,24 @@ def analyze_period(days: int = 7):
     # Best/Worst hours
     hourly = metrics['hourly_pnl']
     if hourly:
-        print("📊 BEST & WORST TRADING HOURS")
+        print("📊 TRADING HOURS BY P&L")
         print("-" * 40)
         sorted_hours = sorted(hourly.items(), key=lambda x: x[1]['pnl'], reverse=True)
         if sorted_hours:
-            best = sorted_hours[0]
-            worst = sorted_hours[-1]
-            print(f"Best Hour:   {best[0]}:00 - PnL: ₹{best[1]['pnl']:+,.2f} ({best[1]['win_rate']}% win rate, {best[1]['trades']} trades)")
-            print(f"Worst Hour:  {worst[0]}:00 - PnL: ₹{worst[1]['pnl']:+,.2f} ({worst[1]['win_rate']}% win rate, {worst[1]['trades']} trades)")
+            top, bottom = sorted_hours[0], sorted_hours[-1]
+
+            def line(label, entry):
+                hour, stats = entry
+                n = stats['trades']
+                print(f"{label:<13}{hour}:00 - PnL: ₹{stats['pnl']:+,.2f} "
+                      f"({stats['win_rate']}% win rate, {n} trade{'s' if n != 1 else ''})")
+
+            # "Best" is only true when it made money; otherwise it is the smallest loss,
+            # and saying so is the difference between a finding and a wrong one.
+            line("Best Hour:" if top[1]['pnl'] > 0 else "Least Loss:", top)
+            line("Worst Hour:", bottom)
+            if top[1]['pnl'] <= 0:
+                print("No hour was profitable in this period.")
         print("")
     
     # Exit reason breakdown
@@ -554,14 +564,58 @@ def get_best_worst_hours(days: int = 30) -> Dict[str, Any]:
         all_hourly[hour]['avg_pnl'] = round(all_hourly[hour]['pnl'] / total, 2) if total > 0 else 0
         result[hour] = dict(all_hourly[hour])
     
-    # Sort by profitability
+    # Ranked most profitable first.
     sorted_hours = sorted(result.items(), key=lambda x: x[1]['pnl'], reverse=True)
-    
+
+    # Split on the sign rather than on position. Ranking alone cannot tell you whether an
+    # hour made money, and on a losing book the top of the ranking is still a loss - which
+    # is how "BEST HOURS" came to list three negative numbers.
+    profitable = [h for h in sorted_hours if h[1]['pnl'] > 0]
+    losing = [h for h in sorted_hours if h[1]['pnl'] < 0]
+
     return {
         'hourly_stats': result,
-        'best_hours': sorted_hours[:3] if len(sorted_hours) >= 3 else sorted_hours,
-        'worst_hours': sorted_hours[-3:] if len(sorted_hours) >= 3 else sorted_hours[::-1]
+        'any_profitable': bool(profitable),
+        'profitable_hours': profitable[:3],
+        # Worst first, so the heading and the order agree. This used to be a tail slice of
+        # a descending sort, which printed the worst hour last, and a reversed whole list
+        # when there were fewer than three hours - two different orders from one function.
+        'losing_hours': list(reversed(losing))[:3],
+        'best_hours': sorted_hours[:3],
+        'worst_hours': list(reversed(sorted_hours))[:3],
     }
+
+
+def print_hourly_performance(days: int = 30) -> None:
+    """Hourly performance, labelled by what the numbers actually say.
+
+    The old rendering called the top of the ranking "BEST HOURS" whichever way it pointed,
+    so a book that lost money in every hour still reported three best ones. An hour is
+    only called profitable here if it made money; when none did, the ranking is presented
+    as least costly and the report says so outright.
+    """
+    data = get_best_worst_hours(days)
+    if not data or not data.get('hourly_stats'):
+        print("  No hourly data available yet")
+        return
+
+    def show(rows):
+        for hour, stats in rows:
+            n = stats['trades']
+            print(f"  {hour}:00 - {n} trade{'s' if n != 1 else ''}, "
+                  f"Rs{stats['pnl']:+,.2f} ({stats['win_rate']}% win rate)")
+
+    if data['any_profitable']:
+        print("\n\U0001f4c8 PROFITABLE HOURS (most profitable first):")
+        show(data['profitable_hours'])
+    else:
+        print("\n\U0001f4c9 NO HOUR WAS PROFITABLE over the last "
+              f"{days} days — the ranking below is least costly first, not best:")
+        show(data['best_hours'])
+
+    if data['losing_hours']:
+        print("\n\U0001f4c9 LOSING HOURS (worst first):")
+        show(data['losing_hours'])
 
 
 def print_trading_calendar(days: int = 30):
@@ -633,13 +687,7 @@ def interactive_analytics():
         elif choice == '4':
             print_trading_calendar()
         elif choice == '5':
-            hours_data = get_best_worst_hours()
-            print("\n📊 BEST TRADING HOURS (by total PnL):")
-            for hour, stats in hours_data['best_hours']:
-                print(f"  {hour}:00 - {stats['trades']} trades, ₹{stats['pnl']:+,.2f} PnL, {stats['win_rate']}% win rate")
-            print("\n📊 WORST TRADING HOURS (by total PnL):")
-            for hour, stats in hours_data['worst_hours']:
-                print(f"  {hour}:00 - {stats['trades']} trades, ₹{stats['pnl']:+,.2f} PnL, {stats['win_rate']}% win rate")
+            print_hourly_performance()
         elif choice == '6':
             print("Returning...")
             break
