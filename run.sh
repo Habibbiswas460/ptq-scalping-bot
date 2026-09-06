@@ -381,6 +381,15 @@ print("EXPIRY" if is_expiry_date(date(y, m, d)) else "NORMAL")
 PYDAY
 }
 
+# Data rows in a CSV, i.e. not counting the header. wc -l counts it, so a trades.csv
+# holding only its header reported "1 rows" and read as a session with one trade.
+csv_rows() {
+    local file="$1" lines
+    lines=$(wc -l < "$file" 2>/dev/null) || { printf '?'; return; }
+    lines=${lines// /}
+    [ "$lines" -gt 0 ] 2>/dev/null && printf '%s' "$((lines - 1))" || printf '0'
+}
+
 discover_source_files() {
     find . -name '*.py' \
         -not -path './venv/*' -not -path './archive/*' -not -path './.git/*' \
@@ -1153,9 +1162,10 @@ run_quick_backtest() {
     fi
 
     for i in "${!CSV_FILES[@]}"; do
-        local lines
-        lines=$(wc -l < "${CSV_FILES[$i]}" 2>/dev/null || echo 0)
-        printf "      ${BGREEN}[%2d]${NC} ${BWHITE}%-30s${NC} ${DIM}(%s rows)${NC}\n" $((i+1)) "${CSV_FILES[$i]}" "$lines"
+        local rows
+        rows=$(csv_rows "${CSV_FILES[$i]}")
+        printf "      ${BGREEN}[%2d]${NC} ${BWHITE}%-30s${NC} ${DIM}(%s rows)${NC}\n" \
+               $((i+1)) "${CSV_FILES[$i]}" "$rows"
     done
 
     echo ""
@@ -1293,10 +1303,14 @@ browse_data_files() {
     printf "    ${BYELLOW}Log CSV Files:${NC}\n"
     local csv_count=0
     while IFS= read -r f; do
-        local size lines
+        local size rows
         size=$(wc -c < "$f" 2>/dev/null || echo "?")
-        lines=$(wc -l < "$f" 2>/dev/null || echo "?")
-        printf "      ${BGREEN}•${NC} %-35s ${DIM}%s bytes, %s rows${NC}\n" "$f" "$size" "$lines"
+        rows=$(csv_rows "$f")
+        if [ "$rows" = "0" ]; then
+            printf "      ${BGREEN}•${NC} %-35s ${DIM}%s bytes, header only${NC}\n" "$f" "$size"
+        else
+            printf "      ${BGREEN}•${NC} %-35s ${DIM}%s bytes, %s rows${NC}\n" "$f" "$size" "$rows"
+        fi
         csv_count=$((csv_count + 1))
     done < <(find logs/ -name "*.csv" 2>/dev/null | sort)
 

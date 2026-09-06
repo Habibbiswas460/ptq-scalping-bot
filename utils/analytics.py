@@ -227,34 +227,46 @@ class TradeAnalytics:
         
         return max_count
     
+    # The labels core/engines/exit_engine.py actually writes, longest first so that
+    # "RSI REVERSAL EXIT" is not swallowed by "RSI EXIT".
+    #
+    # The scan this replaces searched the whole sentence for loose substrings, and an exit
+    # reason is a sentence: it carries the numbers and the commentary as well as the type.
+    # So "EARLY LOSS CUT ... (saved 2.8pts vs SL)" was filed under Stop Loss because the
+    # commentary says SL, and "ORPHANED (no exit recorded - closed by cleanup)" was filed
+    # under Market Close because cleanup "closed" it - a trade with no recorded exit shown
+    # as a clean one. Meanwhile the buckets it did offer (TP-1/TP-2/TP-3, breakeven, Greeks)
+    # match nothing this engine emits, so every take profit, every RSI exit and every soft
+    # loss - 62% of all trades - fell into "Other".
+    EXIT_CATEGORIES = (
+        ('RSI REVERSAL EXIT', 'RSI Reversal'),
+        ('MARKET CLOSE EXIT', 'Market Close'),
+        ('EARLY LOSS CUT', 'Early Loss Cut'),
+        ('SOFT LOSS EXIT', 'Soft Loss'),
+        ('TRAILING PROFIT', 'Trailing Profit'),
+        ('HARD SL HIT', 'Hard Stop Loss'),
+        ('TAKE PROFIT', 'Take Profit'),
+        ('RSI EXIT', 'RSI Exit'),
+        ('TIME EXIT', 'Time Exit'),
+        ('ORPHANED', 'No Exit Recorded'),
+        ('KILL SWITCH', 'Kill Switch'),
+    )
+
     def _categorize_exit_reason(self, reason: str) -> str:
-        """Categorize exit reason into groups"""
-        reason_lower = reason.lower()
-        
-        if 'stop loss' in reason_lower or 'sl' in reason_lower:
-            return 'Stop Loss'
-        elif 'tp-1' in reason_lower or 'tp1' in reason_lower:
-            return 'TP-1 (Partial)'
-        elif 'tp-2' in reason_lower or 'tp2' in reason_lower:
-            return 'TP-2 (Partial)'
-        elif 'tp-3' in reason_lower or 'full exit' in reason_lower:
-            return 'TP-3 (Full)'
-        elif 'trailing' in reason_lower:
-            return 'Trailing Stop'
-        elif 'breakeven' in reason_lower:
-            return 'Breakeven'
-        elif 'time' in reason_lower:
-            return 'Time Exit'
-        elif 'delta' in reason_lower or 'gamma' in reason_lower or 'theta' in reason_lower:
-            return 'Greeks Exit'
-        elif 'kill' in reason_lower:
-            return 'Kill Switch'
-        elif 'manual' in reason_lower:
-            return 'Manual'
-        elif 'close' in reason_lower:
-            return 'Market Close'
-        else:
+        """Group an exit reason by the type the engine stamped on it.
+
+        Matched against the label only, not the numbers or the explanation after it.
+        Anything unrecognised stays "Other" - which should now mean the engine grew a new
+        exit this table has not been told about, rather than the table being unable to read
+        the ones it already has.
+        """
+        if not reason:
             return 'Other'
+        text = str(reason).upper()
+        for label, group in self.EXIT_CATEGORIES:
+            if label in text:
+                return group
+        return 'Other'
     
     def _hourly_analysis(self, trades: List[Dict]) -> Dict[str, Dict]:
         """Analyze performance by hour"""
