@@ -41,7 +41,9 @@ KILL_SWITCH_SPREAD_COOLDOWN_SEC = 15  # Wait 15s then retry (was 30)
 # Track high latency (RECOVERABLE - pause trading when high, resume when low)
 high_latency_count = 0
 HIGH_LATENCY_CONSECUTIVE_LIMIT = 5  # Need 5 consecutive high latency to trigger pause (was 3)
-HIGH_LATENCY_THRESHOLD_MS = 500  # Above 500ms = high latency (was 400)
+# Read from KILL_SWITCH_LATENCY_MS. The constant was imported and then never used: the
+# real threshold was this literal, so changing the setting did nothing.
+HIGH_LATENCY_THRESHOLD_MS = KILL_SWITCH_LATENCY
 high_latency_paused = False  # Track if we're in high latency pause mode
 consecutive_low_latency = 0
 LOW_LATENCY_RECOVERY_COUNT = 3  # Need 3 consecutive low latency to resume (was 5)

@@ -7,6 +7,7 @@ With Auto-Reconnect, Telegram, Dashboard & Database
 import time
 import socket
 import os
+import sys
 import json
 from datetime import datetime
 from pathlib import Path
@@ -294,8 +295,11 @@ def main():
                                             second=0, microsecond=0)
                            - timedelta(minutes=5))
 
-    # Unit tests and CI runs should exercise startup logic immediately without sleeping until market open.
-    is_pytest_run = bool(os.getenv("PYTEST_CURRENT_TEST"))
+    # Tests must not sleep until market open. PYTEST_CURRENT_TEST used to be the check,
+    # but it is inherited by every subprocess a test spawns - including a shell that runs
+    # run.sh - so a test harness could silently disable the market-hours gate for a real
+    # launch. 'pytest' in sys.modules is true only in-process and does not inherit.
+    is_pytest_run = "pytest" in sys.modules or bool(os.getenv("PTQ_SKIP_MARKET_WAIT"))
     if current < pre_market_time and not is_pytest_run:
         wait_seconds = (pre_market_time - current).total_seconds()
         hours = int(wait_seconds // 3600)

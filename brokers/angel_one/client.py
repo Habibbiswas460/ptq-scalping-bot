@@ -1223,15 +1223,6 @@ class AngelOneClient:
     # WEBSOCKET STREAMING + PHASE 5: REDUNDANCY & FAILOVER
     # =========================================================================
     
-    def _get_ws_exchange_type(self, exchange: str) -> int:
-        """Get WebSocket exchange type from exchange code"""
-        exchange_map = {
-            'NSE': WS_EXCHANGE_NSE_CM,
-            'NFO': WS_EXCHANGE_NSE_FO,
-            'BSE': WS_EXCHANGE_BSE_CM,
-        }
-        return exchange_map.get(exchange, WS_EXCHANGE_NSE_FO)
-    
     def _get_primary_websocket(self):
         """Get the primary (active) WebSocket connection (Phase 5)"""
         if self.ws_connections and len(self.ws_connections) > 0:

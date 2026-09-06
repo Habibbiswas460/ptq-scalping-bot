@@ -821,11 +821,9 @@ launch_bot() {
     export PAPER_TRADING="$paper_mode"
     # Keep runtime mode aligned with readiness decision.
     # Paper mode can still use live data; live mode always uses live data.
-    if [ "$paper_mode" = "true" ]; then
-        export USE_LIVE_DATA=true
-    else
-        export USE_LIVE_DATA=true
-    fi
+    # Both modes stream live market data; paper differs only in that orders are simulated.
+    # This was an if/else with an identical body, which read as a choice that was never made.
+    export USE_LIVE_DATA=true
 
     clear
     echo ""

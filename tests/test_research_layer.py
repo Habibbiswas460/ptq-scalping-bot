@@ -264,7 +264,10 @@ def test_session_profile_matches_the_hand_forensics(book):
     spot, src = book.spot("2026-09-04")
     p = session_profile(spot, book.trades("2026-09-04"))
     assert src == "tick"
-    assert p["range"] == pytest.approx(107.70, abs=0.01)
+    # 107.80 is the true high-low across all 25,055 ticks of the session. The hand
+    # forensics recorded 107.70 because Book.spot() silently dropped ~20% of ticks,
+    # keeping the first of each same-second group and losing the extremes with them.
+    assert p["range"] == pytest.approx(107.80, abs=0.01)
     assert p["legs_25"] == 11
 
 

@@ -55,7 +55,14 @@ class AdaptiveConfidenceEngine:
         market_quality_score = 100 if not squeeze and vol_ratio >= 1.1 else 60 if vol_ratio >= 0.9 else 30
         spread_score = 100 if spread_pct <= 1.0 else 60 if spread_pct <= 2.0 else 20
         volume_score = 100 if vol_ratio >= 1.3 else 70 if vol_ratio >= 1.0 else 35
-        greeks_score = 100 if 0.35 <= delta <= 0.65 else 50 if 0.30 <= delta <= 0.70 else 10
+        # Moneyness, not sign. PE deltas are negative (-0.42, -0.68 on real 2026-09-04
+        # quotes), so comparing the signed value sent every well-positioned PE to the 10
+        # branch. weighted_score_engine.py:73 was fixed for this; this engine was not, and
+        # greeks_score carries 0.20 of the confidence total below - an 18-point penalty
+        # against a 70-72% gate. Invisible only while delta was unpopulated; TICK_DELTA_
+        # ENABLED is now on, so it would have started suppressing PE entries silently.
+        abs_delta = abs(delta)
+        greeks_score = 100 if 0.35 <= abs_delta <= 0.65 else 50 if 0.30 <= abs_delta <= 0.70 else 10
 
         if direction == 'CE':
             oi_score = 100 if oi_direction in ['LONG_BUILDUP', 'SHORT_COVERING'] else 50 if oi_direction == 'NEUTRAL' else 20
