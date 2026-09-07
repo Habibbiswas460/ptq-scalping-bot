@@ -40,6 +40,18 @@ from config.constants import NSE_HOLIDAY_FILE
 DECLARED = "declared"
 INFERRED = "inferred"
 
+# The note the declared file carries. It lives here, not only in the shipped JSON, because
+# write_declared() rewrites the whole file: when the text was duplicated, the first fetch
+# silently replaced the shipped note - including the only place that says how to refill it.
+NOTE = (
+    "NSE trading holidays. Dates here are treated as authoritative: market_open() returns "
+    "False on them and next_trading_day() skips them. Anything not listed is 'unknown', "
+    "not 'trading' - utils/trading_calendar.py never invents a date. Populate it from the "
+    "broker with: ./venv/bin/python -m utils.trading_calendar fetch 2026-01-01 2026-12-31 "
+    "(asks for NIFTY spot candles and records the weekdays that produced none), or add "
+    "entries by hand from the NSE circular."
+)
+
 _cache: Optional[Dict[_dt.date, str]] = None
 _cache_key: Optional[tuple] = None
 
@@ -248,8 +260,7 @@ def write_declared(days: List[_dt.date], source: str,
     for day in days:
         existing.setdefault(day, "no NIFTY candle on a weekday")
     blob = {
-        "note": ("NSE trading holidays. Dates here are treated as authoritative. Anything "
-                 "not listed is 'unknown', not 'trading'."),
+        "note": NOTE,
         "source": source,
         "updated": _dt.datetime.now().isoformat(timespec="seconds"),
         "holidays": [{"date": d.isoformat(), "name": existing[d]} for d in sorted(existing)],
