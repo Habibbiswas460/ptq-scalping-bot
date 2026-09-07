@@ -91,6 +91,22 @@ class RiskManager:
                     last_updated = state.get('last_updated')
                     if last_updated:
                         self._last_active_date = datetime.fromisoformat(last_updated).date()
+
+                    # daily_pnl is what MAX_DAILY_LOSS_AMOUNT and the kill switch are
+                    # measured against, and it used to be neither saved nor loaded — so
+                    # every process restart handed the bot a fresh full-size daily loss
+                    # budget. In paper trading that is only untidy; with real money a bot
+                    # that had lost most of its ceiling, died and came back would be
+                    # allowed to lose it again. Restored only when the saved date is
+                    # today, so a normal overnight start still begins at zero.
+                    saved_day = state.get('daily_date')
+                    if saved_day == datetime.now().date().isoformat():
+                        self.daily_pnl = state.get('daily_pnl', 0.0)
+                        if self.daily_pnl:
+                            self._log('info',
+                                      f"↩ Restored today's P&L from a previous run: "
+                                      f"Rs{self.daily_pnl:+.2f} (daily loss ceiling continues "
+                                      f"from here, it does not restart)")
             except Exception as e:
                 self._log('warning', f"Could not load risk state: {e}")
     
@@ -105,6 +121,8 @@ class RiskManager:
                 'peak_equity': self.peak_equity,
                 'recovery_mode': self.recovery_mode,
                 'equity_history': self.equity_history[-30:],
+                'daily_pnl': self.daily_pnl,
+                'daily_date': datetime.now().date().isoformat(),
                 'last_updated': datetime.now().isoformat()
             }
             with open(state_file, 'w') as f:
