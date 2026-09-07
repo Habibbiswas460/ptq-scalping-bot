@@ -165,7 +165,14 @@ class TestBrokerSplitSubscriptions:
 
         assert broker._subscribe_with_retry.call_count == 2
         assert broker._subscribe_with_retry.call_args_list[0].args[0] == [("NSE", "99926000", 1)]
-        assert broker._subscribe_with_retry.call_args_list[1].args[0] == [("NFO", "44649", 2)]
+        # The option's subscription mode is configurable now (WS_SNAP_QUOTE_ENABLED): mode 3
+        # is what carries open interest and the best-5 book, mode 2 carries neither. Assert
+        # against the setting rather than a frozen literal, so the test states the intent —
+        # spot in LTP mode, option in whatever mode the config asks for.
+        from config.constants import WS_OPTION_SUB_MODE
+        assert broker._subscribe_with_retry.call_args_list[1].args[0] == [
+            ("NFO", "44649", WS_OPTION_SUB_MODE)]
+        assert WS_OPTION_SUB_MODE in (2, 3)
         assert broker._ws_connected is True
 
     def test_start_websocket_only_spot_when_option_missing(self):
