@@ -1,0 +1,438 @@
+<title>Six Blockers and a Cost Model</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&display=swap">
+<style>
+  :root{
+    --ground:#f5f6f4; --panel:#ffffff; --sunk:#eceee9;
+    --ink:#171a1c; --ink-2:#41474b; --ink-3:#6d7479;
+    --rule:#d8dcd6; --rule-2:#c3c8c0;
+    --loss:#8f2f2a; --gain:#1f6b5c; --flag:#9a6a12; --link:#2b5876;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+    --serif:"IBM Plex Serif",Georgia,serif;
+    --wrap:min(112rem,100% - 3rem); --col:68ch;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ground:#14171a; --panel:#1b1f23; --sunk:#22272c;
+      --ink:#e8eaec; --ink-2:#b3babf; --ink-3:#848d94;
+      --rule:#2e343a; --rule-2:#3d454c;
+      --loss:#d9736c; --gain:#5fbfa8; --flag:#d6a63f; --link:#8ab4d6;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#14171a; --panel:#1b1f23; --sunk:#22272c;
+    --ink:#e8eaec; --ink-2:#b3babf; --ink-3:#848d94;
+    --rule:#2e343a; --rule-2:#3d454c;
+    --loss:#d9736c; --gain:#5fbfa8; --flag:#d6a63f; --link:#8ab4d6;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--ground); color:var(--ink); font-family:var(--sans);
+       font-size:16px; line-height:1.62; -webkit-font-smoothing:antialiased;}
+  .wrap{width:var(--wrap); margin-inline:auto;}
+  .col{max-width:var(--col);}
+  p,li{color:var(--ink-2)}
+  strong{color:var(--ink); font-weight:600}
+  a{color:var(--link)}
+  code,.mono{font-family:var(--mono); font-variant-numeric:tabular-nums}
+  h1,h2,h3{color:var(--ink); text-wrap:balance; margin:0}
+  h2{font-family:var(--serif); font-size:1.6rem; font-weight:600; letter-spacing:-.01em}
+  h3{font-family:var(--sans); font-size:1.02rem; font-weight:600}
+  .eyebrow{font-family:var(--mono); font-size:.7rem; letter-spacing:.14em;
+           text-transform:uppercase; color:var(--ink-3)}
+
+  /* masthead */
+  header{border-bottom:2px solid var(--ink); padding:3.2rem 0 1.4rem; margin-bottom:2.6rem}
+  header h1{font-family:var(--serif); font-size:clamp(2rem,4.6vw,3.1rem); line-height:1.08;
+            font-weight:600; letter-spacing:-.02em; margin:.5rem 0 .7rem}
+  .standfirst{font-size:1.08rem; color:var(--ink-2); max-width:60ch}
+  .meta{display:flex; flex-wrap:wrap; gap:.4rem 1.6rem; margin-top:1.4rem;
+        font-family:var(--mono); font-size:.76rem; color:var(--ink-3)}
+
+  /* the day's number */
+  .ledger{display:grid; grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));
+          border:1px solid var(--rule-2); background:var(--panel); margin:0 0 2.8rem}
+  .ledger div{padding:1rem 1.1rem; border-right:1px solid var(--rule)}
+  .ledger div:last-child{border-right:0}
+  .ledger dt{font-family:var(--mono); font-size:.68rem; letter-spacing:.12em;
+             text-transform:uppercase; color:var(--ink-3); margin-bottom:.35rem}
+  .ledger dd{margin:0; font-family:var(--mono); font-size:1.42rem; font-weight:500;
+             font-variant-numeric:tabular-nums}
+  .neg{color:var(--loss)} .pos{color:var(--gain)}
+  .ledger small{display:block; font-family:var(--sans); font-size:.74rem; color:var(--ink-3); margin-top:.2rem}
+
+  section{margin:0 0 3.4rem}
+  section > p, section > ul, section > ol{max-width:var(--col)}
+  .lede{border-left:3px solid var(--rule-2); padding-left:1.1rem; margin:1.2rem 0 1.6rem}
+
+  /* chronology: the day genuinely was a sequence, each blocker hidden by the one before */
+  .chain{list-style:none; margin:1.6rem 0 0; padding:0; counter-reset:blk}
+  .chain li{position:relative; padding:0 0 1.5rem 3.4rem; border-left:1px solid var(--rule-2);
+            margin-left:1.1rem}
+  .chain li:last-child{border-left-color:transparent; padding-bottom:0}
+  .chain li::before{counter-increment:blk; content:counter(blk,decimal-leading-zero);
+    position:absolute; left:-1.1rem; top:0; width:2.2rem; height:2.2rem; display:grid;
+    place-items:center; border-radius:50%; background:var(--panel);
+    border:1px solid var(--rule-2); font-family:var(--mono); font-size:.72rem; color:var(--ink-3)}
+  .chain h3{margin-bottom:.2rem}
+  .chain .ev{font-family:var(--mono); font-size:.8rem; color:var(--ink-3); margin:.15rem 0 .45rem}
+  .chain p{margin:0; max-width:62ch}
+
+  /* data blocks break out of the prose column */
+  .scroll{overflow-x:auto; margin:1.5rem 0; border:1px solid var(--rule-2); background:var(--panel)}
+  table{border-collapse:collapse; width:100%; font-family:var(--mono); font-size:.82rem;
+        font-variant-numeric:tabular-nums; white-space:nowrap}
+  caption{caption-side:top; text-align:left; padding:.75rem 1rem; font-family:var(--sans);
+          font-size:.84rem; color:var(--ink-3); border-bottom:1px solid var(--rule)}
+  th,td{padding:.44rem 1rem; text-align:right; border-bottom:1px solid var(--rule)}
+  th:first-child,td:first-child{text-align:left}
+  thead th{font-size:.68rem; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-3);
+           font-weight:500; background:var(--sunk)}
+  tbody tr:last-child td{border-bottom:0}
+  tfoot td{font-weight:600; color:var(--ink); border-top:1px solid var(--rule-2)}
+
+  pre{font-family:var(--mono); font-size:.79rem; line-height:1.55; color:var(--ink-2);
+      background:var(--sunk); border:1px solid var(--rule); padding:.9rem 1.1rem;
+      overflow-x:auto; margin:1.3rem 0}
+
+  .flag{border:1px solid var(--flag); border-left-width:3px; background:var(--panel);
+        padding:1rem 1.2rem; margin:1.6rem 0; max-width:var(--col)}
+  .flag .eyebrow{color:var(--flag)}
+  .flag p{margin:.4rem 0 0}
+
+  .verdict{border-top:2px solid var(--ink); border-bottom:2px solid var(--ink);
+           padding:1.8rem 0; margin:2.4rem 0}
+  .verdict p{font-family:var(--serif); font-size:1.2rem; line-height:1.5; color:var(--ink); max-width:56ch; margin:0}
+
+  footer{border-top:1px solid var(--rule-2); margin-top:3rem; padding:1.6rem 0 3rem;
+         font-family:var(--mono); font-size:.74rem; color:var(--ink-3)}
+  footer a{color:var(--ink-3)}
+  @media (max-width:640px){ :root{--wrap:min(112rem,100% - 1.6rem)} .ledger div{border-right:0;border-bottom:1px solid var(--rule)} }
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">PTQ scalping bot · live-paper session · 2026-09-07</div>
+  <h1>Six blockers and a cost model</h1>
+  <p class="standfirst">The bot took thirteen trades in a six-hour session. Finding out why it
+  could not take more uncovered six independent reasons stacked behind one another — and then a
+  seventh thing, which is the one that matters.</p>
+  <div class="meta">
+    <span>Branch <code>experiment/exit-strategy-20260904</code></span>
+    <span>8 commits · <code>88e07d3</code>…<code>e771827</code></span>
+    <span>Paper trading</span>
+  </div>
+</header>
+
+<dl class="ledger">
+  <div><dt>Gross P&amp;L</dt><dd class="neg">−₹952.25</dd><small>13 trades, 4 winners</small></div>
+  <div><dt>Transaction cost</dt><dd class="neg">−₹846.21</dd><small>₹65.09 per round trip</small></div>
+  <div><dt>Net P&amp;L</dt><dd class="neg">−₹1,798.46</dd><small>−₹138.34 per trade</small></div>
+  <div><dt>Traded window</dt><dd>10:16→14:15</dd><small>of 09:15–15:25 available</small></div>
+</dl>
+
+<section>
+  <h2>What the day was supposed to be</h2>
+  <p class="lede">This was booked as the out-of-sample test of the project's strongest result:
+  that the 09:15–09:45 window, which the time filter had always blocked, returned
+  <span class="mono">+₹114.06</span>/trade against <span class="mono">−₹34.41</span> for the
+  traded day. The time gate was opened for this session specifically so that window could
+  finally be traded.</p>
+  <p><strong>It was never traded.</strong> The bot placed its first order at 10:16:01, thirty-one
+  minutes after the window closed, and the reasons it could not are the subject of the next
+  section. The scheduled experiment did not happen; a different one did.</p>
+</section>
+
+<section>
+  <div class="eyebrow">Chronology</div>
+  <h2>Six blockers, each hidden by the one in front</h2>
+  <p>None of these are individually unreasonable. Every one of them is a mechanism someone added
+  deliberately. What no one chose is their conjunction — and because each returned silently, only
+  the frontmost was ever visible.</p>
+
+  <ol class="chain">
+    <li>
+      <h3>The PE trend-exhaustion filter</h3>
+      <p class="ev">986 of 986 evaluations rejected before scoring · 0 scored signals in 30 minutes</p>
+      <p>A hardcoded rule: <code>rsi &lt; 30 and macd_hist rising</code> = "bounce coming, do not
+      buy PE". In a downtrend at RSI 17.7 it fired on every evaluation. The session produced not one
+      scored signal. EXP-11 could show neither that this gate earns its rejections nor that it costs
+      anything, so the standing decision had been "no action" — which is why it had never been tested.
+      Now settable; the PE half was disabled at 09:28:35.</p>
+    </li>
+    <li>
+      <h3>Indicators rebuilt from nothing — self-inflicted</h3>
+      <p class="ev">EMA9/EMA21 separated by 0.1–0.7 pts against 32 pts · 17 minutes lost</p>
+      <p>My own restart hit the broker's historical-candle rate limit, so warm-up logged "indicators
+      will start from zero" and the EMAs were rebuilt from two minutes of ticks instead of 5-minute
+      candles. The chop filter then rejected everything. The existing fallback cache was in-memory, so
+      it was empty in the only case that matters — process startup. It is now written to disk, and
+      it caught the same failure twice more the same afternoon.</p>
+    </li>
+    <li>
+      <h3>The opposite direction was always the wrong moneyness</h3>
+      <p class="ev">988 × "Premium too low ₹32 &lt; ₹70" against 512 confidence rejections</p>
+      <p>The subscribed strike is chosen to put the <em>subscribed</em> option type inside the
+      ₹70–350 premium band. Both the validation path and the order path reused that same strike for
+      the opposite direction — and a strike that makes a CE in-the-money makes the PE
+      out-of-the-money by the same distance. Holding an ITM 23800 CE in a falling market, every PE
+      the strategy asked for priced at ₹31–32. This is the most plausible reason the entire tick
+      record holds <strong>297 PE rows against ~73,000 CE</strong>.</p>
+    </li>
+    <li>
+      <h3>Open interest could never have populated</h3>
+      <p class="ev">154 tick rows at <code>oi = 0</code>; 73,171 NULLs historically; never a positive value</p>
+      <p>Option tokens are subscribed with a hardcoded literal <code>2</code> in eight places —
+      WS_MODE_QUOTE. Open interest lives at bytes 131:139 of a mode-3 SnapQuote packet and is simply
+      absent from a Quote packet, so the flag enabled two days earlier had been reading a field the
+      subscription never asked for. The same gap explains the fabricated spread: bytes 147:347 are the
+      best-5 book, and the parser jumped from 139 straight to 347.</p>
+    </li>
+    <li>
+      <h3>Two losses paused the session for thirty minutes, not fifteen</h3>
+      <p class="ev">Streak at 10:19:44 → first evaluation 10:49:47. After the fix: 11:32:30 → 11:47:32</p>
+      <p>The risk manager armed its pause the first time it <em>observed</em> a streak, not when the
+      streak happened — and while the state machine sat in its own 900-second cooldown it never
+      reached the check at all. The two clocks ran back to back instead of together. This had been
+      fixed once before, by deleting a duplicate pause; the duplication survived through the cooldown
+      <em>duration</em> instead.</p>
+    </li>
+    <li>
+      <h3>Recovery mode was a permanent trading halt</h3>
+      <p class="ev">87 consecutive accepted signals placed no order · 12:02 → 13:53</p>
+      <p>NIFTY's minimum position is one 65-lot, which at an 8-point stop risks ₹520 against a ₹900
+      per-trade budget — so any size multiplier below 0.578 computes a position that cannot be
+      executed. Recovery mode's configured "size 50%" lands at 0.4936. It does not halve the trade;
+      there is no half lot. Worse, <code>recovery_mode</code> was persisted and
+      <code>recovery_start_date</code> was not, and the exit condition is guarded on that date — so
+      after any restart the mode could be entered and never left. Trading is the only way out of
+      recovery, and recovery blocked trading.</p>
+    </li>
+  </ol>
+
+  <div class="flag">
+    <div class="eyebrow">The pattern, not the list</div>
+    <p>The failure mode here is not wrong logic. Each mechanism is defensible on its own. It is that
+    they <strong>compose multiplicatively and return silently</strong> — <code>return "IDLE"</code>
+    with nothing logged looks exactly like a market with no signals. The most useful changes made
+    today were not logic but <em>logging</em>: the entry-hold reason, and the sizing arithmetic.
+    Without those two lines, blockers 5 and 6 would still be invisible.</p>
+  </div>
+</section>
+
+<section>
+  <div class="eyebrow">The seventh thing</div>
+  <h2>Why three months produced nothing</h2>
+  <p class="lede">Every P&amp;L figure this project has ever produced is <strong>gross</strong>.
+  There is no brokerage, STT, exchange transaction charge, GST or stamp duty anywhere in the
+  codebase — the bot computes <code>(exit − entry) × qty</code> and stops. There is also no backtest
+  artifact behind the strategy docstring's claim of "+42.2% monthly".</p>
+
+  <div class="scroll">
+    <table>
+      <caption>All 144 recorded trades, priced at Zerodha's published options-intraday rates</caption>
+      <thead><tr><th>Measure</th><th>Gross</th><th>Net of costs</th></tr></thead>
+      <tbody>
+        <tr><td>Total P&amp;L</td><td class="neg">−₹1,768.00</td><td class="neg">−₹10,956.28</td></tr>
+        <tr><td>Expectancy per trade</td><td class="neg">−₹12.28</td><td class="neg">−₹76.09</td></tr>
+        <tr><td>Win rate</td><td>46.5%</td><td>33.3%</td></tr>
+        <tr><td>Break-even win rate required</td><td>50.4%</td><td>70.3%</td></tr>
+        <tr><td>Average winning trade</td><td>₹159.23 · 2.45 pts</td><td>—</td></tr>
+        <tr><td>Round-trip cost</td><td>—</td><td>₹63.80 · 1.162 pts</td></tr>
+      </tbody>
+      <tfoot><tr><td>Transaction cost as a share of the average win</td><td colspan="2">40.1%</td></tr></tfoot>
+    </table>
+  </div>
+
+  <p>The cost is not an artefact of a small account. The flat ₹40 brokerage is 53% of it at one lot
+  and amortises with size — but at eight lots, four times this account's margin, the round trip still
+  costs 0.527 points and break-even still needs an average win of <strong>3.94 points against the
+  2.45 observed</strong>.</p>
+
+  <h3 style="margin-top:2rem">And the entries are followed by more adverse movement than favourable</h3>
+  <p>Measured on real ticks after each of 37 entries across three sessions, ignoring where the bot
+  actually exited — so this is the opportunity, not the exit policy:</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Excursion after entry, direction-adjusted, option points</caption>
+      <thead><tr><th>Horizon</th><th>Mean MFE</th><th>Mean MAE</th><th>MFE / |MAE|</th><th>Would hit −2.5</th></tr></thead>
+      <tbody>
+        <tr><td>60 s</td><td class="pos">+1.06</td><td class="neg">−2.09</td><td>0.51</td><td>29.7%</td></tr>
+        <tr><td>180 s</td><td class="pos">+2.19</td><td class="neg">−3.16</td><td>0.69</td><td>51.4%</td></tr>
+        <tr><td>300 s</td><td class="pos">+2.70</td><td class="neg">−4.27</td><td>0.63</td><td>62.2%</td></tr>
+        <tr><td>600 s</td><td class="pos">+3.63</td><td class="neg">−5.55</td><td>0.65</td><td>75.7%</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The ratio is below 1 at every horizon. Holding longer does not rescue it: the upside grows
+  from 1.06 to 3.63 points while the downside grows from 2.09 to 5.55, and by ten minutes a
+  2.5-point stop is hit on three quarters of them. <strong>Cutting losses fast is the correct
+  response to a signal shaped like this</strong> — which is also why every loss-side relaxation
+  tested in EXP-02 made results worse. That was never a flaw in the exit ladder.</p>
+</section>
+
+<section>
+  <div class="eyebrow">Out-of-sample</div>
+  <h2>Both of the morning's leads failed by evening</h2>
+  <p>Before the market opened I re-derived the project's flagship result on the audited layer and it
+  reproduced: the opening window at <span class="mono">+₹151.26</span> against
+  <span class="mono">−₹30.42</span>, p=0.0165. I then found a mechanism for it — realised range,
+  not the clock — where a 30-point gate moved expectancy from −₹32.26 to +₹72.02 inside the traded
+  day, p=0.042. I flagged at the time that the threshold was chosen on the same two sessions that
+  scored it, across roughly 21 threshold/lookback combinations, and that the p-value was not
+  corrected for that.</p>
+
+  <div class="scroll">
+    <table>
+      <caption>Both findings re-run on 2026-09-07, which had no part in fitting them</caption>
+      <thead><tr><th>Test</th><th>In-sample (09-02/03/04)</th><th>Out-of-sample (09-07)</th></tr></thead>
+      <tbody>
+        <tr><td>Opening window 09:15–09:45</td><td class="pos">+₹114.06 · p=0.0057</td><td class="neg">−₹108.81 · p(better)=0.797</td></tr>
+        <tr><td>Rest of day 09:45–15:10</td><td class="neg">−₹34.41</td><td class="neg">−₹42.49</td></tr>
+        <tr><td>Range gate ≥30 pts, inside 09:45–15:10</td><td class="pos">+₹72.02 · p=0.042</td><td class="neg">−₹177.38 · p(better)=0.913</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Both reversed. The opening window was the better half of the day on three sessions and the
+  worse half on this one; every range threshold tested came out below the ungated baseline. The
+  caution written into the morning's commit was the correct reading: <strong>these were artifacts of
+  fitting on two or three sessions</strong>, and the honest status of both is now withdrawn rather
+  than pending.</p>
+</section>
+
+<section>
+  <h2>Today's thirteen trades</h2>
+  <div class="scroll">
+    <table>
+      <caption>Gross, cost and net per trade. Three of the four winners clear the round trip by under ₹50.</caption>
+      <thead><tr><th>#</th><th>Dir</th><th>Entry</th><th>Hold</th><th>Conf</th><th>Grade</th><th>Gross</th><th>Cost</th><th>Net</th><th>Exit</th></tr></thead>
+      <tbody>
+        <tr><td>132</td><td>PE</td><td>10:16:01</td><td>22s</td><td>91</td><td>A</td><td class="pos">+292.50</td><td>65.33</td><td class="pos">+227.17</td><td>RSI reversal</td></tr>
+        <tr><td>133</td><td>PE</td><td>10:17:18</td><td>2s</td><td>100</td><td>A+</td><td class="neg">−176.15</td><td>65.40</td><td class="neg">−241.55</td><td>Early loss cut</td></tr>
+        <tr><td>134</td><td>PE</td><td>10:19:21</td><td>23s</td><td>83</td><td>A</td><td class="neg">−182.00</td><td>65.23</td><td class="neg">−247.23</td><td>Early loss cut</td></tr>
+        <tr><td>135</td><td>PE</td><td>10:49:49</td><td>29s</td><td>83</td><td>A</td><td class="pos">+97.50</td><td>65.15</td><td class="pos">+32.35</td><td>RSI reversal</td></tr>
+        <tr><td>136</td><td>PE</td><td>10:51:44</td><td>78s</td><td>91</td><td>A</td><td class="neg">−133.90</td><td>65.22</td><td class="neg">−199.12</td><td>Soft loss</td></tr>
+        <tr><td>137</td><td>PE</td><td>10:55:11</td><td>75s</td><td>74</td><td>A</td><td class="neg">−354.25</td><td>65.19</td><td class="neg">−419.44</td><td>Soft loss</td></tr>
+        <tr><td>138</td><td>PE</td><td>11:23:16</td><td>75s</td><td>83</td><td>A</td><td class="pos">+95.55</td><td>66.53</td><td class="pos">+29.02</td><td>RSI reversal</td></tr>
+        <tr><td>139</td><td>PE</td><td>11:25:22</td><td>46s</td><td>83</td><td>A</td><td class="pos">+115.05</td><td>67.13</td><td class="pos">+47.92</td><td>RSI reversal</td></tr>
+        <tr><td>140</td><td>PE</td><td>11:26:57</td><td>84s</td><td>100</td><td>A+</td><td class="neg">−141.70</td><td>61.79</td><td class="neg">−203.49</td><td>Soft loss</td></tr>
+        <tr><td>141</td><td>PE</td><td>11:30:26</td><td>124s</td><td>83</td><td>A</td><td class="neg">−144.95</td><td>61.62</td><td class="neg">−206.57</td><td>Soft loss</td></tr>
+        <tr><td>142</td><td>PE</td><td>12:02:33</td><td>105s</td><td>83</td><td>A</td><td class="neg">−133.90</td><td>60.66</td><td class="neg">−194.56</td><td>Soft loss</td></tr>
+        <tr><td>143</td><td>CE</td><td>13:56:39</td><td>15s</td><td>88</td><td>REJECT</td><td class="neg">−162.50</td><td>71.70</td><td class="neg">−234.20</td><td>Early loss cut</td></tr>
+        <tr><td>144</td><td>CE</td><td>14:13:10</td><td>125s</td><td>88</td><td>REJECT</td><td class="neg">−123.50</td><td>65.26</td><td class="neg">−188.76</td><td>Soft loss</td></tr>
+      </tbody>
+      <tfoot><tr><td colspan="6">Session</td><td class="neg">−952.25</td><td>846.21</td><td class="neg">−1,798.46</td><td></td></tr></tfoot>
+    </table>
+  </div>
+  <p>Net by exit family: RSI reversal <span class="mono pos">+₹336</span>, early loss cut
+  <span class="mono neg">−₹723</span>, soft loss <span class="mono neg">−₹1,412</span>. No take-profit
+  and no hard stop fired all day. The two <code>REJECT</code>-grade trades are the ones the new
+  minimum-lot floor admitted; both lost, on n=2.</p>
+  <p>Neither confidence nor allocation grade ordered the outcomes: the two 100%-confidence trades
+  both lost, one at −2.5 points inside two seconds, while an 83 and a 91 produced the day's winners.
+  That is consistent with EXP-06's finding that the scoring stack cannot rank, now seen on live PE
+  trades for the first time — n=13, so it is an observation, not a result.</p>
+</section>
+
+<section>
+  <div class="eyebrow">What was measured for the first time</div>
+  <h2>The instrument, at least, now reads true</h2>
+  <p>SnapQuote was enabled mid-session at 13:28:46. Quote source moved from
+  <code>100.0% estimated</code>, which every prior session logged, to <code>real=1 estimated=0</code>.</p>
+  <pre>real spread, 112 ticks, one PE contract, mid-afternoon
+  median  0.246%      mean 0.235%      range 0.054% – 0.305%
+  fabricated model    a flat 0.300% on every row
+  kill-switch breaches (&gt;0.6%)   0 of 112</pre>
+  <p>So the fabrication sat at the top of the real range — a reasonable guess, slightly pessimistic,
+  worth about ₹8 per round trip. That <em>refines</em> the synthetic-bid/ask correction rather than
+  overturning it: the spread cost was invented, but it was not badly invented, and it is not where
+  the expectancy problem lives. One contract, two minutes, one time of day — opening spreads remain
+  uncharacterised.</p>
+  <p><code>ticks.oi</code> carried real values for the first time (1,646,840, moving) against 73,171
+  historical NULLs. The scorer still could not use them: <code>update_oi_data()</code> classifies
+  from the change between two <em>consecutive ticks</em> against a ±1% threshold, and the broker
+  republishes OI in steps — 243 of 246 comparisons were exactly zero, one crossed the threshold.
+  Over the same window OI drifted −1.29%, which is the signal the rule was written to read. A
+  time-baseline option is written and defaulted off.</p>
+</section>
+
+<section>
+  <div class="eyebrow">External cross-check</div>
+  <h2>Where this sits against the population</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr><th></th><th>This bot, 144 trades</th><th>SEBI FY26, all individual F&amp;O traders</th></tr></thead>
+      <tbody>
+        <tr><td>Net losses</td><td class="neg">−₹10,956</td><td class="neg">−₹91,685 crore</td></tr>
+        <tr><td>Transaction costs</td><td>₹9,188</td><td>₹25,000 crore</td></tr>
+        <tr><td>Cost as a share of net loss</td><td class="neg">84%</td><td>27%</td></tr>
+        <tr><td>Turnover vs capital</td><td>67×</td><td>“higher turnover → higher loss rate”</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The bot's loss is three times more friction-dominated than the average losing retail trader's,
+  because it trades one lot at a flat ₹40 per round trip, very often, on a ₹30,000 account. It also
+  sits squarely in the cohort SEBI identifies as worst-performing: option <em>buying</em> (97% of
+  individual traders; 87.7% of them lost money in FY26), small capital, high turnover.</p>
+</section>
+
+<div class="verdict">
+  <p>Gross P&amp;L across 144 trades is −₹12.28 per trade — statistically indistinguishable from
+  zero. The strategy has no measured edge, and it pays ₹63.80 a trade for the privilege of not
+  having one. That is the whole result: <strong>not a tuning problem, a frequency problem.</strong></p>
+</div>
+
+<section>
+  <h2>What this does not establish</h2>
+  <ul>
+    <li>Today is <strong>not a controlled experiment</strong>. Five settings changed inside the
+    session and the bot was restarted six times. Switch times are recorded in
+    <code>logs/2026-09-07/SWITCH_pe_exhaustion_off.txt</code>; nothing here should be attributed to
+    any single one of them.</li>
+    <li>The excursion figures are <strong>n=37 across three sessions</strong>, and they are the bot's
+    own entries rather than a head-to-head against arbitrary timing.</li>
+    <li>The real-spread measurement is one contract over two minutes. It does not characterise the
+    open, other strikes, or other days.</li>
+    <li>Costs are Zerodha's published rates and reflect the Budget 2026 STT rise to 0.15%. A different
+    broker changes the arithmetic; the model takes them as constructor arguments for that reason.</li>
+    <li>Four restarts reset the daily loss counter before that was fixed, so the bot's own
+    <code>Daily:</code> figure for today is wrong. Every number in this report is computed from the
+    trades table, not from that counter.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>What follows from it</h2>
+  <ol>
+    <li><strong>Re-read every prior experiment as gross.</strong> EXP-01 through EXP-11 are all
+    stated before costs and are therefore about ₹64/trade too optimistic, in the same direction.
+    "X3 at −₹24.86 beats control at −₹40.05" compares two numbers both far under water once the
+    trade is paid for.</li>
+    <li><strong>Stop tuning the exit ladder.</strong> Four experiments have now swept both sides of
+    it. Against a signal whose forward distribution is adverse-skewed, no exit policy closes the gap,
+    and the fast loss cut it already uses is the correct response.</li>
+    <li><strong>The next question is the entry, and it has to clear a bar that is now known:</strong>
+    an average win above 3.94 points even at eight lots, 5.30 at one. Nothing measured so far comes
+    close to 2.45.</li>
+    <li><strong>Trade far less often, or not at this size.</strong> With a near-zero gross edge and
+    ₹63.80 of friction, trade count is the dominant term in the P&amp;L and it currently runs the
+    wrong way.</li>
+    <li>Deferred deliberately: the recovery-mode trigger reads all-time <code>total_pnl</code> rather
+    than drawdown from peak, so accumulated lifetime losses will cross 8% once and latch. It needs
+    its own change and its own measurement.</li>
+  </ol>
+</section>
+
+<footer>
+  <p>PTQ scalping bot · session of 2026-09-07 · paper trading · branch
+  <code>experiment/exit-strategy-20260904</code> · 8 commits from <code>88e07d3</code> to
+  <code>e771827</code>. Cost rates from
+  <a href="https://zerodha.com/charges/">Zerodha's published schedule</a>; population figures from
+  <a href="https://openthemagazine.com/business/sebi-fo-loss-study-explained-why-9-in-10-retail-traders-lost-91685-crore-in-fy26">SEBI's FY26 study of individual derivatives traders</a>.
+  All P&amp;L computed from the trades table, read-only.</p>
+</footer>
+</div>

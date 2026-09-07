@@ -47,6 +47,11 @@ def test_cross_direction_fetches_the_target_contract_not_the_subscribed_one():
     broker.current_symbol = 'NIFTY01SEP2624000CE'
     broker.current_strike = 24000
     broker.spot_price = 24050.0
+    # resolve_strike_for_direction() now searches for the opposite direction's own
+    # premium-band strike (see test_snapquote_depth for that behaviour). This test is about
+    # the routing — that the PE's own tick is fetched rather than the CE's reused — so pin
+    # the search to the same strike and leave the assertion below unchanged.
+    broker._find_strike_by_premium = lambda option_type='CE': (24000, 100.0)
     broker._build_option_symbol = lambda strike, option_type: f'NIFTY01SEP2624000{option_type}'
     broker.get_tick = MagicMock(return_value={'ltp': 98.0, 'symbol': 'NIFTY01SEP2624000CE'})
     broker.broker_client = MagicMock()
