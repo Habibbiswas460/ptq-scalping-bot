@@ -113,6 +113,9 @@ RC2_STABILIZATION_AUDIT_2026-07-27_TO_2026-07-31.md
 
 # Telegram preferences written at runtime from the chat menu
 data/telegram_prefs.json
+# Last known-good broker candle fetch, written at warm-up so a restart during an
+# API outage still has 5-minute candles. Runtime data, regenerated on any success.
+data/candle_cache/
 
 # Generated research reports
 claude_code/research_output/

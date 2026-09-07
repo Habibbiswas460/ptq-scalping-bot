@@ -10,6 +10,7 @@ Changes from original:
 """
 
 import json
+import os
 import time
 import math
 import random
@@ -17,7 +18,7 @@ import requests
 import threading
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 from brokers.angel_one import AngelOneClient
 from utils.logger import BotLogger
@@ -38,6 +39,7 @@ from config.constants import (
     USE_LIMIT_ORDERS, LIMIT_ORDER_OFFSET, MAX_SLIPPAGE_PCT,
     ORDER_RETRY_ENABLED, ORDER_MAX_RETRIES, ORDER_RETRY_DELAY_MS, ORDER_PRICE_CHASE_STEP,
     TICK_OI_ENABLED,
+    WS_OPTION_SUB_MODE,
     MARKET_OPEN_TIME,
     NIFTY_SPOT_TOKEN,
     SCRIP_MASTER_URL,
@@ -488,14 +490,14 @@ class BrokerInterface:
             if self._ws_connected and self.broker_client and self._option_token:
                 try:
                     # 1. Subscribe to new token FIRST (so data flow doesn't break)
-                    if not self._subscribe_with_retry([(EXCHANGE, self._option_token, 2)]):
+                    if not self._subscribe_with_retry([(EXCHANGE, self._option_token, WS_OPTION_SUB_MODE)]):
                         self.logger.warning(f"⚠ WebSocket re-subscribe failed for {self._option_token}")
                     else:
                         self.logger.info(f"🔌 WebSocket re-subscribed to {self.current_symbol}")
 
                     # 2. Unsubscribe old token SECOND
                     if old_token and old_token != self._option_token:
-                        if not self._unsubscribe_with_verify([(EXCHANGE, old_token, 2)]):
+                        if not self._unsubscribe_with_verify([(EXCHANGE, old_token, WS_OPTION_SUB_MODE)]):
                             self.logger.warning(f"⚠ Old token unsubscribe failed: {old_token}")
 
                 except Exception as e:
@@ -655,7 +657,7 @@ class BrokerInterface:
         )
 
         try:
-            if not self._subscribe_with_retry([(EXCHANGE, option_token, 2)], retries=1, timeout_sec=5):
+            if not self._subscribe_with_retry([(EXCHANGE, option_token, WS_OPTION_SUB_MODE)], retries=1, timeout_sec=5):
                 return False
         except Exception as e:
             self.logger.warning(f"⚠ Forced re-subscribe failed before order: {e}")
@@ -754,13 +756,14 @@ class BrokerInterface:
                 self.logger.warning("⚠ WebSocket connection failed or timed out, will use REST polling")
                 return
 
-            # Subscribe spot first (LTP mode), then option (Quote mode)
+            # Subscribe spot first (LTP mode), then option (Quote or SnapQuote,
+            # per WS_SNAP_QUOTE_ENABLED — SnapQuote is what carries OI and the book)
             spot_tokens = [
                 ("NSE", NIFTY_SPOT_TOKEN, 1),  # NIFTY spot — LTP mode
             ]
             option_tokens = []
             if self._option_token:
-                option_tokens.append((EXCHANGE, self._option_token, 2))  # Option — Quote mode
+                option_tokens.append((EXCHANGE, self._option_token, WS_OPTION_SUB_MODE))  # Option
 
             spot_ok = self._subscribe_with_retry(spot_tokens)
             option_ok = True
@@ -1030,7 +1033,9 @@ class BrokerInterface:
                 if not ltp or ltp <= 0:
                     return
 
-                # Build tick dict with bid/ask from Quote mode
+                # Build tick dict with bid/ask from the best-5 book. Present only on a
+                # SnapQuote subscription (WS_SNAP_QUOTE_ENABLED); in Quote mode these keys
+                # are absent and the estimate below is what every historical row holds.
                 bid = tick_data.get('best_bid_price', 0) or ltp
                 ask = tick_data.get('best_ask_price', 0) or ltp
                 volume = tick_data.get('volume', 0) or 0
@@ -1239,10 +1244,10 @@ class BrokerInterface:
                                     self._tick_buffer.clear()
 
                                 if old_token:
-                                    if not self._unsubscribe_with_verify([(EXCHANGE, old_token, 2)]):
+                                    if not self._unsubscribe_with_verify([(EXCHANGE, old_token, WS_OPTION_SUB_MODE)]):
                                         self.logger.warning(f"⚠ Old token unsubscribe failed: {old_token}")
 
-                                if not self._subscribe_with_retry([(EXCHANGE, self._option_token, 2)]):
+                                if not self._subscribe_with_retry([(EXCHANGE, self._option_token, WS_OPTION_SUB_MODE)]):
                                     self.logger.warning(f"⚠ WebSocket re-subscribe failed for {self._option_token}")
                                 else:
                                     self.logger.info(f"🔌 WebSocket re-subscribed after strike adjust: {old_symbol} → {self.current_symbol}")
@@ -1317,6 +1322,7 @@ class BrokerInterface:
 
                 if formatted:
                     self._historical_candles_cache[cache_key] = {"candles": formatted, "cached_at": now}
+                    self._save_candle_cache(cache_key, formatted, now)
                     if self.logger:
                         self.logger.info(f"📊 Fetched {len(formatted)} historical candles for {exchange}:{token}")
                     return formatted
@@ -1346,7 +1352,61 @@ class BrokerInterface:
                 )
             return cached["candles"]
 
+        # The in-memory cache above only helps a process that has already fetched once, so it
+        # is empty in the case that matters: the warm-up at startup. On 2026-09-07 two
+        # restarts inside eight minutes both hit "exceeding access rate" on this endpoint and
+        # both logged "Strategy indicators will start from zero" — after which EMA9 and EMA21
+        # were rebuilt from a couple of minutes of ticks and sat 0.1-0.7 points apart, against
+        # 16 points from the 5-minute candles, and the chop filter rejected everything. A
+        # disk copy of the last good fetch survives the restart that the memory cache cannot.
+        disk = self._load_candle_cache(cache_key)
+        if disk:
+            candles, saved_at = disk
+            if self.logger:
+                self.logger.warning(
+                    f"💾 Historical API unavailable — warming up from the on-disk candle cache "
+                    f"for {exchange}:{token} ({len(candles)} candles, saved {saved_at})"
+                )
+            self._historical_candles_cache[cache_key] = {"candles": candles, "cached_at": datetime.now()}
+            return candles
+
         return []
+
+    # ---- on-disk fallback for the warm-up fetch -----------------------------
+
+    def _candle_cache_path(self, cache_key: str) -> str:
+        safe = cache_key.replace(":", "_")
+        return os.path.join("data", "candle_cache", f"{safe}.json")
+
+    def _save_candle_cache(self, cache_key: str, candles: List[Dict[str, Any]], when: datetime) -> None:
+        """Best-effort: a failure to cache must never break a successful fetch."""
+        try:
+            path = self._candle_cache_path(cache_key)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"saved_at": when.strftime("%Y-%m-%d %H:%M:%S"),
+                           "cache_key": cache_key, "candles": candles}, fh)
+            os.replace(tmp, path)          # atomic, so a crash cannot leave a half-written cache
+        except Exception as e:
+            if self.logger:
+                self.logger.debug(f"Candle cache write skipped for {cache_key}: {e}")
+
+    def _load_candle_cache(self, cache_key: str) -> Optional[Tuple[List[Dict[str, Any]], str]]:
+        try:
+            path = self._candle_cache_path(cache_key)
+            if not os.path.exists(path):
+                return None
+            with open(path, encoding="utf-8") as fh:
+                blob = json.load(fh)
+            candles = blob.get("candles") or []
+            if not candles:
+                return None
+            return candles, str(blob.get("saved_at", "unknown"))
+        except Exception as e:
+            if self.logger:
+                self.logger.debug(f"Candle cache read skipped for {cache_key}: {e}")
+            return None
 
     # =========================================================================
     # GET TICK — unified entry point
@@ -1715,7 +1775,7 @@ class BrokerInterface:
                             self._tick_buffer.clear()
                         
                         # 1. Subscribe to new token FIRST to ensure data flow
-                        if not self._subscribe_with_retry([(EXCHANGE, self._option_token, 2)]):
+                        if not self._subscribe_with_retry([(EXCHANGE, self._option_token, WS_OPTION_SUB_MODE)]):
                             self.logger.warning(f"⚠ WebSocket re-subscribe failed for {self._option_token}")
                             return None
 
@@ -1723,7 +1783,7 @@ class BrokerInterface:
 
                         # 2. Unsubscribe old token SECOND
                         if old_token and old_token != self._option_token:
-                            if not self._unsubscribe_with_verify([(EXCHANGE, old_token, 2)]):
+                            if not self._unsubscribe_with_verify([(EXCHANGE, old_token, WS_OPTION_SUB_MODE)]):
                                 self.logger.warning(f"⚠ Old token unsubscribe failed: {old_token}")
 
                     except Exception as e:

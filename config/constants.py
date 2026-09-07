@@ -182,6 +182,45 @@ EXIT_REALISED_ATR_WINDOW_SEC = env_int('EXIT_REALISED_ATR_WINDOW_SEC', 60)
 # ═══════════════════════════════════════════════════════════════════════════
 TICK_DELTA_ENABLED = env_bool('TICK_DELTA_ENABLED', False)
 TICK_OI_ENABLED = env_bool('TICK_OI_ENABLED', False)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WEBSOCKET SUBSCRIPTION MODE — the reason TICK_OI_ENABLED never worked
+# ═══════════════════════════════════════════════════════════════════════════
+# Option tokens are subscribed in mode 2 (QUOTE). Open interest lives at bytes
+# 131:139 and the best-5 book at 147:347, and BOTH are only present in mode 3
+# (SNAP_QUOTE). So TICK_OI_ENABLED has been reading a field the subscription
+# never asked for: on 2026-09-07 it turned ticks.oi from NULL into 0 on every
+# row and never once produced a real value. The same gap is why every persisted
+# bid/ask in this project is broker.py's ltp +/- 0.3% estimate — the depth block
+# it wants was neither subscribed to nor parsed.
+#
+# Enabling this CHANGES LIVE DATA: larger packets, a real spread where there was
+# a fabricated one, and a live oi component that has been pinned NEUTRAL. Default
+# OFF so a checkout reproduces current behaviour; measure it on its own session.
+WS_SNAP_QUOTE_ENABLED = env_bool('WS_SNAP_QUOTE_ENABLED', False)
+WS_OPTION_SUB_MODE = 3 if WS_SNAP_QUOTE_ENABLED else 2
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DIRECTIONAL TREND-EXHAUSTION FILTER (smart_scalp_v3)
+# ═══════════════════════════════════════════════════════════════════════════
+# "RSI oversold + MACD rising = bounce coming, don't buy PE" and its CE mirror.
+# Both thresholds were hardcoded. On 2026-09-07 the PE half rejected 986 of 986
+# evaluations before scoring — a whole session with not one scored signal — in a
+# downtrend at RSI 17.7. EXP-11 could not show the directional blocks earn their
+# rejections (p=0.305) and could not show they cost anything either, so the
+# project's standing decision was "no action". Making the thresholds settable is
+# what turns that stalemate into something a session can answer.
+#
+# Defaults reproduce the hardcoded behaviour exactly (30 / 70), so a checkout
+# without .env is unchanged. Set an RSI threshold to 0 to disable that half:
+# `rsi < 0` is never true. ENABLED=false disables both halves at once.
+#
+# This filter is NOT the SL-streak direction block. That one lives in
+# state_machine.is_direction_blocked(), measured to have saved Rs2,042, and is
+# deliberately left alone by all of these settings.
+DIRECTIONAL_EXHAUSTION_ENABLED = env_bool('DIRECTIONAL_EXHAUSTION_ENABLED', True)
+PE_EXHAUSTION_RSI = env_float('PE_EXHAUSTION_RSI', 30)   # PE blocked when rsi < this and MACD rising
+CE_EXHAUSTION_RSI = env_float('CE_EXHAUSTION_RSI', 70)   # CE blocked when rsi > this and MACD falling
 RSI_REVERSAL_CE_EXIT = env_float('RSI_REVERSAL_CE_EXIT', 60)      # CE: exit once RSI drops back below this
 RSI_REVERSAL_PE_EXIT = env_float('RSI_REVERSAL_PE_EXIT', 40)      # PE: exit once RSI rises back above this
 RSI_REVERSAL_CE_EXTREME = env_float('RSI_REVERSAL_CE_EXTREME', 75)  # CE: must have seen RSI above this before a reversal counts
