@@ -340,3 +340,59 @@ def test_idle_block_is_logged_once_per_reason():
     assert len(lg.msgs) == 1
     _log_idle_block(s, lg, "limits", "Streak pause active, 3min remaining")
     assert len(lg.msgs) == 2
+
+
+# ── the daily loss ceiling must survive a restart ───────────────────────────
+
+def _rm_with_state(tmpdir, config=None):
+    """A RiskManager rooted at tmpdir, so it reads/writes logs/risk_state.json there."""
+    from core.risk.risk_manager import RiskManager
+
+    cfg = config or {
+        "capital": {"total_capital": 30000},
+        "risk_management": {"pause_after_consecutive_loss_sec": 900,
+                            "consecutive_loss_limit": 2, "consecutive_win_limit": 5},
+    }
+    return RiskManager(cfg, logger=None)
+
+
+def test_daily_pnl_survives_a_restart_on_the_same_day():
+    """MAX_DAILY_LOSS_AMOUNT and the kill switch are measured against daily_pnl. It was
+    never persisted, so each restart handed the bot a fresh full loss budget."""
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            os.chdir(tmp)
+            r = _rm_with_state(tmp)
+            r.daily_pnl = -2900.0
+            r._save_state()
+
+            again = _rm_with_state(tmp)                      # "restart"
+            assert again.daily_pnl == -2900.0
+        finally:
+            os.chdir(cwd)
+
+
+def test_a_new_day_starts_the_ceiling_at_zero():
+    import json as _json
+    from datetime import date, timedelta
+
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            os.chdir(tmp)
+            r = _rm_with_state(tmp)
+            r.daily_pnl = -2900.0
+            r._save_state()
+
+            path = os.path.join(tmp, "logs", "risk_state.json")
+            with open(path) as fh:
+                blob = _json.load(fh)
+            blob["daily_date"] = (date.today() - timedelta(days=1)).isoformat()
+            with open(path, "w") as fh:
+                _json.dump(blob, fh)
+
+            again = _rm_with_state(tmp)
+            assert again.daily_pnl == 0.0, "yesterday's loss must not eat today's budget"
+        finally:
+            os.chdir(cwd)
