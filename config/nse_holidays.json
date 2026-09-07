@@ -1,6 +1,47 @@
 {
   "note": "NSE trading holidays. Dates here are treated as authoritative: market_open() returns False on them and next_trading_day() skips them. Anything not listed is 'unknown', not 'trading' - utils/trading_calendar.py never invents a date. Populate it from the broker with: ./venv/bin/python -m utils.trading_calendar fetch 2026-01-01 2026-12-31 (asks for NIFTY spot candles and records the weekdays that produced none), or add entries by hand from the NSE circular.",
-  "source": "",
-  "updated": "",
-  "holidays": []
+  "source": "broker candles 2026-01-01..2026-12-31",
+  "updated": "2026-09-07T00:13:26",
+  "holidays": [
+    {
+      "date": "2026-01-15",
+      "name": "no NIFTY candle on a weekday"
+    },
+    {
+      "date": "2026-01-26",
+      "name": "no NIFTY candle on a weekday"
+    },
+    {
+      "date": "2026-03-03",
+      "name": "no NIFTY candle on a weekday"
+    },
+    {
+      "date": "2026-03-26",
+      "name": "no NIFTY candle on a weekday"
+    },
+    {
+      "date": "2026-03-31",
+      "name": "no NIFTY candle on a weekday"
+    },
+    {
+      "date": "2026-04-03",
+      "name": "no NIFTY candle on a weekday"
+    },
+    {
+      "date": "2026-04-14",
+      "name": "no NIFTY candle on a weekday"
+    },
+    {
+      "date": "2026-05-01",
+      "name": "no NIFTY candle on a weekday"
+    },
+    {
+      "date": "2026-05-28",
+      "name": "no NIFTY candle on a weekday"
+    },
+    {
+      "date": "2026-06-26",
+      "name": "no NIFTY candle on a weekday"
+    }
+  ]
 }

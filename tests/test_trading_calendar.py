@@ -176,10 +176,24 @@ def test_writing_does_not_drop_what_was_already_declared(tmp_path):
     assert dt.date(2026, 10, 2) in declared
 
 
-def test_the_shipped_calendar_is_empty_and_says_so():
-    """It ships empty on purpose: dates nobody verified are worse than a known gap."""
+def test_the_shipped_calendar_says_where_its_dates_came_from():
+    """Dates nobody can trace are worse than a known gap.
+
+    This used to assert the file was empty, which was right only while nothing had ever
+    filled it: the moment `fetch` wrote the broker's own answer in, a correct calendar
+    failed the suite. Empty was never the property worth pinning - provenance is. So an
+    empty file still passes, and a populated one has to say what produced it.
+    """
     from config.constants import NSE_HOLIDAY_FILE
 
     blob = json.loads(open(NSE_HOLIDAY_FILE, encoding="utf-8").read())
-    assert blob["holidays"] == []
     assert "unknown" in blob["note"]
+
+    entries = blob["holidays"]
+    if entries:
+        assert blob["source"], "a populated calendar must name its source"
+        assert blob["updated"], "a populated calendar must say when it was written"
+    for item in entries:
+        assert dt.date.fromisoformat(item["date"]).weekday() < 5, \
+            f"{item['date']} is a weekend; the calendar is for holidays the code can miss"
+        assert item.get("name"), f"{item['date']} has no reason attached"
