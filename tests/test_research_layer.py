@@ -193,8 +193,12 @@ def test_regression_refuses_a_thin_sample():
 
 # ── provenance ────────────────────────────────────────────────────────────
 def test_fabricated_and_missing_fields_are_labelled():
-    assert prov.state("bid") == prov.ESTIMATED
-    assert prov.state("oi") == prov.MISSING
+    # bid and oi were ESTIMATED / MISSING until 2026-09-07 13:28:53, when the mode-3
+    # subscription was switched on mid-session and the same table began holding both. A single
+    # state for either is now a false statement about a third of that day's rows, so they read
+    # MIXED and the per-row answer comes from research.depth — see test_depth_instrument.py.
+    assert prov.state("bid") == prov.MIXED
+    assert prov.state("oi") == prov.MIXED
     assert prov.state("regime") == prov.MISSING
     assert prov.state("delta") == prov.RECONSTRUCTED
     assert prov.state("spot") == prov.REAL

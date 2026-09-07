@@ -23,7 +23,8 @@ from research.visual.build import build_session, candle_rows, normalized_series,
 from research.visual.store import Reader, Store
 
 T0 = dt.datetime(2026, 9, 4, 10, 0, 0)
-STATES = {vschema.REAL, vschema.RECONSTRUCTED, vschema.ESTIMATED, vschema.MISSING}
+STATES = {vschema.REAL, vschema.RECONSTRUCTED, vschema.ESTIMATED, vschema.MISSING,
+          vschema.MIXED}
 
 
 def ramp(n, step_sec, fn, start=T0):

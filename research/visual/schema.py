@@ -33,10 +33,14 @@ INDICATOR_TIMEFRAMES = ("1m", "5m")
 #   ESTIMATED     a model or a fabricated input is involved somewhere in the chain
 #                 (anything downstream of the synthetic bid/ask, Black-Scholes delta)
 #   MISSING       not present in the source; recorded as absent, never filled in
+#   MIXED         the same column holds measured and fabricated rows, because a source was
+#                 switched on mid-session (bid/ask/oi on 2026-09-07 at 13:28:53). A chart must
+#                 split on research.depth.quote_origin() per row rather than paint one colour.
 REAL = "real"
 RECONSTRUCTED = "reconstructed"
 ESTIMATED = "estimated"
 MISSING = "missing"
+MIXED = "mixed"
 
 LEG_THRESHOLDS = (5.0, 10.0, 15.0, 25.0)
 

@@ -108,6 +108,11 @@ letter-spacing:.08em;text-transform:uppercase;padding:2px 6px;border-radius:2px;
 .c-reconstructed{background:var(--c-reconstructed-bg);color:var(--c-reconstructed)}
 .c-missing{background:var(--c-missing-bg);color:var(--c-missing)}
 .c-invalid{background:var(--c-invalid-bg);color:var(--c-invalid)}
+/* MIXED is literally two states in one field, so the chip is two colours: half the REAL
+   ground, half the ESTIMATED ground. It reuses existing tokens, so it follows both themes
+   without adding a palette entry that would then need its own dark value. */
+.c-mixed{background:linear-gradient(90deg,var(--c-real-bg) 0 50%,var(--c-estimated-bg) 50%);
+color:var(--ink);box-shadow:inset 0 0 0 1px var(--rule)}
 .c-live-only{background:var(--c-live-only-bg);color:var(--c-live-only)}
 .flag{border:1px solid var(--rule);border-left:3px solid var(--dn);background:var(--surface);
 padding:12px 15px;margin:0 0 16px}

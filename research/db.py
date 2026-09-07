@@ -126,7 +126,12 @@ class Book:
         return self._c[k]
 
     def option_quotes(self, symbol: str, day: str) -> List[Dict]:
-        """Full quote rows. bid/ask are fabricated — see provenance before using them."""
+        """Full quote rows.
+
+        bid/ask are fabricated on every row before 2026-09-07 13:28:53 and real after it, so
+        never treat the column as one thing: call `research.depth.quote_origin(ltp, bid, ask,
+        has_oi)` per row. Same for `oi`, which rides the same packet.
+        """
         k = ("q", symbol, day)
         if k not in self._c:
             self._c[k] = [{"t": parse_ts(r["timestamp"]), "ltp": r["ltp"], "bid": r["bid"],

@@ -189,6 +189,13 @@ def render_indicator(rows: Sequence[Dict], field: str, *, title: str,
     if prov == "missing":
         return "", (f"{field}: MISSING — {len({r['text_value'] for r in series}) } distinct "
                     f"value(s); not drawn")
+    if prov == "mixed":
+        # One line cannot honestly carry both. On 2026-09-07 the mode-3 subscription came up
+        # at 13:28:53, so bid/ask/oi and everything downstream are measured after it and
+        # fabricated before it, in the same column. Drawn as a single series the fabricated
+        # two-thirds would read exactly like the measured third.
+        return "", (f"{field}: MIXED — measured and fabricated rows in one column; split on "
+                    f"research.depth.quote_origin() before drawing it")
     if len(values) < 2:
         return "", f"{field}: fewer than two observations; not drawn"
     if len(set(values)) <= 1:
