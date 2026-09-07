@@ -72,6 +72,20 @@ class PositionSizeEngine:
             # (e.g. ATR widened the SL from 6pts to 7pts), round up to 1 lot
             # instead of silently zeroing the trade. 0.05 = up to 5% short.
             "min_lot_rounding_tolerance_pct": 0.05,
+            # A soft multiplier must never silently become a trading halt.
+            # NIFTY's minimum tradeable position is one 65-lot, which at SL 8 risks
+            # Rs520 against a Rs900 per-trade budget: any multiplier below 0.578
+            # computes a position that cannot be executed. Recovery mode's "size 50%"
+            # lands at 0.4936, so on 2026-09-07 it produced 87 consecutive blocked
+            # entries — not smaller trades, no trades. "Reduce size" is a preference;
+            # with a one-lot floor the only sizes that exist are one lot or nothing,
+            # and nothing was never the configured intent.
+            #
+            # When this is on and the soft multiplier alone zeroed the position, fall
+            # back to one lot -- but ONLY if the HARD budget (remaining daily loss
+            # capacity, per-trade cap, available capital) can fund it. Those are
+            # limits, not preferences, and they must still be able to stop a trade.
+            "min_lot_floor_enabled": False,
         },
         "allocation_grades": {
             "A+": 1.02,
@@ -176,6 +190,19 @@ class PositionSizeEngine:
         ):
             lots = 1
             cap_reason = self._append_reason(cap_reason, "rounded_up_min_lot")
+
+        # Soft-multiplier floor: see min_lot_floor_enabled above. The comparison is
+        # against the hard budget with the soft multiplier removed, so a genuine risk
+        # ceiling still zeroes the trade while a preference no longer can.
+        if lots == 0 and lot_risk > 0 and bool(self.config["safety_caps"].get("min_lot_floor_enabled", False)):
+            hard_budget, _, _ = self._apply_risk_caps(
+                base_risk_amount, capital_value, risk_budget, recovery_mode
+            )
+            if hard_budget >= lot_risk:
+                lots = 1
+                cap_reason = self._append_reason(cap_reason, "floored_to_min_lot")
+            else:
+                cap_reason = self._append_reason(cap_reason, "hard_budget_below_one_lot")
 
         max_lots = int(self.config["safety_caps"]["max_lots"])
         if lots > max_lots:

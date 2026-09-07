@@ -87,6 +87,22 @@ class RiskManager:
                     self.total_pnl = state.get('total_pnl', 0)
                     self.peak_equity = state.get('peak_equity', self.current_equity)
                     self.recovery_mode = state.get('recovery_mode', False)
+                    # recovery_mode was persisted and recovery_start_date was not, so after
+                    # any restart check_recovery_mode()'s exit branch is guarded by
+                    # `if self.recovery_start_date:` on a None — the mode could be entered
+                    # but never left. Combined with the sizing halt it made recovery
+                    # permanent: no trades, so total_pnl can never climb back under the
+                    # 3% exit threshold that is never tested anyway.
+                    rsd = state.get('recovery_start_date')
+                    if rsd:
+                        try:
+                            self.recovery_start_date = datetime.fromisoformat(rsd)
+                        except (TypeError, ValueError):
+                            self.recovery_start_date = None
+                    if self.recovery_mode and self.recovery_start_date is None:
+                        # Entered before this field was saved: start the clock now rather
+                        # than leaving the exit unreachable forever.
+                        self.recovery_start_date = datetime.now()
                     self.equity_history = state.get('equity_history', [])[-30:]
                     last_updated = state.get('last_updated')
                     if last_updated:
@@ -120,6 +136,8 @@ class RiskManager:
                 'total_pnl': self.total_pnl,
                 'peak_equity': self.peak_equity,
                 'recovery_mode': self.recovery_mode,
+                'recovery_start_date': (self.recovery_start_date.isoformat()
+                                        if self.recovery_start_date else None),
                 'equity_history': self.equity_history[-30:],
                 'daily_pnl': self.daily_pnl,
                 'daily_date': datetime.now().date().isoformat(),

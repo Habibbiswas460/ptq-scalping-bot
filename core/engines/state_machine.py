@@ -847,7 +847,19 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
 
     if adjusted_qty <= 0:
         cap_reason = allocation.get('cap_reason') or 'allocator_zero_quantity'
-        logger.warning(f"⚠ POSITION SIZE BLOCKED: qty=0 | reason={cap_reason}")
+        # "allocator_zero_quantity" on its own says only that the sizing produced nothing —
+        # not whether a risk cap bit, or the budget simply could not fund one lot. Those need
+        # opposite responses, and on 2026-09-07 the bare message left 87 consecutive blocks
+        # (every accepted signal for over 90 minutes) unexplainable from the logs. Print the
+        # arithmetic that decided it.
+        _b = allocation.get('breakdown', {}) or {}
+        _lot_risk = float(sl_points) * float(lot_size)
+        logger.warning(
+            f"⚠ POSITION SIZE BLOCKED: qty=0 | reason={cap_reason} | "
+            f"sl_points={sl_points} x lot={lot_size} = one lot needs Rs{_lot_risk:.0f} | "
+            f"requested=Rs{_b.get('requested_risk_amount')} "
+            f"(multiplier={_b.get('soft_allocation_multiplier')}) | capped={allocation.get('capped')}"
+        )
         logger.state_change("ENTRY_READY", "COOLDOWN", f"Allocator: {cap_reason}")
         state.cooldown_until = now() + timedelta(seconds=COOLDOWN_NON_TRADE_BLOCK_SEC)
         return "COOLDOWN"

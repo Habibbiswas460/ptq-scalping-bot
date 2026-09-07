@@ -331,6 +331,9 @@ POSITION_SIZE_ENV_CONFIG = {
         "daily_risk_cap_pct": env_float('POS_SIZE_DAILY_RISK_CAP_PCT', 0.03),
         "recovery_mode_cap_pct": env_float('POS_SIZE_RECOVERY_MODE_CAP_PCT', 0.50),
         "min_lot_rounding_tolerance_pct": env_float('POS_SIZE_MIN_LOT_ROUNDING_TOLERANCE_PCT', 0.05),
+        # See position_size_engine's safety_caps comment. Default off: a checkout keeps
+        # today's behaviour, where a soft size reduction below one lot blocks the trade.
+        "min_lot_floor_enabled": env_bool('POS_SIZE_MIN_LOT_FLOOR_ENABLED', False),
     },
     "allocation_grades": {
         "A+": env_float('POS_SIZE_GRADE_A_PLUS', 1.02),
