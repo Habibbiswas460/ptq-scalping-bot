@@ -411,7 +411,7 @@ left alone on purpose — each of these is a live recommendation waiting on your
 ```bash
 cd "/home/lora/projects/PTQ-scalping bot"
 ./venv/bin/python -m utils.preflight        # expect: READY — nothing blocking
-./venv/bin/python -m pytest tests/ -q       # expect: 691 passed, 1 skipped
+./venv/bin/python -m pytest tests/ -q       # expect: 717 passed, 1 skipped
 git log --oneline -7                        # 7 commits, NOT pushed — yours to push
 ```
 
