@@ -237,6 +237,23 @@ WS_OPTION_SUB_MODE = 3 if WS_SNAP_QUOTE_ENABLED else 2
 CROSS_DIRECTION_STRIKE_ENABLED = env_bool('CROSS_DIRECTION_STRIKE_ENABLED', False)
 CROSS_DIRECTION_STRIKE_TTL_SEC = env_float('CROSS_DIRECTION_STRIKE_TTL_SEC', 60)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# OI CHANGE BASELINE — the third layer of the open-interest defect
+# ═══════════════════════════════════════════════════════════════════════════
+# update_oi_data() classifies buildup/unwinding from the OI change between two
+# CONSECUTIVE TICKS, against a +/-1% threshold. Ticks arrive about once a second
+# and the broker only republishes OI in steps, so measured on the first session
+# that ever carried real OI (2026-09-07, 246 comparisons): 243 were exactly zero,
+# 3 were non-zero, and 1 crossed the threshold. 99.6% of evaluations therefore saw
+# NEUTRAL, which pins the score's oi component to 0 of 10 and confidence's
+# oi_score to 50 — the same shape of defect as the unpopulated `atr`.
+#
+# Over a meaningful interval the same window drifted -1.29%, which is the signal
+# the rule was written to read. Set this to the number of seconds of baseline to
+# compare against (300 = five minutes). 0 keeps the tick-to-tick behaviour, so it
+# is the default and a checkout is unchanged.
+OI_CHANGE_WINDOW_SEC = env_float('OI_CHANGE_WINDOW_SEC', 0)
+
 DIRECTIONAL_EXHAUSTION_ENABLED = env_bool('DIRECTIONAL_EXHAUSTION_ENABLED', True)
 PE_EXHAUSTION_RSI = env_float('PE_EXHAUSTION_RSI', 30)   # PE blocked when rsi < this and MACD rising
 CE_EXHAUSTION_RSI = env_float('CE_EXHAUSTION_RSI', 70)   # CE blocked when rsi > this and MACD falling

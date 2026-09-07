@@ -23,6 +23,7 @@ Backtest Results (6 months):
 """
 
 import json
+import time as _time
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 from datetime import datetime
@@ -57,6 +58,7 @@ from config.constants import (
     ATR_LOW_SL_ADJUSTMENT, ATR_LOW_TP_ADJUSTMENT,
     ATR_SL_MIN_POINTS, ATR_TP_MIN_POINTS,
     DIRECTIONAL_EXHAUSTION_ENABLED, PE_EXHAUSTION_RSI, CE_EXHAUSTION_RSI,
+    OI_CHANGE_WINDOW_SEC,
 )
 
 try:
@@ -159,6 +161,8 @@ class SmartScalpV3:
         self._last_oi = None
         self._prev_oi = None
         self._oi_change_pct = 0.0
+        # (monotonic seconds, oi, price) samples, only used when OI_CHANGE_WINDOW_SEC > 0
+        self._oi_history = deque(maxlen=4000)
         self._last_price = None
         self._recent_valid_premiums = deque(maxlen=30)
     
@@ -276,8 +280,26 @@ class SmartScalpV3:
         
         # Use a stable previous price if available
         prev_price = self._last_price if self._last_price is not None else current_price
-        oi_change = current_oi - self._last_oi
-        oi_change_pct = (oi_change / self._last_oi * 100) if self._last_oi > 0 else 0
+        base_oi = self._last_oi
+
+        if OI_CHANGE_WINDOW_SEC > 0:
+            # Compare against where OI and price were OI_CHANGE_WINDOW_SEC ago rather than
+            # against the previous tick. The broker republishes OI in steps, so tick-to-tick
+            # it is almost always unchanged and the +/-1% test below can essentially never
+            # fire; over a real interval the same series moves by percent.
+            nowt = _time.monotonic()
+            self._oi_history.append((nowt, current_oi, current_price))
+            cutoff = nowt - OI_CHANGE_WINDOW_SEC
+            older = [h for h in self._oi_history if h[0] <= cutoff]
+            if older:
+                base_oi = older[-1][1]
+                prev_price = older[-1][2]
+            else:
+                base_oi = self._oi_history[0][1]
+                prev_price = self._oi_history[0][2]
+
+        oi_change = current_oi - base_oi
+        oi_change_pct = (oi_change / base_oi * 100) if base_oi > 0 else 0
         self._oi_change_pct = oi_change_pct
         
         price_up = current_price > prev_price

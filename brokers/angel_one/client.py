@@ -1798,16 +1798,27 @@ class AngelOneClient:
             return None
 
         _, bid, ask, bid_qty, ask_qty = best
-        # A book that does not contain the last trade is not a book we understand; better to
-        # fall back than to publish a quote whose own ltp sits outside it.
-        if not (bid <= ltp <= ask):
-            if not self._best5_warned:
-                self._best5_warned = True
-                self.logger.warning(
-                    f"⚠ best-5 depth rejected: ltp {ltp} outside bid {bid} / ask {ask} "
-                    "— keeping the estimated spread"
-                )
-            return None
+        # What actually has to be caught here is a book read the wrong way round, and the
+        # assignment search above already does that: for two disjoint price groups only one
+        # ordering can give bid <= ask, so a swapped book cannot survive it.
+        #
+        # This second check is only against a misread packet — wrong offsets would give
+        # absurd numbers, not slightly-off ones. It first required bid <= ltp <= ask, which
+        # is not true of a real book: the last trade routinely sits a tick outside the
+        # current quote because the book moved after it. Live at 13:28:53 that threw away a
+        # perfectly good 185.50/185.95 quote for an ltp of 185.40. Generous bounds instead,
+        # sized to catch garbage rather than to police normal drift.
+        if ltp > 0:
+            spread = ask - bid
+            mid = (bid + ask) / 2.0
+            if spread > 0.10 * ltp or abs(mid - ltp) > 0.05 * ltp:
+                if not self._best5_warned:
+                    self._best5_warned = True
+                    self.logger.warning(
+                        f"⚠ best-5 depth rejected as implausible: bid {bid} / ask {ask} "
+                        f"against ltp {ltp} — keeping the estimated spread"
+                    )
+                return None
         return {
             'best_bid_price': bid,
             'best_ask_price': ask,
