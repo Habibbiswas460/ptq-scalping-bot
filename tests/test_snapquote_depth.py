@@ -69,11 +69,25 @@ def test_picks_the_best_level_on_each_side_not_the_first(client):
     assert out["best_ask_price"] == 100.4      # lowest ask
 
 
-def test_rejects_a_book_that_does_not_contain_the_last_trade(client):
-    """A quote whose own ltp sits outside it is not understood, so the caller keeps its
-    estimate rather than publishing a wrong spread."""
+def test_accepts_a_book_the_last_trade_sits_just_outside(client):
+    """Seen live at 13:28:53 on 2026-09-07: ltp 185.40 against a 185.50/185.95 book. The
+    last trade routinely sits a tick outside the current quote because the book moved after
+    it; an earlier bid <= ltp <= ask rule threw that away."""
+    block = _block(0, [185.5, 185.4], [185.95, 186.0])
+    out = client._parse_best5(block, ltp=185.4)
+    assert out["best_bid_price"] == 185.5
+    assert out["best_ask_price"] == 185.95
+
+
+def test_rejects_a_book_nowhere_near_the_last_trade(client):
+    """Wrong byte offsets give absurd numbers, not slightly-off ones."""
     block = _block(0, [100.0, 99.5], [100.4, 100.9])
-    assert client._parse_best5(block, ltp=105.0) is None
+    assert client._parse_best5(block, ltp=5000.0) is None
+
+
+def test_rejects_an_absurdly_wide_book(client):
+    block = _block(0, [50.0], [150.0])
+    assert client._parse_best5(block, ltp=100.0) is None
 
 
 def test_warns_only_once_for_a_rejected_book(client):
@@ -81,7 +95,7 @@ def test_warns_only_once_for_a_rejected_book(client):
     client.logger.warning = lambda msg, *a, **k: seen.append(msg)
     block = _block(0, [100.0], [100.4])
     for _ in range(5):
-        client._parse_best5(block, ltp=105.0)
+        client._parse_best5(block, ltp=5000.0)
     assert len(seen) == 1
 
 
@@ -396,3 +410,71 @@ def test_a_new_day_starts_the_ceiling_at_zero():
             assert again.daily_pnl == 0.0, "yesterday's loss must not eat today's budget"
         finally:
             os.chdir(cwd)
+
+
+# ── OI change baseline: tick-to-tick can essentially never fire ─────────────
+
+def _strategy():
+    from strategies.smart_scalp_v3 import SmartScalpV3
+    s = SmartScalpV3.__new__(SmartScalpV3)
+    s._last_oi = None
+    s._prev_oi = None
+    s._oi_change_pct = 0.0
+    s._last_price = None
+    from collections import deque as _dq
+    s._oi_history = _dq(maxlen=4000)
+    return s
+
+
+def test_tick_to_tick_oi_barely_ever_crosses_the_threshold(monkeypatch):
+    """Real numbers from 2026-09-07, the first session that ever carried live OI: the broker
+    republishes OI in steps, so 243 of 246 consecutive-tick changes were exactly zero and
+    only one crossed +/-1%. The classifier therefore returns NEUTRAL almost always."""
+    from strategies import smart_scalp_v3 as m
+    monkeypatch.setattr(m, "OI_CHANGE_WINDOW_SEC", 0)
+
+    s = _strategy()
+    oi_series = [1638780] * 120 + [1646840] * 120        # one step, mid-way
+    directions = []
+    for i, oi in enumerate(oi_series):
+        _, d = s.update_oi_data({"oi": oi, "ltp": 100.0 + i * 0.01})
+        directions.append(d)
+    neutral = sum(1 for d in directions if d == "NEUTRAL")
+    assert neutral >= len(directions) - 1, "tick-to-tick should be NEUTRAL on all but the step"
+
+
+def test_a_time_baseline_sees_the_drift_the_rule_was_written_for(monkeypatch):
+    """Over a real interval the same series moves by percent, which is the signal
+    'price up + OI up = long buildup' is actually about."""
+    from strategies import smart_scalp_v3 as m
+    monkeypatch.setattr(m, "OI_CHANGE_WINDOW_SEC", 300)
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(m._time, "monotonic", lambda: clock["t"])
+
+    s = _strategy()
+    s.update_oi_data({"oi": 1_000_000, "ltp": 100.0})     # seed
+    s.update_oi_data({"oi": 1_000_000, "ltp": 100.0})
+    clock["t"] += 600                                      # ten minutes later
+    pct, direction = s.update_oi_data({"oi": 1_030_000, "ltp": 105.0})
+    assert pct > 1
+    assert direction == "LONG_BUILDUP"                     # price up + OI up
+
+
+def test_time_baseline_reads_short_buildup_when_price_falls(monkeypatch):
+    from strategies import smart_scalp_v3 as m
+    monkeypatch.setattr(m, "OI_CHANGE_WINDOW_SEC", 300)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(m._time, "monotonic", lambda: clock["t"])
+
+    s = _strategy()
+    s.update_oi_data({"oi": 1_000_000, "ltp": 100.0})
+    s.update_oi_data({"oi": 1_000_000, "ltp": 100.0})
+    clock["t"] += 600
+    _, direction = s.update_oi_data({"oi": 1_030_000, "ltp": 95.0})
+    assert direction == "SHORT_BUILDUP"
+
+
+def test_zero_window_is_the_untouched_default():
+    from config.constants import OI_CHANGE_WINDOW_SEC
+    assert OI_CHANGE_WINDOW_SEC == 0, "default must reproduce the old tick-to-tick behaviour"
