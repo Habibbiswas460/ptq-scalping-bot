@@ -478,3 +478,103 @@ def test_time_baseline_reads_short_buildup_when_price_falls(monkeypatch):
 def test_zero_window_is_the_untouched_default():
     from config.constants import OI_CHANGE_WINDOW_SEC
     assert OI_CHANGE_WINDOW_SEC == 0, "default must reproduce the old tick-to-tick behaviour"
+
+
+# ── a soft size reduction must not become a trading halt ────────────────────
+
+def _size_engine(floor_enabled):
+    from core.engines.position_size_engine import PositionSizeEngine
+    e = PositionSizeEngine()
+    e.config["safety_caps"]["min_lot_floor_enabled"] = floor_enabled
+    return e
+
+
+def _alloc(engine, remaining=900.0, capital=27495.55, recovery=True, sl=8.0):
+    rec = {"active": recovery, "severity": 0.5}
+    rb = {"capital": capital, "remaining_risk_amount": remaining,
+          "daily_risk_budget_amount": 3000.0, "recovery_mode": rec,
+          "daily_loss_state": {"loss_utilization": 0.0},
+          "legacy_size_multiplier": 0.5 if recovery else 1.0}
+    return engine.calculate(capital=capital, risk_budget=rb, weighted_score=66,
+                            confidence=88, market_quality=100, regime="BEARISH",
+                            volatility={"vix": 11.0}, recovery_mode=rec,
+                            daily_loss_state={"loss_utilization": 0.0},
+                            sl_points=sl, lot_size=65)
+
+
+def test_recovery_mode_blocks_every_trade_without_the_floor():
+    """The 2026-09-07 state: multiplier 0.4936 against the 0.578 one lot needs."""
+    r = _alloc(_size_engine(False))
+    assert r["position_size"] == 0
+    assert r["lots"] == 0
+
+
+def test_the_floor_lets_recovery_mode_trade_one_lot():
+    r = _alloc(_size_engine(True))
+    assert r["lots"] == 1
+    assert r["position_size"] == 65
+    assert "floored_to_min_lot" in (r["cap_reason"] or "")
+
+
+def test_the_floor_never_overrides_a_real_budget_limit():
+    """A hard budget that cannot fund one lot is a limit, not a preference — the trade
+    must still be refused. Rs300 of daily loss capacity against Rs520 of lot risk."""
+    r = _alloc(_size_engine(True), remaining=300.0)
+    assert r["position_size"] == 0
+    assert "hard_budget_below_one_lot" in (r["cap_reason"] or "")
+
+
+def test_the_floor_changes_nothing_when_sizing_already_works():
+    on = _alloc(_size_engine(True), recovery=False)
+    off = _alloc(_size_engine(False), recovery=False)
+    assert on["position_size"] == off["position_size"]
+    assert "floored_to_min_lot" not in (on["cap_reason"] or "")
+
+
+def test_recovery_start_date_survives_a_restart():
+    """recovery_mode was persisted and recovery_start_date was not, so after a restart the
+    exit branch `if self.recovery_start_date:` guarded a None and recovery became permanent."""
+    from core.risk.risk_manager import RiskManager
+    from datetime import datetime as _dt
+
+    cfg = {"capital": {"total_capital": 30000},
+           "risk_management": {"pause_after_consecutive_loss_sec": 900,
+                               "consecutive_loss_limit": 2, "consecutive_win_limit": 5}}
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            os.chdir(tmp)
+            r = RiskManager(cfg, logger=None)
+            r.recovery_mode = True
+            r.recovery_start_date = _dt(2026, 9, 5, 10, 0, 0)
+            r._save_state()
+
+            again = RiskManager(cfg, logger=None)
+            assert again.recovery_mode is True
+            assert again.recovery_start_date == _dt(2026, 9, 5, 10, 0, 0)
+        finally:
+            os.chdir(cwd)
+
+
+def test_a_legacy_state_file_starts_the_recovery_clock_instead_of_stalling():
+    """Files written before recovery_start_date was saved must not leave the exit
+    unreachable forever."""
+    import json as _json
+    from core.risk.risk_manager import RiskManager
+
+    cfg = {"capital": {"total_capital": 30000},
+           "risk_management": {"pause_after_consecutive_loss_sec": 900,
+                               "consecutive_loss_limit": 2, "consecutive_win_limit": 5}}
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            os.chdir(tmp)
+            os.makedirs("logs", exist_ok=True)
+            with open("logs/risk_state.json", "w") as fh:
+                _json.dump({"recovery_mode": True, "total_pnl": -2504.45,
+                            "last_updated": "2026-09-07T10:00:00"}, fh)
+            r = RiskManager(cfg, logger=None)
+            assert r.recovery_mode is True
+            assert r.recovery_start_date is not None
+        finally:
+            os.chdir(cwd)
