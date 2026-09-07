@@ -12,8 +12,10 @@ Applied to the 143 trades recorded up to 2026-09-07 that is not a rounding corre
     costs   -Rs9,123.02   (mean Rs63.80 per trade)
     net    -Rs10,767.52   (33.6% winners)
 
-Cost is 40% of the average winning trade, and 1.162 option points on a single lot —
-against a 60-second mean favourable excursion of 1.06 points. So the comparisons every
+Cost is 40% of the average winning trade, and 0.982 option points on a single lot at
+that mean of Rs63.80 — against a 60-second mean favourable excursion of 1.06 points.
+(This line previously read 1.162 points, which is `points()` at a premium of Rs183.83,
+not the figure that pairs with a Rs63.80 mean. Rs63.80 / 65 = 0.982.) So the comparisons every
 experiment in this repo rests on are all roughly Rs64/trade too optimistic, in the same
 direction, which is enough to move several of them across zero.
 
@@ -56,9 +58,11 @@ class CostModel:
         """Round-trip cost expressed in option points per lot — the unit the exit ladder
         is written in, so it can be compared with a stop or a target directly.
 
-        The flat brokerage does not scale, so this falls with size: 1.162 points at one
-        lot, 0.527 at eight. It never reaches zero, and at this account's Rs30,000 (NIFTY
-        margin ~Rs15,000/lot) only one or two lots are reachable at all.
+        The flat brokerage does not scale, so this falls with size: at a premium of
+        Rs183.83, 1.162 points at one lot and 0.527 at eight. Both numbers move with
+        premium — at Rs145.55 they are 1.071 and 0.436 — so quote the premium with
+        them. It never reaches zero, and at this account's Rs30,000 (NIFTY margin
+        ~Rs15,000/lot) only one or two lots are reachable at all.
         """
         if lots <= 0 or lot_size <= 0 or premium <= 0:
             return 0.0
