@@ -530,6 +530,22 @@ class TradingState:
 trading_state = TradingState()
 
 
+def _log_idle_block(state, logger, kind: str, msg: str) -> None:
+    """Say why IDLE produced nothing, once per distinct reason.
+
+    Both gates above return "IDLE" with no output, so a bot that is awake, ticking and
+    evaluating nothing looks exactly like a bot with no signals. On 2026-09-07 that hid a
+    30-minute streak pause: `dvf_signals` simply stopped at 10:19:20 with no line anywhere
+    saying why. Logged on change rather than every loop, since these gates hold for minutes
+    at a time and the loop runs ~10x a second.
+    """
+    key = f"{kind}:{msg}"
+    if getattr(state, "_last_idle_block", None) == key:
+        return
+    state._last_idle_block = key
+    logger.info(f"⏸ Entries held ({kind}): {msg}")
+
+
 def is_trading_session_allowed(day_type: str) -> Tuple[bool, str]:
     """Check if current time is in allowed trading session"""
     if not SESSION_FILTER_ENABLED:
@@ -652,12 +668,18 @@ def state_idle(tick: Dict, greeks: Dict, state: TradingState,
     # Session filter
     session_ok, session_msg = is_trading_session_allowed(state.day_type)
     if not session_ok:
+        _log_idle_block(state, logger, "session", session_msg)
         return "IDLE"
-    
+
     # Trade limits
     limits_ok, limits_msg = check_trade_limits(state, logger)
     if not limits_ok:
+        _log_idle_block(state, logger, "limits", limits_msg)
         return "IDLE"
+
+    # Past both gates: forget the last hold reason so the next one is reported even if it
+    # repeats a message seen earlier in the session.
+    state._last_idle_block = None
     
     # ============================================
     # PULLBACK & PROTECT: No trades before configured start time
