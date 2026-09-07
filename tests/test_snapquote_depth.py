@@ -165,3 +165,101 @@ def test_candle_cache_write_failure_is_not_fatal():
             b._save_candle_cache("bad/../key:x", [{"a": 1}], datetime.now())   # must not raise
         finally:
             os.chdir(cwd)
+
+
+# ── cross-direction strike selection ────────────────────────────────────────
+# The bug: current_strike is chosen to put the SUBSCRIBED option type in the premium
+# band, and both the validation path and the order path reused it for the opposite
+# direction — which is the opposite moneyness, and therefore the wrong price.
+
+def _broker(monkeypatch, *, enabled=True, symbol="NIFTY08SEP2623800CE",
+            strike=23800, spot=23850.0, found=(23900, 180.0)):
+    import importlib
+    # core.trading's __init__ exports the singleton under the name `broker`, which shadows
+    # the submodule — import it explicitly or you get the instance.
+    bmod = importlib.import_module("core.trading.broker")
+
+    b = bmod.BrokerInterface.__new__(bmod.BrokerInterface)
+    b.current_symbol = symbol
+    b.current_strike = strike
+    b.spot_price = spot
+    b._cross_strike_cache = {}
+    b.calls = []
+
+    class _L:
+        def info(self, *a, **k): pass
+        def debug(self, *a, **k): pass
+        def warning(self, *a, **k): pass
+    b.logger = _L()
+
+    def _find(option_type="CE"):
+        b.calls.append(option_type)
+        return found
+    b._find_strike_by_premium = _find
+
+    monkeypatch.setattr(bmod, "CROSS_DIRECTION_STRIKE_ENABLED", enabled)
+    monkeypatch.setattr(bmod, "CROSS_DIRECTION_STRIKE_TTL_SEC", 60)
+    return b
+
+
+def test_opposite_direction_gets_its_own_strike(monkeypatch):
+    b = _broker(monkeypatch)
+    assert b.resolve_strike_for_direction("PE") == 23900
+    assert b.calls == ["PE"]
+
+
+def test_subscribed_direction_never_triggers_a_search(monkeypatch):
+    b = _broker(monkeypatch)
+    assert b.resolve_strike_for_direction("CE") == 23800
+    assert b.calls == []
+
+
+def test_disabled_flag_reproduces_the_old_behaviour(monkeypatch):
+    b = _broker(monkeypatch, enabled=False)
+    assert b.resolve_strike_for_direction("PE") == 23800
+    assert b.calls == []
+
+
+def test_result_is_cached_so_rest_calls_stay_bounded(monkeypatch):
+    b = _broker(monkeypatch)
+    for _ in range(25):
+        b.resolve_strike_for_direction("PE")
+    assert b.calls == ["PE"], "the premium search costs 5 REST calls; it must not repeat"
+
+
+def test_cache_is_dropped_when_spot_moves_to_a_new_atm(monkeypatch):
+    b = _broker(monkeypatch)
+    b.resolve_strike_for_direction("PE")
+    b.spot_price = 23950.0                     # ATM 23850 -> 23950
+    b.resolve_strike_for_direction("PE")
+    assert b.calls == ["PE", "PE"]
+
+
+def test_cache_expires_with_the_ttl(monkeypatch):
+    import importlib
+    bmod = importlib.import_module("core.trading.broker")
+    b = _broker(monkeypatch)
+    b.resolve_strike_for_direction("PE")
+    monkeypatch.setattr(bmod, "CROSS_DIRECTION_STRIKE_TTL_SEC", 0)
+    b.resolve_strike_for_direction("PE")
+    assert b.calls == ["PE", "PE"]
+
+
+def test_a_failed_search_falls_back_to_the_current_strike(monkeypatch):
+    b = _broker(monkeypatch)
+
+    def _boom(option_type="CE"):
+        raise RuntimeError("LTP timeout")
+    b._find_strike_by_premium = _boom
+    assert b.resolve_strike_for_direction("PE") == 23800
+
+
+def test_no_strike_in_band_falls_back_to_the_current_strike(monkeypatch):
+    b = _broker(monkeypatch, found=(None, 0))
+    assert b.resolve_strike_for_direction("PE") == 23800
+
+
+def test_unknown_spot_falls_back_to_the_current_strike(monkeypatch):
+    b = _broker(monkeypatch, spot=0.0)
+    assert b.resolve_strike_for_direction("PE") == 23800
+    assert b.calls == []

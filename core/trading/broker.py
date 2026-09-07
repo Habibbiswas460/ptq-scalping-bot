@@ -40,6 +40,7 @@ from config.constants import (
     ORDER_RETRY_ENABLED, ORDER_MAX_RETRIES, ORDER_RETRY_DELAY_MS, ORDER_PRICE_CHASE_STEP,
     TICK_OI_ENABLED,
     WS_OPTION_SUB_MODE,
+    CROSS_DIRECTION_STRIKE_ENABLED, CROSS_DIRECTION_STRIKE_TTL_SEC,
     MARKET_OPEN_TIME,
     NIFTY_SPOT_TOKEN,
     SCRIP_MASTER_URL,
@@ -83,6 +84,9 @@ class BrokerInterface:
         # Last known-good historical candles, keyed by "exchange:token:interval"
         # (fallback source when the broker API rate-limits a fetch)
         self._historical_candles_cache: Dict[str, Dict[str, Any]] = {}
+        # direction -> {strike, atm, at}: the opposite direction's own premium-band
+        # strike, cached because the search costs up to five REST calls.
+        self._cross_strike_cache: Dict[str, Dict[str, Any]] = {}
 
         # WebSocket tick state (thread-safe)
         self._tick_lock = threading.Lock()
@@ -1412,11 +1416,61 @@ class BrokerInterface:
     # GET TICK — unified entry point
     # =========================================================================
 
+    def resolve_strike_for_direction(self, direction: str) -> int:
+        """The strike to use for `direction` — the one place that answers this question.
+
+        `current_strike` was chosen by _find_strike_by_premium() for whichever option type
+        is currently subscribed, so it is only the right strike for that type. Reusing it
+        for the opposite direction picks the opposite moneyness: with an ITM CE (strike
+        below spot) the same-strike PE is OTM and cheap, which is why every cross-direction
+        PE on 2026-09-07 priced at ₹31-32 against the ₹70 floor and was rejected after it
+        had already cleared confidence.
+
+        Both get_tick_for_direction() and place_order() go through here, so the contract
+        that is validated is always the contract that gets traded. Any divergence between
+        those two would be worse than the bug this fixes.
+
+        The search costs up to five REST LTP calls, and the strategy evaluates many times a
+        second, so the answer is cached per direction until the TTL expires or the ATM
+        strike moves. On failure the current strike is returned — the old behaviour — so a
+        lookup problem degrades to what the bot did before rather than to no trade at all.
+        """
+        if not CROSS_DIRECTION_STRIKE_ENABLED:
+            return self.current_strike
+        # Already the subscribed type: current_strike was chosen for exactly this.
+        if self.current_symbol and self.current_symbol.endswith(direction):
+            return self.current_strike
+        if not self.spot_price or self.spot_price < 10000:
+            return self.current_strike
+
+        atm = round(self.spot_price / 50) * 50
+        entry = self._cross_strike_cache.get(direction)
+        if (entry and entry.get("atm") == atm
+                and (time.time() - entry.get("at", 0)) < CROSS_DIRECTION_STRIKE_TTL_SEC):
+            return entry["strike"]
+
+        try:
+            strike, premium = self._find_strike_by_premium(direction)
+        except Exception as e:
+            self.logger.debug(f"Cross-direction strike search failed for {direction}: {e}")
+            return self.current_strike
+        if not strike:
+            return self.current_strike
+
+        if not entry or entry.get("strike") != strike:
+            self.logger.info(
+                f"🎯 Cross-direction strike for {direction}: {strike} "
+                f"(premium ₹{premium:.0f}) — subscribed {self.current_symbol} is "
+                f"{self.current_strike}"
+            )
+        self._cross_strike_cache[direction] = {"strike": strike, "atm": atm, "at": time.time()}
+        return strike
+
     def get_tick_for_direction(self, direction: str) -> Optional[Dict[str, Any]]:
         """
         Fetch a real tick for the option contract matching `direction`
-        (CE/PE) at the current strike — even when a different contract is
-        currently subscribed.
+        (CE/PE) at that direction's own strike — even when a different
+        contract is currently subscribed.
 
         Every entry-decision check that reads a tick (premium filter,
         delta filter, market-quality's spread/liquidity gate) normally
@@ -1431,7 +1485,8 @@ class BrokerInterface:
         use this to re-validate against the contract that will actually
         be traded before committing to the entry.
         """
-        target_symbol = self._build_option_symbol(self.current_strike, direction)
+        target_strike = self.resolve_strike_for_direction(direction)
+        target_symbol = self._build_option_symbol(target_strike, direction)
         if target_symbol == self.current_symbol:
             return self.get_tick()
 
@@ -1449,7 +1504,7 @@ class BrokerInterface:
 
         tick_ts = current_time_ms()
         tick['spot_price'] = self.spot_price
-        tick['strike'] = self.current_strike
+        tick['strike'] = target_strike
         tick['direction'] = direction
         tick['symbol'] = target_symbol
         tick['timestamp'] = tick_ts
@@ -1750,9 +1805,11 @@ class BrokerInterface:
                 f"⚠ Order quantity {qty} exceeds the exchange freeze quantity {freeze}; "
                 f"the exchange will refuse it. Reduce the size or split the order.")
 
-        # Build option symbol for this direction
-        option_symbol = self._build_option_symbol(self.current_strike, direction)
-        self.logger.info(f"   Strike: {self.current_strike} | Symbol: {option_symbol}")
+        # Build option symbol for this direction. Same resolver get_tick_for_direction()
+        # used to validate, so the contract that was checked is the contract that trades.
+        order_strike = self.resolve_strike_for_direction(direction)
+        option_symbol = self._build_option_symbol(order_strike, direction)
+        self.logger.info(f"   Strike: {order_strike} | Symbol: {option_symbol}")
 
         # ═══════════════════════════════════════════════════════════════════
         # CRITICAL FIX: Update current_symbol BEFORE getting tick
@@ -1762,6 +1819,7 @@ class BrokerInterface:
         if option_symbol != self.current_symbol:
             old_token = self._option_token
             self.current_symbol = option_symbol
+            self.current_strike = order_strike   # the subscribed strike IS the traded one
             self._option_token = self._get_token(option_symbol, EXCHANGE)
             self.logger.info(f"📍 Symbol switched: {old_symbol} → {option_symbol}")
             

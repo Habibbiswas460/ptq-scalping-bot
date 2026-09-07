@@ -218,6 +218,25 @@ WS_OPTION_SUB_MODE = 3 if WS_SNAP_QUOTE_ENABLED else 2
 # This filter is NOT the SL-streak direction block. That one lives in
 # state_machine.is_direction_blocked(), measured to have saved Rs2,042, and is
 # deliberately left alone by all of these settings.
+# ═══════════════════════════════════════════════════════════════════════════
+# CROSS-DIRECTION STRIKE SELECTION
+# ═══════════════════════════════════════════════════════════════════════════
+# The subscribed strike is chosen by _find_strike_by_premium() for the SUBSCRIBED
+# option type. Both get_tick_for_direction() and place_order() then reuse that
+# same strike for the opposite direction — and a strike that puts a CE in the
+# premium band puts the PE at the opposite moneyness. On 2026-09-07, holding an
+# ITM 23800 CE in a falling market, every PE the strategy asked for priced at
+# ₹31-32 against a ₹70 floor: "Premium too low" on every cross-direction entry
+# that had already cleared confidence. It is symmetric — a PE-optimised strike
+# does the same to CE — and it is the most likely reason the whole tick record
+# holds 297 PE ticks against ~73,000 CE.
+#
+# Enabled, the opposite direction gets its own premium search (cached, because
+# that search costs up to 5 REST calls and the strategy evaluates many times a
+# second). Default OFF so a checkout reproduces the old behaviour.
+CROSS_DIRECTION_STRIKE_ENABLED = env_bool('CROSS_DIRECTION_STRIKE_ENABLED', False)
+CROSS_DIRECTION_STRIKE_TTL_SEC = env_float('CROSS_DIRECTION_STRIKE_TTL_SEC', 60)
+
 DIRECTIONAL_EXHAUSTION_ENABLED = env_bool('DIRECTIONAL_EXHAUSTION_ENABLED', True)
 PE_EXHAUSTION_RSI = env_float('PE_EXHAUSTION_RSI', 30)   # PE blocked when rsi < this and MACD rising
 CE_EXHAUSTION_RSI = env_float('CE_EXHAUSTION_RSI', 70)   # CE blocked when rsi > this and MACD falling
