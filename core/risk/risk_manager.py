@@ -316,13 +316,39 @@ class RiskManager:
     
     def update_streak(self, pnl: float):
         """Update win/loss streak. A breakeven trade (pnl == 0) is neutral -
-        it neither extends nor resets either streak."""
+        it neither extends nor resets either streak.
+
+        The pause starts HERE, when the streak actually happens, not when
+        check_streak_limits() first gets to look at it. Those are not the same
+        instant: after a streak the state machine goes into its own
+        COOLDOWN_AFTER_CONSECUTIVE_LOSS, and while it is in COOLDOWN it never
+        reaches check_trade_limits() at all -- so the pause clock used to start
+        only once that cooldown had already expired, and the two ran back to
+        back instead of together.
+
+        Measured on 2026-09-07: two losses closed at 10:19:44, the state machine
+        held COOLDOWN until 10:34:44, and the streak pause then set itself to
+        10:49:44. A configured 15-minute pause cost 30 minutes of session, and
+        nothing logged it, because state_idle()'s limit check returns "IDLE"
+        silently. findings.md 2.9 removed the state machine's duplicate pause
+        clock; the duplication survived through the cooldown *duration* instead.
+        """
         if pnl > 0:
             self.consecutive_wins += 1
             self.consecutive_losses = 0
         elif pnl < 0:
             self.consecutive_losses += 1
             self.consecutive_wins = 0
+
+        rm = self.config['risk_management']
+        pause_sec = rm.get('pause_after_consecutive_loss_sec', 900)
+        hit_losses = self.consecutive_losses >= rm.get('consecutive_loss_limit', 2)
+        hit_wins = self.consecutive_wins >= rm.get('consecutive_win_limit', 5)
+        if (hit_losses or hit_wins) and self.streak_pause_until is None:
+            self.streak_pause_until = datetime.now() + timedelta(seconds=pause_sec)
+            self._log('info',
+                      f"⏸ Streak pause armed for {pause_sec // 60}min "
+                      f"(losses={self.consecutive_losses}, wins={self.consecutive_wins})")
 
     # ==================== TIME-BASED SIZING ====================
     

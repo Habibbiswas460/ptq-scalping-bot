@@ -263,3 +263,80 @@ def test_unknown_spot_falls_back_to_the_current_strike(monkeypatch):
     b = _broker(monkeypatch, spot=0.0)
     assert b.resolve_strike_for_direction("PE") == 23800
     assert b.calls == []
+
+
+# ── streak pause: it must start when the streak happens ─────────────────────
+
+def _rm(monkeypatch, pause_sec=900, loss_limit=2):
+    from core.risk.risk_manager import RiskManager
+
+    r = RiskManager.__new__(RiskManager)
+    r.config = {"risk_management": {"pause_after_consecutive_loss_sec": pause_sec,
+                                    "consecutive_loss_limit": loss_limit,
+                                    "consecutive_win_limit": 5}}
+    r.consecutive_losses = 0
+    r.consecutive_wins = 0
+    r.streak_pause_until = None
+    r._log = lambda *a, **k: None
+    return r
+
+
+def test_pause_is_armed_at_the_moment_the_streak_completes(monkeypatch):
+    """Not when check_streak_limits() first looks. The state machine sits in its own
+    COOLDOWN until then, so a late-arming clock runs back to back with it instead of
+    together -- 30 minutes for a 15-minute setting, as happened on 2026-09-07."""
+    from datetime import datetime, timedelta
+
+    r = _rm(monkeypatch)
+    r.update_streak(-100.0)
+    assert r.streak_pause_until is None, "one loss is not a streak"
+    before = datetime.now()
+    r.update_streak(-100.0)
+    assert r.streak_pause_until is not None
+    assert r.streak_pause_until - before <= timedelta(seconds=901)
+
+
+def test_a_later_check_does_not_push_the_pause_further_out():
+    from datetime import datetime, timedelta
+
+    r = _rm(_rm)
+    r.update_streak(-100.0)
+    r.update_streak(-100.0)
+    armed = r.streak_pause_until
+    r.streak_pause_until = datetime.now() - timedelta(seconds=1)   # pretend it expired
+    ok, _ = r.check_streak_limits()
+    assert ok, "an expired pause must release, not re-arm"
+    assert r.consecutive_losses == 0
+    assert r.streak_pause_until is None
+    assert armed is not None
+
+
+def test_pause_blocks_while_active():
+    r = _rm(_rm)
+    r.update_streak(-100.0)
+    r.update_streak(-100.0)
+    ok, msg = r.check_streak_limits()
+    assert not ok and "remaining" in msg
+
+
+def test_a_win_clears_the_loss_streak_without_arming():
+    r = _rm(_rm)
+    r.update_streak(-100.0)
+    r.update_streak(50.0)
+    assert r.consecutive_losses == 0
+    assert r.streak_pause_until is None
+
+
+def test_idle_block_is_logged_once_per_reason():
+    from core.engines.state_machine import _log_idle_block
+
+    class S: pass
+    class L:
+        def __init__(self): self.msgs = []
+        def info(self, m): self.msgs.append(m)
+    s, lg = S(), L()
+    for _ in range(5):
+        _log_idle_block(s, lg, "limits", "Streak pause active, 9min remaining")
+    assert len(lg.msgs) == 1
+    _log_idle_block(s, lg, "limits", "Streak pause active, 3min remaining")
+    assert len(lg.msgs) == 2
