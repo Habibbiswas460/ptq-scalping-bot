@@ -56,6 +56,7 @@ from config.constants import (
     ATR_HIGH_SL_ADJUSTMENT, ATR_HIGH_TP_ADJUSTMENT,
     ATR_LOW_SL_ADJUSTMENT, ATR_LOW_TP_ADJUSTMENT,
     ATR_SL_MIN_POINTS, ATR_TP_MIN_POINTS,
+    DIRECTIONAL_EXHAUSTION_ENABLED, PE_EXHAUSTION_RSI, CE_EXHAUSTION_RSI,
 )
 
 try:
@@ -1241,23 +1242,31 @@ class SmartScalpV3:
         # CE Trend Exhaustion Check
         ce_exhausted = False
         if ce_signal:
-            # 1. RSI overbought + MACD declining = momentum waning
-            if rsi > 70 and macd_hist < macd_hist_prev:
+            # 1. RSI overbought + MACD declining = momentum waning.
+            #    Threshold is settable (default 70 = the value that was hardcoded here);
+            #    CE_EXHAUSTION_RSI above 100, or ENABLED=false, disables this half.
+            if (DIRECTIONAL_EXHAUSTION_ENABLED
+                    and rsi > CE_EXHAUSTION_RSI and macd_hist < macd_hist_prev):
                 ce_exhausted = True
                 details["exhaustion"] = "CE overbought + MACD declining"
-            # 2. Check direction block (with cooldown support)
+            # 2. Check direction block (with cooldown support). This is the SL-streak
+            #    block, a different mechanism with its own evidence — the settings above
+            #    deliberately do not touch it.
             if ce_blocked:
                 ce_exhausted = True
                 details["exhaustion"] = ce_block_reason
-        
+
         # PE Trend Exhaustion Check
         pe_exhausted = False
         if pe_signal:
-            # 1. RSI oversold + MACD rising = bounce coming
-            if rsi < 30 and macd_hist > macd_hist_prev:
+            # 1. RSI oversold + MACD rising = bounce coming.
+            #    Threshold is settable (default 30 = the value that was hardcoded here);
+            #    PE_EXHAUSTION_RSI=0 disables this half, since rsi < 0 is never true.
+            if (DIRECTIONAL_EXHAUSTION_ENABLED
+                    and rsi < PE_EXHAUSTION_RSI and macd_hist > macd_hist_prev):
                 pe_exhausted = True
                 details["exhaustion"] = "PE oversold + MACD rising"
-            # 2. Check direction block (with cooldown support)
+            # 2. Check direction block (with cooldown support). SL-streak, untouched.
             if pe_blocked:
                 pe_exhausted = True
                 details["exhaustion"] = pe_block_reason

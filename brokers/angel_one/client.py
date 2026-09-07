@@ -197,7 +197,10 @@ class AngelOneClient:
         self.totp_secret = totp_secret
         
         self.logger = logger or BotLogger()
-        
+        # One warning per process if the best-5 book cannot be made sense of; without the
+        # latch a malformed book would log on every tick.
+        self._best5_warned = False
+
         # API connections
         self.smart_api = None  # type: Optional[SmartConnect]
         self.auth_token: Optional[str] = None
@@ -1750,6 +1753,69 @@ class AngelOneClient:
         """
         pass  # Protocol-level pings handle this now
     
+    def _parse_best5(self, block: bytes, ltp: float) -> Optional[Dict]:
+        """Best-5 depth from the 200-byte block at offset 147 of a SnapQuote packet.
+
+        Ten 20-byte records: flag (uint16), quantity (int64), price (int64, paise),
+        order count (uint16). The flag separates the two sides.
+
+        Which flag means "buy" is deliberately NOT trusted. The vendored SmartApi SDK
+        assigns `best_5_buy_data` from the flag!=0 list and `best_5_sell_data` from the
+        flag==0 list -- i.e. it swaps them -- and Angel One's documentation does not settle
+        which is right. Guessing costs more than it saves: an inverted book would make every
+        recorded fill look better or worse than it was, silently, and unlike the current
+        fabricated spread it would look like real data. So both assignments are tried and the
+        one that actually forms a book (bid <= ask, straddling ltp most closely) wins. If
+        neither does, None is returned and the caller keeps its existing estimate.
+        """
+        if len(block) < 200:
+            return None
+        side_a, side_b = [], []
+        try:
+            for i in range(0, 200, 20):
+                rec = block[i:i + 20]
+                flag = struct.unpack('<H', rec[0:2])[0]
+                qty = struct.unpack('<q', rec[2:10])[0]
+                price = struct.unpack('<q', rec[10:18])[0] / 100.0
+                if price <= 0 or qty <= 0:
+                    continue          # an unfilled level, not a quote
+                (side_a if flag == 0 else side_b).append((price, qty))
+        except struct.error:
+            return None
+        if not side_a or not side_b:
+            return None
+
+        best = None
+        for bids, asks in ((side_a, side_b), (side_b, side_a)):
+            bid, bid_qty = max(bids, key=lambda x: x[0])
+            ask, ask_qty = min(asks, key=lambda x: x[0])
+            if bid > ask:
+                continue                       # crossed: wrong way round
+            dist = abs((bid + ask) / 2.0 - ltp)
+            if best is None or dist < best[0]:
+                best = (dist, bid, ask, bid_qty, ask_qty)
+        if best is None:
+            return None
+
+        _, bid, ask, bid_qty, ask_qty = best
+        # A book that does not contain the last trade is not a book we understand; better to
+        # fall back than to publish a quote whose own ltp sits outside it.
+        if not (bid <= ltp <= ask):
+            if not self._best5_warned:
+                self._best5_warned = True
+                self.logger.warning(
+                    f"⚠ best-5 depth rejected: ltp {ltp} outside bid {bid} / ask {ask} "
+                    "— keeping the estimated spread"
+                )
+            return None
+        return {
+            'best_bid_price': bid,
+            'best_ask_price': ask,
+            'best_bid_qty': bid_qty,
+            'best_ask_qty': ask_qty,
+            'depth_source': 'ws_best5',
+        }
+
     def _parse_ws_binary(self, data: bytes) -> Optional[Dict]:
         """
         Parse WebSocket binary tick data
@@ -1807,6 +1873,15 @@ class AngelOneClient:
             if mode >= WS_MODE_SNAP_QUOTE and len(data) >= 379:
                 tick['last_trade_time'] = struct.unpack('<q', data[123:131])[0]
                 tick['open_interest'] = struct.unpack('<q', data[131:139])[0]
+                tick['oi_change_pct'] = struct.unpack('<q', data[139:147])[0] / 100.0
+                # Bytes 147:347 are the best-5 book. This parser used to jump
+                # straight from 139 to 347, so the depth was discarded and
+                # broker.py's `tick_data.get('best_bid_price')` never found
+                # anything — which is why every persisted bid/ask in the project
+                # is the ltp +/- 0.3% estimate rather than a quote.
+                book = self._parse_best5(data[147:347], ltp)
+                if book:
+                    tick.update(book)
                 tick['upper_circuit'] = struct.unpack('<q', data[347:355])[0] / 100.0
                 tick['lower_circuit'] = struct.unpack('<q', data[355:363])[0] / 100.0
                 tick['week_52_high'] = struct.unpack('<q', data[363:371])[0] / 100.0
