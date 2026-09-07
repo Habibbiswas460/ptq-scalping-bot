@@ -276,6 +276,16 @@ class TradingState:
         self.daily_pnl_inr = 0.0
         self.daily_pnl_pct = 0.0
         self.daily_loss_alerted = False  # DAILY_LOSS_ALERT pre-warning, see check_daily_loss_alert()
+        # An operator pressing Stop in Telegram is not the same event as an
+        # automatic kill switch, and conflating the two broke both directions:
+        # Telegram used to write state.state = "KILL_SWITCH" directly, which (a)
+        # overwrote "IN_TRADE" and orphaned any open position, since only the
+        # IN_TRADE branch ever runs the exit path, and (b) was undone one
+        # iteration later by main.py's "kill check passed -> recover to IDLE",
+        # so the bot silently resumed trading. Stop reported success and did
+        # neither thing it claimed. This flag is the operator's intent, held
+        # separately from the machine's state and cleared only by Resume.
+        self.manual_stop = False
         
         # Trade counters
         self.trades_this_hour = 0
@@ -977,7 +987,16 @@ def finalize_trade_exit_accounting(order_id, trade_direction, result, exit_reaso
         from core.risk.risk_manager import get_risk_manager
         rm = get_risk_manager()
         if rm:
-            rm.record_trade({'pnl': result['pnl_inr'], 'direction': trade_direction})
+            # entry/exit/qty are passed so RiskManager can charge the round-trip
+            # transaction cost. Without them the cost cannot be computed and the
+            # trade is recorded gross, which is what every trade before today was.
+            rm.record_trade({
+                'pnl': result['pnl_inr'],
+                'direction': trade_direction,
+                'entry_price': (current_trade or {}).get('entry_price'),
+                'exit_price': result.get('exit_price'),
+                'qty': (current_trade or {}).get('qty'),
+            })
     except Exception as e:
         # Not a cosmetic failure: RiskManager's daily/weekly PnL and
         # consecutive-loss counters (used by can_trade()'s risk gates) are

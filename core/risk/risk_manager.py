@@ -69,6 +69,31 @@ class RiskManager:
             self._log('info', f"📅 New week detected (last active {self._last_active_date}) — resetting weekly PnL")
             self.end_of_week()
 
+        self._warn_if_drawdown_gate_is_a_one_day_gate()
+
+    def _warn_if_drawdown_gate_is_a_one_day_gate(self):
+        """A lifetime ceiling no larger than one day's budget is a config bug.
+
+        If max_drawdown_amount <= max_daily_loss_amount then a single day that
+        spends its full, permitted loss budget also trips the lifetime gate — and
+        with a monotone peak that halt never lifts. The bot is then allowed
+        exactly one bad day for its whole life, which nobody chose; it is what
+        two independently-derived defaults happened to evaluate to.
+        """
+        cap = self.config.get('capital', {})
+        dd = cap.get('max_drawdown_amount')
+        daily = cap.get('max_daily_loss_amount')
+        lookback = int(cap.get('drawdown_peak_lookback_sessions', 0) or 0)
+        if dd is None or daily is None:
+            return
+        if dd <= daily:
+            self._log('warning',
+                      f"⚠ Lifetime drawdown ceiling ₹{dd} is not above the daily loss "
+                      f"ceiling ₹{daily}: one full permitted losing day also trips the "
+                      f"lifetime halt"
+                      + ("" if lookback > 0 else
+                         ", and with an all-time peak (lookback=0) that halt never lifts"))
+
     def _log(self, level: str, msg: str):
         """Log message"""
         if self.logger:
@@ -228,6 +253,25 @@ class RiskManager:
 
     # ==================== DRAWDOWN PROTECTION ====================
     
+    def effective_peak_equity(self) -> float:
+        """The peak the drawdown gate measures against.
+
+        With lookback 0 this is `peak_equity`, the all-time monotone high — the
+        original behaviour, kept as the default so nothing changes unless it is
+        configured. With lookback N the peak is taken over the last N end-of-day
+        equity points plus today's equity, so an old high ages out of the window.
+
+        The distinction is not cosmetic. A monotone all-time peak combined with a
+        gate that blocks all trading has no exit: the only thing that lifts it is
+        profit, and profit needs the trading the gate forbids. On 2026-09-07 that
+        deadlock closed the account Rs28 short of the limit, permanently.
+        """
+        lookback = int(self.config['capital'].get('drawdown_peak_lookback_sessions', 0) or 0)
+        if lookback <= 0:
+            return self.peak_equity
+        window = list(self.equity_history[-lookback:]) + [self.current_equity]
+        return max(window) if window else self.current_equity
+
     def check_drawdown(self) -> Tuple[bool, str]:
         """Check max drawdown limits"""
         capital_cfg = self.config['capital']
@@ -236,18 +280,34 @@ class RiskManager:
         
         if self.current_equity > self.peak_equity:
             self.peak_equity = self.current_equity
-        
-        drawdown = self.peak_equity - self.current_equity
-        drawdown_pct = (drawdown / self.peak_equity) * 100 if self.peak_equity > 0 else 0
+
+        peak = self.effective_peak_equity()
+
+        drawdown = peak - self.current_equity
+        drawdown_pct = (drawdown / peak) * 100 if peak > 0 else 0
         
         max_dd_amount = capital_cfg.get('max_drawdown_amount', 3000)
         max_dd_pct = capital_cfg.get('max_drawdown_pct', 10.0)
-        
+
+        # A blocked gate used to print only the number it tripped on, which does
+        # not say how far from re-opening it is — and when that distance is
+        # unearnable the halt is permanent rather than protective. Print the
+        # escape arithmetic so the difference is visible in the log.
         if drawdown >= max_dd_amount:
-            return False, f"Max drawdown ₹{drawdown:.0f} hit (limit: ₹{max_dd_amount})"
+            need = drawdown - max_dd_amount
+            return False, (
+                f"Max drawdown ₹{drawdown:.0f} hit (limit: ₹{max_dd_amount}) | "
+                f"peak=₹{peak:.0f} equity=₹{self.current_equity:.0f} | "
+                f"needs +₹{need:.2f} to re-open"
+            )
         
         if drawdown_pct >= max_dd_pct:
-            return False, f"Max drawdown {drawdown_pct:.1f}% hit (limit: {max_dd_pct}%)"
+            need = drawdown - (max_dd_pct / 100.0) * peak
+            return False, (
+                f"Max drawdown {drawdown_pct:.1f}% hit (limit: {max_dd_pct}%) | "
+                f"peak=₹{peak:.0f} equity=₹{self.current_equity:.0f} | "
+                f"needs +₹{need:.2f} to re-open"
+            )
         
         return True, ""
     
@@ -549,9 +609,56 @@ class RiskManager:
     
     # ==================== TRADE RECORDING ====================
     
+    def transaction_cost(self, trade: Dict) -> float:
+        """Rupee cost of the round trip, or 0.0 when it cannot be computed.
+
+        Nothing in the live path used to charge brokerage, STT, exchange fees, GST
+        or stamp duty — the bot computed (exit - entry) x qty and stopped. So every
+        limit measured against P&L (the daily ceiling, the kill switch, the
+        drawdown gate) was reading a number that was, on this project's own 143
+        recorded trades, Rs63.80/trade too kind. The rates come from
+        research/costs.py so the live path and the offline experiments cannot
+        drift into disagreeing about what a trade cost.
+
+        Returns 0.0 rather than guessing when entry/exit/qty are not all present:
+        an unpriced trade must not be charged an invented cost.
+        """
+        cfg = self.config.get('costs', {})
+        if not cfg.get('enabled', False):
+            return 0.0
+        try:
+            entry = float(trade.get('entry_price') or 0)
+            exit_ = float(trade.get('exit_price') or 0)
+            qty = int(trade.get('qty') or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if entry <= 0 or exit_ <= 0 or qty <= 0:
+            return 0.0
+        try:
+            from research.costs import CostModel
+        except ImportError:
+            return 0.0
+        model = CostModel(brokerage_per_order=float(cfg.get('brokerage_per_order', 20.0)))
+        return float(model.round_trip(entry, exit_, qty))
+
     def record_trade(self, trade: Dict):
-        """Record a completed trade"""
-        pnl = trade.get('pnl', 0)
+        """Record a completed trade.
+
+        `trade['pnl']` arrives GROSS from the broker layer. Costs are subtracted
+        here, at the one place every exit path funnels through, so daily/weekly/
+        total P&L, the equity curve and every gate built on them are all net of
+        what the trade actually cost. The gross figure is kept alongside it rather
+        than overwritten, because the two differing is itself information.
+        """
+        gross = trade.get('pnl', 0)
+        cost = self.transaction_cost(trade)
+        pnl = gross - cost
+        trade['gross_pnl'] = gross
+        trade['cost'] = round(cost, 2)
+        trade['pnl'] = round(pnl, 2)
+        if cost:
+            self._log('info',
+                      f"🧾 Costs: gross ₹{gross:+.2f} - ₹{cost:.2f} = net ₹{pnl:+.2f}")
         
         self.daily_pnl += pnl
         self.weekly_pnl += pnl

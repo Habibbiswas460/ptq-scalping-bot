@@ -38,6 +38,37 @@ MAX_DAILY_LOSS_AMOUNT = env_int('MAX_DAILY_LOSS', 3000)  # Owner's real ceiling 
 DAILY_LOSS_ALERT = env_int('DAILY_LOSS_ALERT', 1500)      # Alert at ₹1500 loss
 PROFIT_LOCK_THRESHOLD = env_int('PROFIT_LOCK_THRESHOLD', 1000)  # Lock profit at ₹1000
 
+# --- Lifetime drawdown gate -------------------------------------------------
+# These were hardcoded as int(TOTAL_CAPITAL * 0.10) and 10.0, which made the
+# LIFETIME drawdown ceiling exactly equal to MAX_DAILY_LOSS. One full daily loss
+# therefore closed the bot permanently: check_drawdown() is the first gate in
+# can_trade(), peak_equity is a monotone all-time high, and the only way out of
+# the gate is profit that the gate itself forbids earning. That is a deadlock by
+# construction, and it fired for real (2026-09-07: drawdown Rs3028 vs Rs3000, an
+# escape of Rs28 that could never be earned). A lifetime ceiling has to be
+# strictly larger than a single day's budget or it grants exactly one bad day,
+# ever. RiskManager warns at startup if that invariant is violated.
+MAX_DRAWDOWN_AMOUNT = env_int('MAX_DRAWDOWN_AMOUNT', int(TOTAL_CAPITAL * 0.10))
+MAX_DRAWDOWN_PCT = env_float('MAX_DRAWDOWN_PCT', 10.0)
+# 0 = the old all-time monotone peak (no recovery path). N > 0 measures the peak
+# over the last N end-of-day equity points plus today, so a bad run ages out and
+# the account can trade its way back instead of latching forever.
+DRAWDOWN_PEAK_LOOKBACK_SESSIONS = env_int('DRAWDOWN_PEAK_LOOKBACK_SESSIONS', 0)
+
+# --- Transaction costs ------------------------------------------------------
+# There was no brokerage, STT, exchange charge, GST or stamp duty anywhere in the
+# live path: the bot computed (exit - entry) x qty and stopped. Every P&L figure
+# this project has ever produced, and every risk gate measured against one, was
+# therefore GROSS. On the 143 trades to 2026-09-07 that is Rs63.80/trade, turning
+# -Rs1,644 gross into -Rs10,767 net. It is not a rounding correction; it is
+# roughly 40% of the average winning trade, and it is the difference between a
+# daily loss ceiling that means what it says and one that is silently ~25% larger
+# than intended. Rates live in research/costs.py, which is the single definition
+# used by both the live path and every offline experiment, so the two can never
+# disagree about what a trade cost.
+COST_ACCOUNTING_ENABLED = env_bool('COST_ACCOUNTING_ENABLED', True)
+COST_BROKERAGE_PER_ORDER = env_float('COST_BROKERAGE_PER_ORDER', 20.0)
+
 # =========================================================
 # 📊 TRADING INSTRUMENT
 # =========================================================
@@ -629,11 +660,16 @@ CONFIG = {
         'max_daily_loss_amount': MAX_DAILY_LOSS_AMOUNT,
         'daily_loss_alert_threshold': DAILY_LOSS_ALERT,
         'margin_per_lot': 15000,
-        'max_drawdown_amount': int(TOTAL_CAPITAL * 0.10),  # 10% of capital
-        'max_drawdown_pct': 10.0,
+        'max_drawdown_amount': MAX_DRAWDOWN_AMOUNT,
+        'max_drawdown_pct': MAX_DRAWDOWN_PCT,
+        'drawdown_peak_lookback_sessions': DRAWDOWN_PEAK_LOOKBACK_SESSIONS,
         'max_weekly_loss_amount': int(TOTAL_CAPITAL * 0.08),  # 8% of capital
         'profit_lock_threshold': PROFIT_LOCK_THRESHOLD,
         'profit_lock_reduce_pct': 50,  # Reduce size by 50% after profit lock
+    },
+    'costs': {
+        'enabled': COST_ACCOUNTING_ENABLED,
+        'brokerage_per_order': COST_BROKERAGE_PER_ORDER,
     },
     'trading': {
         'symbol': SYMBOL,
