@@ -697,6 +697,23 @@ def main():
                 pass
 
 
+            # An operator Stop is handled before the automatic kill switch and
+            # separately from it. It used to be written straight into state.state
+            # from the Telegram thread, which overwrote "IN_TRADE" — and only the
+            # IN_TRADE branch runs the exit path, so the position was orphaned —
+            # and was then cleared by the recovery branch below on the next pass,
+            # so trading resumed. Stop did neither thing it reported. Here the
+            # open position is closed through the same exit path every other exit
+            # uses, and the halt holds until Resume clears the flag.
+            if getattr(state, 'manual_stop', False):
+                if state.current_trade:
+                    close_current_trade(state, "Manual stop (Telegram)", logger, tick)
+                if state.state != "KILL_SWITCH":
+                    state.state = "KILL_SWITCH"
+                    logger.warning("⏹ MANUAL STOP - position closed, no new entries until /resume")
+                time.sleep(1)
+                continue
+
             if kill_triggered:
                 if state.current_trade:
                     close_current_trade(state, "Kill switch: " + kill_reason, logger, tick)
@@ -746,8 +763,10 @@ def main():
                 time.sleep(1)
                 continue
             
-            # If we were in KILL_SWITCH but kill check passed, recover to IDLE
-            if state.state == "KILL_SWITCH":
+            # If we were in KILL_SWITCH but kill check passed, recover to IDLE.
+            # A manual stop is deliberately not cleared here — this branch is what
+            # used to silently undo the operator's Stop one iteration after it.
+            if state.state == "KILL_SWITCH" and not getattr(state, 'manual_stop', False):
                 state.state = "IDLE"
                 if clear_info.get('reason') == 'recovered':
                     logger.info(f"✅ Stale data recovered - {clear_info.get('valid_ticks', 10)} consecutive valid ticks - resuming trading")

@@ -196,7 +196,10 @@ class TelegramBot:
         hb_on = bool(self.prefs.get('heartbeat'))
         hb_btn = ("💓 Heartbeat ON", "hb_off") if hb_on else ("🩶 Heartbeat OFF", "hb_on")
 
-        is_stopped = self.bot_state and getattr(self.bot_state, 'state', '') == 'KILL_SWITCH'
+        is_stopped = bool(self.bot_state) and (
+            getattr(self.bot_state, 'manual_stop', False)
+            or getattr(self.bot_state, 'state', '') == 'KILL_SWITCH'
+        )
         trade_btn = ("▶️ Resume", "resume") if is_stopped else ("⏹ Stop", "stop")
 
         n_err = self.error_count()
@@ -529,8 +532,15 @@ class TelegramBot:
 
     async def _cb_stop_trading(self, callback_id: str, msg_id: int):
         if self.bot_state:
-            self.bot_state.state = "KILL_SWITCH"
-            await self._answer_callback(callback_id, "⏹ Trading stopped")
+            # Record the operator's intent; do NOT write state.state from this
+            # thread. Writing "KILL_SWITCH" here used to overwrite "IN_TRADE",
+            # which orphaned any open position because only the IN_TRADE branch
+            # of the main loop ever runs the exit path — and the main loop then
+            # cleared the kill switch on its next pass, so trading resumed
+            # anyway. The main loop reads this flag, closes any open position
+            # through the normal exit path, and then halts.
+            self.bot_state.manual_stop = True
+            await self._answer_callback(callback_id, "⏹ Stopping — closing any open position")
         else:
             await self._answer_callback(callback_id, "❌ No state")
         text = self._build_dashboard_text()
@@ -538,7 +548,11 @@ class TelegramBot:
 
     async def _cb_resume_trading(self, callback_id: str, msg_id: int):
         if self.bot_state:
-            self.bot_state.state = "IDLE"
+            # Clearing the intent is enough: the main loop's own recovery path
+            # returns to IDLE once no kill condition holds. Forcing "IDLE" from
+            # here would overwrite "IN_TRADE" and lose an open position exactly
+            # the way Stop used to.
+            self.bot_state.manual_stop = False
             await self._answer_callback(callback_id, "▶️ Trading resumed")
         else:
             await self._answer_callback(callback_id, "❌ No state")
@@ -709,14 +723,14 @@ class TelegramBot:
 
     async def _cmd_stop(self, chat_id: str):
         if self.bot_state:
-            self.bot_state.state = "KILL_SWITCH"
-            await self._send_msg("⏹ <b>Trading stopped</b>\nBot continues monitoring. Use /resume to restart.")
+            self.bot_state.manual_stop = True
+            await self._send_msg("⏹ <b>Stopping</b>\nAny open position is being closed through the normal exit path. No new entries. Use /resume to restart.")
         else:
             await self._send_msg("❌ Bot state not available")
 
     async def _cmd_resume(self, chat_id: str):
         if self.bot_state:
-            self.bot_state.state = "IDLE"
+            self.bot_state.manual_stop = False
             await self._send_msg("▶️ <b>Trading resumed</b>")
         else:
             await self._send_msg("❌ Bot state not available")
