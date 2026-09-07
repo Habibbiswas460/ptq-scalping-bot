@@ -383,6 +383,22 @@ STRATEGY_VERSION = '3.4'
 MIN_SCORE_TO_TRADE = env_int('MIN_SCORE', 4)  # v3.4 entry gate lowered to 4
 MIN_CONFIDENCE = env_int('MIN_CONFIDENCE', 70)  # Balanced: 70% (was 80, too strict)
 MIN_CONFIDENCE_AFTER_3SL = env_int('MIN_CONFIDENCE_AFTER_3SL', 85)  # After 5 consecutive SL (was 92)
+
+# --- Range-position entry experiment (default OFF) --------------------------
+# See core/engines/range_position.py and
+# claude_code/report/strategy_research_20260908.md §4.3. Measured on this
+# project's own ticks: entering in the top 20% of the option's 60-second range
+# is the worst-priced entry available (-0.359 gross points), the bottom 20% the
+# best (+0.192, the only positive cell of 27) — and the scoring stack is a
+# momentum/breakout detector, i.e. aimed at the worst cell. This gate restricts
+# entries to the low end of the range so the claim can be tested as ONE variable
+# against a pre-registered threshold. It is OFF by default and must stay off
+# until that experiment has been registered and scored on a held-out session:
+# the samples behind it overlap heavily, and even if the effect is real it is 22%
+# of what is needed to clear costs. It is a diagnosis, not a cure.
+ENTRY_RANGE_FILTER_ENABLED = env_bool('ENTRY_RANGE_FILTER_ENABLED', False)
+ENTRY_RANGE_MAX_POSITION = env_float('ENTRY_RANGE_MAX_POSITION', 0.20)
+ENTRY_RANGE_WINDOW_SEC = env_float('ENTRY_RANGE_WINDOW_SEC', 60.0)
 MAX_CONFIDENCE_SCORE = env_int('MAX_CONFIDENCE_SCORE', 11)  # 11-factor scoring model
 
 # Entry Price Filter (ATM nearby range)

@@ -18,6 +18,7 @@ from core.risk.session_trend import (
 )
 from config.constants import (
     MIN_CONFIDENCE, MIN_CONFIDENCE_AFTER_3SL,
+    ENTRY_RANGE_FILTER_ENABLED, ENTRY_RANGE_MAX_POSITION, ENTRY_RANGE_WINDOW_SEC,
     MIN_ENTRY_PREMIUM, MAX_ENTRY_PREMIUM,
     KILL_SWITCH_SPREAD,
 )
@@ -205,6 +206,37 @@ def entry_signal(tick: Dict, day_type: str, instrument_type: str = "") -> Tuple[
                 if consecutive_losses >= 3:
                     return False, f"Low conf {confidence}% < {required_conf}% (3+ SL streak)"
                 return False, f"Low confidence {confidence}% < {required_conf}%"
+
+            # ═══════════════════════════════════════════════════════════════
+            # RANGE-POSITION EXPERIMENT (default OFF) — see
+            # core/engines/range_position.py. Measured on this project's own
+            # ticks, buying the top of the option's 60-second range is the
+            # worst-priced entry available and the bottom is the best; the
+            # scoring stack above is a breakout detector, i.e. pointed at the
+            # worst end. This gate restricts entries to the low end so that
+            # claim can be tested as one variable. It fails OPEN: if the range
+            # cannot be attributed to the contract being traded, the entry
+            # proceeds and the reason is logged. A filter that blocks on data it
+            # could not measure is a halt wearing a filter's clothing, and this
+            # project has already shipped one of those.
+            # ═══════════════════════════════════════════════════════════════
+            if ENTRY_RANGE_FILTER_ENABLED:
+                from core.engines.range_position import range_position
+                pos, detail = range_position(
+                    recent_ticks,
+                    execution_tick.get('symbol', ''),
+                    window_sec=ENTRY_RANGE_WINDOW_SEC,
+                )
+                if pos is None:
+                    import logging
+                    logging.debug("Range filter skipped (%s)", detail)
+                elif pos > ENTRY_RANGE_MAX_POSITION:
+                    _log_signal_snapshot(
+                        params, False,
+                        f"Range position {pos:.2f} > {ENTRY_RANGE_MAX_POSITION:.2f}")
+                    return False, (
+                        f"Range position {pos:.2f} > {ENTRY_RANGE_MAX_POSITION:.2f} "
+                        f"— buying strength ({detail})")
 
             # ═══════════════════════════════════════════════════════════════
             # ENTRY PRICE FILTER (v3.1) - ATM nearby ₹90-150 range
