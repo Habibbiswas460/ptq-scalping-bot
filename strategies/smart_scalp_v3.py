@@ -23,6 +23,7 @@ Backtest Results (6 months):
 """
 
 import json
+import logging
 import time as _time
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
@@ -31,7 +32,9 @@ import os
 from collections import deque
 from statistics import median
 
-from core.engines.weighted_score_engine import WeightedScoreEngine
+from strategies.scoring import WeightedScoreEngine
+from strategies import market_context, market_gate, selector
+from strategies import pullback_strategy as _pullback_strategy_module
 from config.constants import TRADING_NO_TRADE_BEFORE
 
 def _parse_no_trade_before() -> tuple:
@@ -44,7 +47,7 @@ def _parse_no_trade_before() -> tuple:
         return 9, 45
 
 
-from core.engines.adaptive_confidence_engine import AdaptiveConfidenceEngine
+from strategies.scoring import AdaptiveConfidenceEngine
 from core.engines.market_quality_engine import MarketQualityEngine
 from config.constants import (
     SL_POINTS_FIXED, TP_POINTS_FIXED,
@@ -414,452 +417,46 @@ class SmartScalpV3:
         """
         Calculate all technical indicators from tick data.
         Converts ticks to OHLCV and calculates indicators.
-        
+
         Uses simulated/broker tick data for indicators.
+
+        Phase C: delegates to strategies.market_context.compute_indicators() —
+        the Market Context module — passing this instance's configured periods
+        explicitly. No formula, threshold, or period value changed; this is a
+        pure code-motion (see claude_code/report/strategy_rebuild_phaseC_*.md).
+        The Supertrend computation that previously lived here was deleted —
+        zero consumers repo-wide, re-verified immediately before deletion.
         """
-        prices, highs, lows, volumes = [], [], [], []
-        
-        # P0 FIX: Prioritize true 5-min OHLC canonical candles if available in live/paper mode.
-        chunk_size = 1
-        try:
-            from core.runtime.state import runtime_state
-            canonical = runtime_state.get_canonical_candles(interval_min=5)
-            # We need at least 15 canonical candles to get a functional EMA
-            if len(canonical) >= 15:
-                prices = [c["close"] for c in canonical]
-                highs = [c["high"] for c in canonical]
-                lows = [c["low"] for c in canonical]
-                volumes = [c.get("volume", 0) for c in canonical]
-                # NOTE: chunk_size stays 1 here (its initializer above) -
-                # prices/highs/lows are already one entry per candle, unlike
-                # the legacy tick-chunking fallback below where chunk_size
-                # maps a chunk index back into a raw per-tick prices array.
-                # Overriding it to len(prices)//60 (as the legacy path does)
-                # would misalign highs[i]/lows[i] against prices[i*chunk_size]
-                # once there are more than ~120 canonical candles cached.
-        except Exception:
-            pass
-
-        # Fallback to legacy tick chunking for backtester or empty state
-        if not prices:
-            # Need at least 60 ticks for reliable indicators
-            if len(ticks) < 60:
-                return {}
-            
-            # Use spot_price for indicators (NIFTY spot), ltp for option premium
-            prices = [t.get('spot_price', t.get('ltp', 0)) for t in ticks]
-            volumes = [t.get('volume', 10000) for t in ticks]
-            
-            # Validate prices - use ltp if spot_price is invalid
-            if prices and prices[-1] < 1000:
-                prices = [t['ltp'] for t in ticks]
-            
-            # Calculate high/low from prices
-            chunk_size = max(1, len(prices) // 60)  # ~1 minute chunks
-            
-            for i in range(0, len(prices), chunk_size):
-                chunk_prices = prices[i:i+chunk_size]
-                if chunk_prices:
-                    highs.append(max(chunk_prices))
-                    lows.append(min(chunk_prices))
-            
-            if len(highs) < 30:
-                return {}
-        
-        indicators = {}
-        
-        # EMAs
-        indicators['EMA_5'] = self._ema(prices, self.ema_fast)
-        indicators['EMA_9'] = self._ema(prices, self.ema_signal)
-        indicators['EMA_21'] = self._ema(prices, self.ema_medium)
-        indicators['EMA_50'] = self._ema(prices, self.ema_slow)
-        
-        # RSI
-        indicators['RSI'] = self._rsi(prices, self.rsi_period)
-        
-        # MACD - O(n) optimized version (BUG FIX #9: was O(n²))
-        # Calculate EMAs incrementally instead of recalculating for each point
-        if len(prices) >= self.macd_slow:
-            fast_ema = self._ema(prices, self.macd_fast)
-            slow_ema = self._ema(prices, self.macd_slow)
-            macd_line = fast_ema - slow_ema
-            
-            # For signal line, we need MACD history - calculate efficiently
-            # Use last N MACD values where N = signal period * 3 for accuracy
-            lookback = min(len(prices) - self.macd_slow, self.macd_signal_period * 3)
-            if lookback >= self.macd_signal_period:
-                # Calculate recent MACD values for signal line
-                macd_values = []
-                for i in range(lookback, 0, -1):
-                    idx = len(prices) - i
-                    f_ema = self._ema(prices[:idx+1], self.macd_fast)
-                    s_ema = self._ema(prices[:idx+1], self.macd_slow)
-                    macd_values.append(f_ema - s_ema)
-                macd_values.append(macd_line)
-                
-                signal_line = self._ema(macd_values, self.macd_signal_period)
-                indicators['MACD'] = macd_line
-                indicators['MACD_Signal'] = signal_line
-                indicators['MACD_Hist'] = macd_line - signal_line
-                # Previous histogram
-                if len(macd_values) > 1:
-                    prev_signal = self._ema(macd_values[:-1], self.macd_signal_period)
-                    indicators['MACD_Hist_Prev'] = macd_values[-2] - prev_signal
-                else:
-                    indicators['MACD_Hist_Prev'] = indicators['MACD_Hist']
-            else:
-                indicators['MACD'] = macd_line
-                indicators['MACD_Signal'] = macd_line
-                indicators['MACD_Hist'] = 0
-                indicators['MACD_Hist_Prev'] = 0
-        else:
-            indicators['MACD'] = 0
-            indicators['MACD_Signal'] = 0
-            indicators['MACD_Hist'] = 0
-            indicators['MACD_Hist_Prev'] = 0
-        
-        # Bollinger Bands
-        sma_20 = sum(prices[-self.bb_period:]) / self.bb_period if len(prices) >= self.bb_period else prices[-1]
-        std_20 = self._std(prices[-self.bb_period:]) if len(prices) >= self.bb_period else 0
-        indicators['BB_Mid'] = sma_20
-        indicators['BB_Upper'] = sma_20 + self.bb_std * std_20
-        indicators['BB_Lower'] = sma_20 - self.bb_std * std_20
-        
-        # ATR (simplified from highs/lows)
-        atr_values = []
-        for i in range(1, min(len(highs), len(lows), self.atr_period + 1)):
-            tr = max(
-                highs[i] - lows[i],
-                abs(highs[i] - prices[min(i*chunk_size, len(prices)-1)]),
-                abs(lows[i] - prices[min(i*chunk_size, len(prices)-1)])
-            )
-            atr_values.append(tr)
-        indicators['ATR'] = sum(atr_values) / len(atr_values) if atr_values else 50
-        
-        # Keltner Channel
-        kc_ema = self._ema(prices, self.kc_period)
-        indicators['KC_Mid'] = kc_ema
-        indicators['KC_Upper'] = kc_ema + self.kc_atr_mult * indicators['ATR']
-        indicators['KC_Lower'] = kc_ema - self.kc_atr_mult * indicators['ATR']
-
-        # Lightweight supertrend proxy for runtime state continuity.
-        st_upper = indicators['EMA_21'] + (1.5 * indicators['ATR'])
-        st_lower = indicators['EMA_21'] - (1.5 * indicators['ATR'])
-        if prices[-1] > st_upper:
-            supertrend = "BULLISH"
-        elif prices[-1] < st_lower:
-            supertrend = "BEARISH"
-        else:
-            supertrend = "NEUTRAL"
-        indicators['Supertrend'] = supertrend
-        
-        # Squeeze Detection (BB inside KC)
-        indicators['Squeeze'] = (
-            indicators['BB_Lower'] > indicators['KC_Lower'] and 
-            indicators['BB_Upper'] < indicators['KC_Upper']
+        indicators = market_context.compute_indicators(
+            ticks,
+            {
+                'ema_fast': self.ema_fast,
+                'ema_signal': self.ema_signal,
+                'ema_medium': self.ema_medium,
+                'ema_slow': self.ema_slow,
+                'rsi_period': self.rsi_period,
+                'macd_fast': self.macd_fast,
+                'macd_slow': self.macd_slow,
+                'macd_signal_period': self.macd_signal_period,
+                'bb_period': self.bb_period,
+                'bb_std': self.bb_std,
+                'atr_period': self.atr_period,
+                'kc_period': self.kc_period,
+                'kc_atr_mult': self.kc_atr_mult,
+                'vol_sma': self.vol_sma,
+            },
+            runtime_state=runtime_state,
+            volume_spike_multiplier=VOLUME_SPIKE_MULTIPLIER,
         )
-        
-        # Check if was in squeeze recently
-        indicators['Was_Squeeze'] = False  # Will be updated with historical data
-        
-        # Volume
-        vol_sma = sum(volumes[-self.vol_sma:]) / self.vol_sma if len(volumes) >= self.vol_sma else sum(volumes) / len(volumes)
-        indicators['Vol_SMA'] = vol_sma
-        indicators['Vol_Ratio'] = volumes[-1] / vol_sma if vol_sma > 0 else 1
-        
-        # v3.1: Volume Spike Detection (>1.5x average)
-        indicators['Volume_Spike'] = indicators['Vol_Ratio'] > VOLUME_SPIKE_MULTIPLIER
-        
-        # v3.1: VWAP Calculation (Volume Weighted Average Price)
-        # VWAP = Σ(Price × Volume) / Σ(Volume)
-        if len(prices) >= 20 and len(volumes) >= 20:
-            total_vol = sum(volumes[-60:]) if len(volumes) >= 60 else sum(volumes)
-            if total_vol > 0:
-                vwap_sum = sum(p * v for p, v in zip(prices[-60:], volumes[-60:])) if len(prices) >= 60 else sum(p * v for p, v in zip(prices, volumes))
-                indicators['VWAP'] = vwap_sum / total_vol
-            else:
-                indicators['VWAP'] = prices[-1]
-        else:
-            indicators['VWAP'] = prices[-1]
-        
-        # VWAP trend (price vs VWAP)
-        indicators['Above_VWAP'] = prices[-1] > indicators['VWAP']
-        indicators['Below_VWAP'] = prices[-1] < indicators['VWAP']
-        indicators['VWAP_Distance_Pct'] = ((prices[-1] - indicators['VWAP']) / indicators['VWAP'] * 100) if indicators['VWAP'] > 0 else 0
-        
-        # Momentum (5-period ROC)
-        if len(prices) >= 6:
-            indicators['MOM'] = (prices[-1] - prices[-6]) / prices[-6] * 100
-        else:
-            indicators['MOM'] = 0
-        
-        # Current price data
-        indicators['Close'] = prices[-1]
-        indicators['Prev_Close'] = prices[-2] if len(prices) >= 2 else prices[-1]
-        indicators['High'] = max(prices[-chunk_size:]) if chunk_size > 0 else prices[-1]
-        indicators['Low'] = min(prices[-chunk_size:]) if chunk_size > 0 else prices[-1]
-        
         self._last_calc_time = datetime.now()
-        if runtime_state is not None:
-            runtime_state.set_indicators(indicators)
-        
         return indicators
     
-    def _ema(self, prices: List[float], period: int) -> float:
-        """Calculate EMA"""
-        if len(prices) < period:
-            return prices[-1] if prices else 0
-        
-        multiplier = 2 / (period + 1)
-        ema = sum(prices[:period]) / period
-        
-        for price in prices[period:]:
-            ema = (price - ema) * multiplier + ema
-        
-        return ema
-    
-    def _rsi(self, prices: List[float], period: int) -> float:
-        """Calculate RSI using Wilder's smoothed moving average (correct method)
-        
-        BUG FIX #8: Use EMA smoothing (alpha = 1/period) instead of SMA
-        This matches TradingView, MetaTrader, and standard TA libraries
-        """
-        if len(prices) < period + 1:
-            return 50
-        
-        # Calculate price changes
-        changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-        
-        if len(changes) < period:
-            return 50
-        
-        # Separate gains and losses
-        gains = [max(c, 0) for c in changes]
-        losses = [abs(min(c, 0)) for c in changes]
-        
-        # First average (SMA for initial value)
-        avg_gain = sum(gains[:period]) / period
-        avg_loss = sum(losses[:period]) / period
-        
-        # Wilder's smoothed moving average for remaining values
-        # Formula: new_avg = (prev_avg * (period-1) + current_value) / period
-        for i in range(period, len(gains)):
-            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        
-        if avg_loss == 0:
-            return 100 if avg_gain > 0 else 50
-        
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
-    
-    def _std(self, values: List[float]) -> float:
-        """Calculate standard deviation"""
-        if len(values) < 2:
-            return 0
-        mean = sum(values) / len(values)
-        variance = sum((x - mean) ** 2 for x in values) / len(values)
-        return variance ** 0.5
-    
-    def calculate_bullish_score(self, indicators: Dict) -> Tuple[int, List[str]]:
-        """
-        Calculate bullish score based on 10 factors.
-        Returns (score, list of triggered factors)
-        """
-        score = 0
-        factors = []
-        
-        close = indicators.get('Close', 0)
-        prev_close = indicators.get('Prev_Close', 0)
-        high = indicators.get('High', 0)
-        low = indicators.get('Low', 0)
-        
-        ema5 = indicators.get('EMA_5', 0)
-        ema9 = indicators.get('EMA_9', 0)
-        ema21 = indicators.get('EMA_21', 0)
-        ema50 = indicators.get('EMA_50', 0)
-        
-        rsi = indicators.get('RSI', 50)
-        macd_hist = indicators.get('MACD_Hist', 0)
-        macd_hist_prev = indicators.get('MACD_Hist_Prev', 0)
-        
-        bb_upper = indicators.get('BB_Upper', close * 1.02)
-        bb_lower = indicators.get('BB_Lower', close * 0.98)
-        
-        squeeze = indicators.get('Squeeze', False)
-        was_squeeze = indicators.get('Was_Squeeze', False)
-        
-        vol_ratio = indicators.get('Vol_Ratio', 1)
-        mom = indicators.get('MOM', 0)
-        
-        # Factor 1: EMA 9 > EMA 21 (trend)
-        if ema9 > ema21:
-            score += 1
-            factors.append("EMA9>21")
-            
-            # Factor 2: EMA 5 > EMA 9 (strong trend)
-            if ema5 > ema9:
-                score += 1
-                factors.append("EMA5>9")
-        
-        # Factor 3: Price above EMA 9
-        if close > ema9:
-            score += 1
-            factors.append("Close>EMA9")
-        
-        # Factor 4: Price above EMA 21
-        if close > ema21:
-            score += 1
-            factors.append("Close>EMA21")
-        
-        # Factor 5: RSI in bullish zone (50-70)
-        if 50 < rsi < 70:
-            score += 1
-            factors.append(f"RSI_Bull({rsi:.0f})")
-        
-        # Factor 6: MACD bullish momentum
-        if macd_hist > 0 and macd_hist > macd_hist_prev:
-            score += 1
-            factors.append("MACD_Rising")
-        
-        # Factor 7: Squeeze breakout (2 points)
-        if was_squeeze and not squeeze and macd_hist > 0:
-            score += 2
-            factors.append("Squeeze_Breakout!")
-        
-        # Factor 8: Volume confirmation
-        if vol_ratio > 1.2 and close > prev_close:
-            score += 1
-            factors.append(f"Vol_Confirm({vol_ratio:.1f}x)")
-        
-        # Factor 9: Positive momentum
-        if mom > 0.1:
-            score += 1
-            factors.append(f"MOM+({mom:.2f}%)")
-        
-        # Factor 10: EMA 9 pullback touch
-        if low <= ema9 <= close:
-            score += 1
-            factors.append("EMA9_Pullback")
-        
-        # === DISQUALIFY CONDITIONS ===
-        
-        # Overbought
-        if rsi > 75:
-            score -= 3
-            factors.append("⚠️RSI_OB")
-        
-        # Extended beyond BB
-        if close > bb_upper:
-            score -= 2
-            factors.append("⚠️BB_Extended")
-        
-        # Wrong trend (complete disqualify)
-        if ema9 < ema21:
-            score = 0
-            factors = ["❌Wrong_Trend"]
-        
-        return max(0, score), factors
-    
-    def calculate_bearish_score(self, indicators: Dict) -> Tuple[int, List[str]]:
-        """
-        Calculate bearish score based on 10 factors.
-        Returns (score, list of triggered factors)
-        """
-        score = 0
-        factors = []
-        
-        close = indicators.get('Close', 0)
-        prev_close = indicators.get('Prev_Close', 0)
-        high = indicators.get('High', 0)
-        low = indicators.get('Low', 0)
-        
-        ema5 = indicators.get('EMA_5', 0)
-        ema9 = indicators.get('EMA_9', 0)
-        ema21 = indicators.get('EMA_21', 0)
-        ema50 = indicators.get('EMA_50', 0)
-        
-        rsi = indicators.get('RSI', 50)
-        macd_hist = indicators.get('MACD_Hist', 0)
-        macd_hist_prev = indicators.get('MACD_Hist_Prev', 0)
-        
-        bb_upper = indicators.get('BB_Upper', close * 1.02)
-        bb_lower = indicators.get('BB_Lower', close * 0.98)
-        
-        squeeze = indicators.get('Squeeze', False)
-        was_squeeze = indicators.get('Was_Squeeze', False)
-        
-        vol_ratio = indicators.get('Vol_Ratio', 1)
-        mom = indicators.get('MOM', 0)
-        
-        # Factor 1: EMA 9 < EMA 21 (trend)
-        if ema9 < ema21:
-            score += 1
-            factors.append("EMA9<21")
-            
-            # Factor 2: EMA 5 < EMA 9 (strong trend)
-            if ema5 < ema9:
-                score += 1
-                factors.append("EMA5<9")
-        
-        # Factor 3: Price below EMA 9
-        if close < ema9:
-            score += 1
-            factors.append("Close<EMA9")
-        
-        # Factor 4: Price below EMA 21
-        if close < ema21:
-            score += 1
-            factors.append("Close<EMA21")
-        
-        # Factor 5: RSI in bearish zone (30-50)
-        if 30 < rsi < 50:
-            score += 1
-            factors.append(f"RSI_Bear({rsi:.0f})")
-        
-        # Factor 6: MACD bearish momentum
-        if macd_hist < 0 and macd_hist < macd_hist_prev:
-            score += 1
-            factors.append("MACD_Falling")
-        
-        # Factor 7: Squeeze breakout (2 points)
-        if was_squeeze and not squeeze and macd_hist < 0:
-            score += 2
-            factors.append("Squeeze_Breakout!")
-        
-        # Factor 8: Volume confirmation
-        if vol_ratio > 1.2 and close < prev_close:
-            score += 1
-            factors.append(f"Vol_Confirm({vol_ratio:.1f}x)")
-        
-        # Factor 9: Negative momentum
-        if mom < -0.1:
-            score += 1
-            factors.append(f"MOM-({mom:.2f}%)")
-        
-        # Factor 10: EMA 9 rejection touch
-        if high >= ema9 >= close:
-            score += 1
-            factors.append("EMA9_Rejection")
-        
-        # === DISQUALIFY CONDITIONS ===
-        
-        # Oversold
-        if rsi < 25:
-            score -= 3
-            factors.append("⚠️RSI_OS")
-        
-        # Extended below BB
-        if close < bb_lower:
-            score -= 2
-            factors.append("⚠️BB_Extended")
-        
-        # Wrong trend (complete disqualify)
-        if ema9 > ema21:
-            score = 0
-            factors = ["❌Wrong_Trend"]
-        
-        return max(0, score), factors
+    # Phase C: calculate_bullish_score() and calculate_bearish_score() — a
+    # second, unreferenced implementation of the CE/PE setup score — were
+    # deleted here. Re-verified zero consumers repo-wide immediately before
+    # deletion (see claude_code/report/strategy_rebuild_phaseC_*.md). The live
+    # setup score has always been evaluate_pullback_strategy() -> now
+    # strategies/pullback_strategy.py.
 
     def get_market_regime(self, indicators: Dict) -> str:
         """Determine market regime: BULLISH, BEARISH, or SIDEWAYS"""
@@ -877,6 +474,24 @@ class SmartScalpV3:
             return "BULLISH"
         else:
             return "BEARISH"
+
+    def evaluate_pullback_strategy(self, indicators: Dict, oi_direction: str) -> Dict:
+        """
+        PULLBACK strategy — the explicit Strategy boundary.
+
+        Phase C: delegates to strategies.pullback_strategy.evaluate_pullback_strategy(),
+        passing this instance's threshold/toggle configuration explicitly. No
+        condition, threshold, or evaluation order changed — pure code-motion
+        (claude_code/report/strategy_rebuild_phaseC_*.md). Kept as a method (not
+        removed) so the existing public call shape — strategy.evaluate_pullback_strategy(...)
+        — used by generate_signal() and by tests continues to work unchanged.
+        """
+        return _pullback_strategy_module.evaluate_pullback_strategy(
+            indicators, oi_direction,
+            min_score=self.min_score,
+            vwap_enabled=VWAP_ENABLED,
+            oi_change_enabled=OI_CHANGE_ENABLED,
+        )
 
     def generate_signal(self, ticks: List[Dict]) -> Tuple[int, str, int, Dict]:
         """
@@ -989,185 +604,88 @@ class SmartScalpV3:
                 'reason': latest_tick.get('invalid_reason')
             }
         )
-        details['market_quality'] = market_quality
-        details['market_quality_pass'] = market_quality.get('passed', False)
-        details['market_quality_score'] = market_quality.get('quality_score', 0)
-        details['market_quality_grade'] = market_quality.get('grade', 'REJECT')
-        details['market_quality_components'] = market_quality.get('components', {})
-        details['hard_reject_reason'] = market_quality.get('hard_reject_reason')
+        # Phase C: MQ-result unpacking and chop detection delegate to
+        # strategies.market_gate — the Market Gate module ("is the market
+        # tradable?"). Same keys, same fallback values, same thresholds; pure
+        # code-motion (claude_code/report/strategy_rebuild_phaseC_*.md).
+        details.update(market_gate.build_market_quality_details(market_quality))
 
         if not market_quality.get('passed', False):
-            details["reason"] = (
-                market_quality.get('hard_reject_reason')
-                or market_quality.get('reason')
-                or f"Market quality gate failed: {market_quality.get('quality_score', 0)}"
-            )
+            details["reason"] = market_gate.market_quality_rejection_reason(market_quality)
             return 0, "", 0, details
-        
-        # ═══════════════════════════════════════════════════════════════
-        # PHASE 3: ENHANCED CHOP DETECTOR (v3.2)
-        # ═══════════════════════════════════════════════════════════════
-        ema_diff_pts = abs(ema9 - ema21)
-        atr = indicators.get('ATR', 50)
-        macd_hist = indicators.get('MACD_Hist', 0)
-        macd_hist_prev = indicators.get('MACD_Hist_Prev', 0)
-        
-        # Chop Detection Criteria:
-        # 1. EMA squeeze (basic) - increased threshold
-        min_ema_separation = 0.8  # Slightly relaxed to avoid over-blocking valid pullbacks
-        
-        # 2. Low ATR = low volatility = choppy
-        # Note: Option ATR is much smaller than index (0-10 vs 30-100)
-        low_atr_threshold = 3  # Treat only very low ATR as chop for option premium flow
-        
-        # 3. MACD histogram flattening (momentum dying)
-        macd_flat = abs(macd_hist) < 0.25 and abs(macd_hist - macd_hist_prev) < 0.2
-        
-        is_choppy = False
-        chop_reason = []
-        
-        if ema_diff_pts < min_ema_separation:
-            is_choppy = True
-            chop_reason.append(f"EMA squeeze ({ema_diff_pts:.1f}pts)")
-        
-        if atr < low_atr_threshold:
-            is_choppy = True
-            chop_reason.append(f"Low ATR ({atr:.0f})")
-        
-        if macd_flat:
-            is_choppy = True
-            chop_reason.append("MACD flat")
-        
-        # Block only if ALL 3 chop indicators fire (relaxed from 2+)
-        if len(chop_reason) >= 3:
+
+        is_choppy, chop_reason = market_gate.evaluate_chop(indicators, ema9, ema21)
+        if is_choppy:
             details["reason"] = f"Chop filter: {', '.join(chop_reason)}"
             details["is_choppy"] = True
             return 0, "", 0, details
         
-        # ====== PULLBACK LOGIC FOR CE (BULLISH) ======
-        # Balanced scoring - conditions are independent, not nested
-        # Score 4+ needed for signal (out of 12 possible with v3.1 additions)
-        
-        ce_signal = False
-        ce_score = 0
-        ce_factors = []
-        
-        # Condition 1: Trend UP (EMA9 > EMA21) - Required
-        if ema9 > ema21:
-            ce_factors.append("EMA9>21")
-            ce_score += 2
-            
-            # Condition 2: Pullback to EMA9 support (within 0.5%)
-            ema9_proximity = abs(low - ema9) / ema9 * 100 if ema9 > 0 else 999
-            if ema9_proximity < 0.5 or low <= ema9 <= close:
-                ce_factors.append("EMA9_Pullback")
-                ce_score += 2
-            
-            # Condition 3: Green candle (bullish)
-            if close > prev_close:
-                ce_factors.append("Green_Candle")
-                ce_score += 1
-                # Extra point if close above EMA9
-                if close > ema9:
-                    ce_factors.append("Close>EMA9")
-                    ce_score += 1
-            
-            # Condition 4: RSI confirmation (relaxed: > 45)
-            if rsi > 45:
-                ce_factors.append(f"RSI({rsi:.0f})>45")
-                ce_score += 1
-                # Extra point for strong momentum
-                if rsi > 55:
-                    ce_score += 1
-            
-            # ═══════════════════════════════════════════════════════════════
-            # v3.1 NEW FACTORS
-            # ═══════════════════════════════════════════════════════════════
-            
-            # Factor 5: VWAP Confirmation (price > VWAP = bullish bias)
-            if VWAP_ENABLED and indicators.get('Above_VWAP', False):
-                ce_factors.append("Above_VWAP")
-                ce_score += 1
-            
-            # Factor 6: Volume Spike (strong interest)
-            if indicators.get('Volume_Spike', False) and close > prev_close:
-                ce_factors.append(f"Vol_Spike({indicators.get('Vol_Ratio', 1):.1f}x)")
-                ce_score += 1
-            
-            # Factor 7: OI confirms bullish (Long buildup)
-            if OI_CHANGE_ENABLED and oi_direction in ["LONG_BUILDUP", "SHORT_COVERING"]:
-                ce_factors.append(f"OI_{oi_direction}")
-                ce_score += 1
-            
-            # Signal if score >= configured threshold (default 4)
-            # VWAP/OI/Volume boost confidence for position sizing, not gatekeeping
-            if ce_score >= self.min_score:
-                ce_signal = True
-        
-        # ====== PULLBACK LOGIC FOR PE (BEARISH) ======
-        # Balanced scoring - conditions are independent, not nested
-        # Score 4+ needed for signal (v3.4: relaxed from 5)
-        
-        pe_signal = False
-        pe_score = 0
-        pe_factors = []
-        
-        # Condition 1: Trend DOWN (EMA9 < EMA21) - Required
-        if ema9 < ema21:
-            pe_factors.append("EMA9<21")
-            pe_score += 2
-            
-            # Condition 2: Rejection at EMA9 resistance (within 0.5%)
-            ema9_proximity = abs(high - ema9) / ema9 * 100 if ema9 > 0 else 999
-            if ema9_proximity < 0.5 or close <= ema9 <= high:
-                pe_factors.append("EMA9_Rejection")
-                pe_score += 2
-            
-            # Condition 3: Red candle (bearish)
-            if close < prev_close:
-                pe_factors.append("Red_Candle")
-                pe_score += 1
-                # Extra point if close below EMA9
-                if close < ema9:
-                    pe_factors.append("Close<EMA9")
-                    pe_score += 1
-            
-            # Condition 4: RSI confirmation (PHASE 2: stricter RSI < 45)
-            if rsi < 45:
-                pe_factors.append(f"RSI({rsi:.0f})<45")
-                pe_score += 1
-                # Extra point for strong momentum
-                if rsi < 35:
-                    pe_score += 1
-            
-            # ═══════════════════════════════════════════════════════════════
-            # v3.1 NEW FACTORS
-            # ═══════════════════════════════════════════════════════════════
-            
-            # Factor 5: VWAP Confirmation (price < VWAP = bearish bias)
-            if VWAP_ENABLED and indicators.get('Below_VWAP', False):
-                pe_factors.append("Below_VWAP")
-                pe_score += 1
-            
-            # Factor 6: Volume Spike (strong selling interest)
-            if indicators.get('Volume_Spike', False) and close < prev_close:
-                pe_factors.append(f"Vol_Spike({indicators.get('Vol_Ratio', 1):.1f}x)")
-                pe_score += 1
-            
-            # Factor 7: OI confirms bearish (Short buildup)
-            if OI_CHANGE_ENABLED and oi_direction in ["SHORT_BUILDUP", "LONG_UNWINDING"]:
-                pe_factors.append(f"OI_{oi_direction}")
-                pe_score += 1
-            
-            # Signal if score >= configured threshold (default 4)
-            if pe_score >= self.min_score:
-                pe_signal = True
-        
+        # ====== STRATEGY: PULLBACK (Phase 3 — extracted to an explicit boundary) ======
+        # See evaluate_pullback_strategy() above. This call preserves the exact
+        # inputs, conditions, thresholds, and evaluation order that previously
+        # ran inline at this point in generate_signal() — nothing before it
+        # (premium, delta, market quality, chop, all above) or after it
+        # (weighted score, exhaustion, adaptive confidence, all below) moved.
+        pullback_result = self.evaluate_pullback_strategy(indicators, oi_direction)
+        ce_signal = pullback_result["ce_signal"]
+        ce_score = pullback_result["ce_score"]
+        ce_factors = pullback_result["ce_factors"]
+        pe_signal = pullback_result["pe_signal"]
+        pe_score = pullback_result["pe_score"]
+        pe_factors = pullback_result["pe_factors"]
+
         # ====== GENERATE SIGNAL ======
         details["ce_score"] = ce_score
         details["pe_score"] = pe_score
         details["ce_factors"] = ce_factors
         details["pe_factors"] = pe_factors
+        details["pullback_strategy"] = pullback_result["observability"]
+        # Phase C: Strategy Selector — additive only. Documents which direction's
+        # candidate the (only) Strategy produced; does not change ce_signal/
+        # pe_signal or the CE-checked-first control flow below, which is
+        # unchanged and remains the actual source of truth. See
+        # strategies/selector.py for why no priority logic was invented.
+        details["selected_direction"] = selector.select_direction(pullback_result)
+
+        # Phase 4 (Scoring Simplification): a single, ordered rejection-attribution
+        # record per direction — trigger/confirmation, then weighted-score threshold,
+        # then exhaustion, then confidence threshold — so "why did this fail" has one
+        # place to look instead of three differently-shaped signals (ce_score_threshold_fail,
+        # exhaustion, and a reason string that gets overwritten up to three times).
+        #
+        # This is additive only. It does not change ce_signal/pe_signal, does not
+        # change ce_weighted_pct/pe_weighted_pct, does not change confidence, and does
+        # not change any threshold. Weighted Score and Adaptive Confidence's raw
+        # percentages are live inputs to PositionSizeEngine's score/confidence
+        # multipliers (state_machine.py -> position_size_engine.py) and to
+        # entry_engine.py's own separate confidence re-check, so collapsing either
+        # into a boolean here would silently change position sizing and the
+        # external confidence gate — out of Phase 4's bounds (PositionSizeEngine and
+        # execution behaviour are explicitly not to be changed). See
+        # claude_code/report/strategy_architecture_phase4_*.md Step 11 for the full
+        # evidence trail behind this decision.
+        strategy_decision = {
+            "CE": {"trigger_confirmation": pullback_result["observability"]["CE"]["final"]},
+            "PE": {"trigger_confirmation": pullback_result["observability"]["PE"]["final"]},
+        }
+        details["strategy_decision"] = strategy_decision
+
+        def _finalize_strategy_decision():
+            # generate_signal() can return from several points once one direction
+            # resolves (e.g. CE passes and returns before PE's own checks run).
+            # Called right before every return past this point so BOTH directions'
+            # strategy_decision always end with a 'final'/'failed_at', regardless of
+            # which direction the function actually returned on. Backfill only —
+            # never overwrites a 'final' a direction already reached on its own.
+            for _dir, _score in (("CE", ce_score), ("PE", pe_score)):
+                if "final" not in strategy_decision[_dir]:
+                    strategy_decision[_dir]["final"] = "FAIL"
+                    if strategy_decision[_dir]["trigger_confirmation"] == "FAIL":
+                        strategy_decision[_dir]["failed_at"] = "trigger_confirmation"
+                    elif "weighted_score" in strategy_decision[_dir]:
+                        strategy_decision[_dir]["failed_at"] = "weighted_score"
+                    else:
+                        strategy_decision[_dir]["failed_at"] = "trigger_confirmation"
         
         # ═══════════════════════════════════════════════════════════════
         # PHASE 1: TREND EXHAUSTION DETECTION (v3.2)
@@ -1207,7 +725,12 @@ class SmartScalpV3:
                 f"Raw Score {ce_score_breakdown['raw_score']}/{ce_score_breakdown['total_weight']}"
                 f" -> Normalized Score {ce_score_breakdown['normalized_score_pct']}%"
             )
-            if ce_weighted_pct < self.min_weighted_score_pct:
+            ce_weighted_pass = ce_weighted_pct >= self.min_weighted_score_pct
+            strategy_decision["CE"]["weighted_score"] = {
+                "value": ce_weighted_pct, "threshold": self.min_weighted_score_pct,
+                "pass": ce_weighted_pass,
+            }
+            if not ce_weighted_pass:
                 ce_signal = False
                 details["ce_score_threshold_fail"] = (
                     f"CE weighted score {ce_weighted_pct}% < {self.min_weighted_score_pct}%"
@@ -1241,7 +764,12 @@ class SmartScalpV3:
                 f"Raw Score {pe_score_breakdown['raw_score']}/{pe_score_breakdown['total_weight']}"
                 f" -> Normalized Score {pe_score_breakdown['normalized_score_pct']}%"
             )
-            if pe_weighted_pct < self.min_weighted_score_pct:
+            pe_weighted_pass = pe_weighted_pct >= self.min_weighted_score_pct
+            strategy_decision["PE"]["weighted_score"] = {
+                "value": pe_weighted_pct, "threshold": self.min_weighted_score_pct,
+                "pass": pe_weighted_pass,
+            }
+            if not pe_weighted_pass:
                 pe_signal = False
                 details["pe_score_threshold_fail"] = (
                     f"PE weighted score {pe_weighted_pct}% < {self.min_weighted_score_pct}%"
@@ -1277,6 +805,10 @@ class SmartScalpV3:
             if ce_blocked:
                 ce_exhausted = True
                 details["exhaustion"] = ce_block_reason
+            strategy_decision["CE"]["exhaustion"] = {
+                "pass": not ce_exhausted,
+                "reason": details.get("exhaustion") if ce_exhausted else None,
+            }
 
         # PE Trend Exhaustion Check
         pe_exhausted = False
@@ -1292,7 +824,11 @@ class SmartScalpV3:
             if pe_blocked:
                 pe_exhausted = True
                 details["exhaustion"] = pe_block_reason
-        
+            strategy_decision["PE"]["exhaustion"] = {
+                "pass": not pe_exhausted,
+                "reason": details.get("exhaustion") if pe_exhausted else None,
+            }
+
         # CE Signal: Weighted score and adaptive confidence
         if ce_signal and not ce_exhausted:
             confidence, confidence_components = self.calculate_adaptive_confidence(
@@ -1305,19 +841,39 @@ class SmartScalpV3:
             details["weighted_score"] = ce_weighted_pct
             details["bull_score"] = ce_weighted_pct
             details["bull_factors"] = ce_factors
+            # Phase 6 (Sizing-Input Separation): the same weighted_score/confidence
+            # values already assigned above (unchanged), packaged as an explicit,
+            # dedicated contract for PositionSizeEngine's two consumers
+            # (state_machine.py's live path, core/backtest.py's offline path) to
+            # read instead of inferring them from the generic 'score'/'confidence'
+            # keys that also happen to gate this signal. Additive only — 'score'
+            # and 'confidence' below are untouched, and this does not change
+            # ce_signal or any threshold.
+            details["sizing_inputs"] = {"weighted_score": ce_weighted_pct, "confidence": confidence}
             details["reason"] = (
                 f"📈 CE PULLBACK: Score {ce_weighted_pct}% | Conf {confidence}%"
             )
-            if confidence < required_conf:
+            ce_conf_pass = confidence >= required_conf
+            strategy_decision["CE"]["confidence"] = {
+                "value": confidence, "threshold": required_conf, "pass": ce_conf_pass,
+            }
+            strategy_decision["CE"]["final"] = "PASS" if ce_conf_pass else "FAIL"
+            strategy_decision["CE"]["failed_at"] = None if ce_conf_pass else "confidence"
+            if not ce_conf_pass:
                 details["reason"] = (
                     f"Low confidence {confidence}% < {required_conf}%"
                     f" (MQ {details.get('market_quality_grade', 'NA')})"
                 )
                 # Keep the real confidence value for DVF/analytics even though the signal is rejected.
+                _finalize_strategy_decision()
                 return 0, "", confidence, details
+            _finalize_strategy_decision()
             return 1, "CE", confidence, details
         elif ce_signal and ce_exhausted:
+            strategy_decision["CE"]["final"] = "FAIL"
+            strategy_decision["CE"]["failed_at"] = "exhaustion"
             details["reason"] = f"CE signal blocked: {details.get('exhaustion', 'Trend exhausted')}"
+            _finalize_strategy_decision()
             return 0, "", 0, details
         
         # PE Signal: Weighted score and adaptive confidence
@@ -1332,29 +888,45 @@ class SmartScalpV3:
             details["weighted_score"] = pe_weighted_pct
             details["bear_score"] = pe_weighted_pct
             details["bear_factors"] = pe_factors
+            # Phase 6 (Sizing-Input Separation): see the CE block above for the
+            # full rationale. Same additive, non-gating packaging for PE.
+            details["sizing_inputs"] = {"weighted_score": pe_weighted_pct, "confidence": confidence}
             details["reason"] = (
                 f"📉 PE PULLBACK: Score {pe_weighted_pct}% | Conf {confidence}%"
             )
-            if confidence < required_conf:
+            pe_conf_pass = confidence >= required_conf
+            strategy_decision["PE"]["confidence"] = {
+                "value": confidence, "threshold": required_conf, "pass": pe_conf_pass,
+            }
+            strategy_decision["PE"]["final"] = "PASS" if pe_conf_pass else "FAIL"
+            strategy_decision["PE"]["failed_at"] = None if pe_conf_pass else "confidence"
+            if not pe_conf_pass:
                 details["reason"] = (
                     f"Low confidence {confidence}% < {required_conf}%"
                     f" (MQ {details.get('market_quality_grade', 'NA')})"
                 )
                 # Keep the real confidence value for DVF/analytics even though the signal is rejected.
+                _finalize_strategy_decision()
                 return 0, "", confidence, details
+            _finalize_strategy_decision()
             return 1, "PE", confidence, details
         elif pe_signal and pe_exhausted:
+            strategy_decision["PE"]["final"] = "FAIL"
+            strategy_decision["PE"]["failed_at"] = "exhaustion"
             details["reason"] = f"PE signal blocked: {details.get('exhaustion', 'Trend exhausted')}"
+            _finalize_strategy_decision()
             return 0, "", 0, details
         
-        # No valid pullback signal
+        # No valid pullback signal.
+        _finalize_strategy_decision()
+
         if ce_score > pe_score:
             details["reason"] = f"No CE pullback: Score {ce_score}/{self.max_confidence_score}, factors: {ce_factors}"
         elif pe_score > ce_score:
             details["reason"] = f"No PE pullback: Score {pe_score}/{self.max_confidence_score}, factors: {pe_factors}"
         else:
             details["reason"] = f"No pullback: CE={ce_score}, PE={pe_score}"
-        
+
         return 0, "", 0, details
     
     def get_entry_params(self, direction: str, confidence: int, indicators: Dict) -> Dict:
@@ -1492,6 +1064,10 @@ def smart_scalp_signal(ticks: List[Dict]) -> Tuple[bool, str, Dict]:
         "direction": direction,
         "score": details.get('weighted_score'),
         "confidence": confidence,
+        # Phase 6: the explicit sizing contract, alongside (not replacing) 'score'/
+        # 'confidence' above — same values, dedicated key so a consumer does not
+        # need to know 'score' happens to also be a gating field.
+        "sizing_inputs": details.get('sizing_inputs'),
         "sl_points": entry_params["sl_points"],
         "tp_points": entry_params["tp_points"],
         "regime": entry_params["regime"],

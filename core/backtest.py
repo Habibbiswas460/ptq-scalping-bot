@@ -294,7 +294,17 @@ class Backtester:
         qty = self.lot_size
 
         if self.use_position_size_engine and self._position_size_engine is not None:
-            weighted_score = float(details.get('weighted_score', details.get('score', 0)) or 0)
+            # Phase 6 (Sizing-Input Separation): prefer the explicit sizing_inputs
+            # contract over the generic 'weighted_score'/'score' keys, which also
+            # happen to gate the signal upstream in generate_signal(). Falls back
+            # to the pre-Phase-6 extraction unchanged when sizing_inputs is absent
+            # — a strict widening: when present, its value is the identical number
+            # the old path would have read, from the same source variable.
+            _sizing_inputs = details.get('sizing_inputs') if isinstance(details, dict) else None
+            if isinstance(_sizing_inputs, dict) and 'weighted_score' in _sizing_inputs:
+                weighted_score = float(_sizing_inputs.get('weighted_score', 0) or 0)
+            else:
+                weighted_score = float(details.get('weighted_score', details.get('score', 0)) or 0)
             market_quality = float(details.get('market_quality_score', details.get('market_quality', 0)) or 0)
             regime = str(entry_params.get('regime', details.get('regime', 'UNKNOWN')) or 'UNKNOWN')
             allocation = self._position_size_engine.calculate(

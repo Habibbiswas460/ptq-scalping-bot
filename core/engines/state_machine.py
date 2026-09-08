@@ -832,8 +832,23 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
         state.cooldown_until = now() + timedelta(seconds=COOLDOWN_NON_TRADE_BLOCK_SEC)
         return "COOLDOWN"
 
-    weighted_score = signal_params.get('score', details.get('weighted_score', 0)) if isinstance(signal_params, dict) else 0
-    confidence = signal_params.get('confidence', 0) if isinstance(signal_params, dict) else 0
+    # Phase 6 (Sizing-Input Separation): prefer the explicit sizing_inputs contract
+    # (strategies/smart_scalp_v3.py) over the generic 'score'/'confidence' keys,
+    # which also happen to gate the signal upstream. Falls back to the pre-Phase-6
+    # extraction unchanged when sizing_inputs is absent (e.g. an older/other
+    # strategy module, or a test fixture that doesn't populate it) — this is a
+    # strict widening, not a behaviour change: when sizing_inputs IS present, its
+    # values are computed from the identical source variables the old path read,
+    # at the identical point in generate_signal(), so the number is unchanged.
+    _sizing_inputs = signal_params.get('sizing_inputs') if isinstance(signal_params, dict) else None
+    if not isinstance(_sizing_inputs, dict):
+        _sizing_inputs = details.get('sizing_inputs') if isinstance(details, dict) else None
+    if isinstance(_sizing_inputs, dict):
+        weighted_score = _sizing_inputs.get('weighted_score', signal_params.get('score', details.get('weighted_score', 0)) if isinstance(signal_params, dict) else 0)
+        confidence = _sizing_inputs.get('confidence', signal_params.get('confidence', 0) if isinstance(signal_params, dict) else 0)
+    else:
+        weighted_score = signal_params.get('score', details.get('weighted_score', 0)) if isinstance(signal_params, dict) else 0
+        confidence = signal_params.get('confidence', 0) if isinstance(signal_params, dict) else 0
     market_quality = details.get('market_quality', details.get('market_quality_score', 0))
     regime = signal_params.get('regime', details.get('regime', 'UNKNOWN')) if isinstance(signal_params, dict) else details.get('regime', 'UNKNOWN')
     sl_points = signal_params.get('sl_points', CONFIG['risk_management'].get('stop_loss_amount', 0) / max(1, CONFIG['trading'].get('lot_size', 1))) if isinstance(signal_params, dict) else 0
