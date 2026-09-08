@@ -1883,6 +1883,18 @@ class BrokerInterface:
             trade = {
                 'order_id': f"PAPER_{int(time.time())}_{trades_this_hour}",
                 'entry_price': entry_price,
+                # The book at the moment of entry, recorded because the spread is
+                # paid here and nowhere else: entry crosses to the ask, exit
+                # crosses to the bid, and neither cost appears in any greek or in
+                # research/costs.py. Without these two numbers there is no way to
+                # tell an instrument whose delta earned its keep from one whose
+                # spread ate the gain, which is the open question about trading
+                # deep-ITM contracts at all.
+                'entry_bid': tick.get('bid'),
+                'entry_ask': tick.get('ask'),
+                'entry_ltp': tick.get('ltp'),
+                'entry_spread': (round(float(tick['ask']) - float(tick['bid']), 2)
+                                 if tick.get('ask') and tick.get('bid') else None),
                 'entry_time': datetime.now(),
                 'qty': qty,
                 'side': side,
@@ -2291,7 +2303,15 @@ class BrokerInterface:
             'exit_reason': exit_reason,
             'pnl': pnl_inr,
             'pnl_pct': pnl_pct,
-            'hold_time_sec': hold_time
+            'hold_time_sec': hold_time,
+            # See the entry side: the round trip crosses the book twice and
+            # neither crossing is in any greek or in research/costs.py.
+            'exit_bid': tick.get('bid'),
+            'exit_ask': tick.get('ask'),
+            'exit_spread': (round(float(tick['ask']) - float(tick['bid']), 2)
+                            if tick.get('ask') and tick.get('bid') else None),
+            'entry_spread': trade.get('entry_spread'),
+            'spot_at_exit': self.spot_price,
         })
         self.logger.info(f"💰 PnL: ₹{pnl_inr:+.2f} ({pnl_pct:+.2f}%) | Daily: ₹{new_daily_pnl:+.2f} ({new_daily_pnl_pct:+.2f}%)")
 
@@ -2301,7 +2321,12 @@ class BrokerInterface:
             'hold_time': hold_time,
             'exit_confirmed': True,
             'exit_price': exit_price,
-            'exit_reason': exit_reason
+            'exit_reason': exit_reason,
+            'exit_bid': tick.get('bid'),
+            'exit_ask': tick.get('ask'),
+            'exit_ltp': tick.get('ltp'),
+            'exit_spread': (round(float(tick['ask']) - float(tick['bid']), 2)
+                            if tick.get('ask') and tick.get('bid') else None),
         }
 
     # =========================================================================

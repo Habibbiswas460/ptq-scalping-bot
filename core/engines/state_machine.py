@@ -959,6 +959,15 @@ def state_entry_ready(tick: Dict, greeks: Dict, state: TradingState,
             'qty': trade['qty'],
             'entry_price': trade['entry_price'],
             'entry_reason': 'Entry signal',
+            # The book at entry. The spread is a real cost paid on every round
+            # trip and it appears in no greek and in no line of research/costs.py,
+            # so without it a trade's result cannot be attributed between the
+            # instrument's delta and the price of crossing its book.
+            'entry_bid': trade.get('entry_bid'),
+            'entry_ask': trade.get('entry_ask'),
+            'entry_spread': trade.get('entry_spread'),
+            'strike': trade.get('strike'),
+            'spot_at_entry': trade.get('spot_at_entry'),
             'greeks': greeks
         })
         
