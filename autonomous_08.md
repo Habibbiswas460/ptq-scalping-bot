@@ -282,3 +282,114 @@ three best ideas available and all three are closed.
 Today's session still runs, and is still worth running — not for profit, but because
 it is the first day this bot reports net numbers, and because the spread
 instrumentation I added answers the delta question on live data.
+
+---
+
+## Close of session — the numbers
+
+```
+15 trades   gross -Rs1,134.25   cost Rs936.59   net -Rs2,070.84
+net winners 5 (33.3%)   expectancy -Rs138.06/trade
+cost is 83% of the gross magnitude
+exits: RSI reversal 6, early loss cut 6, soft loss 2, HARD SL 1
+22 signals reached ENTRY_READY — all 22 PE, all EMA9<21 + EMA9_Rejection
+```
+
+### Set against yesterday
+
+| | 2026-09-07 | 2026-09-08 |
+|---|---|---|
+| trades | 13 | 15 |
+| gross | −Rs952.25 | −Rs1,134.25 |
+| cost | Rs846.21 | Rs936.59 |
+| net | −Rs1,798.46 | −Rs2,070.84 |
+| net win rate | 30.8% | 33.3% |
+| **expectancy/trade** | **−Rs138.34** | **−Rs138.06** |
+
+Two different sessions, a changed strike band, a changed trade-rate cap, a changed
+exit ladder — and the expectancy lands **28 paise apart**. I did not engineer that
+and I would not have predicted it.
+
+### The most useful thing I learned today, and it is about me
+
+At 13:19, with 14 trades closed, the day read **−Rs111.08/trade** against yesterday's
+−Rs138.34. A 20% improvement, and I could see a clean story for it: the strike band
+change had moved delta from 0.40–0.68 to 0.64–0.78 and cut Rs2.53/trade of cost. I
+wrote at the time that n=14 was not significant and I would not claim it.
+
+**One more trade — a single hard-SL loss at −Rs515.68 — erased the entire
+difference.** −111.08 became −138.06.
+
+That is the whole case for not trusting single sessions, delivered by the data
+rather than by argument. Had the session ended at 13:19 I would have had a tidy,
+plausible, completely false result to report.
+
+### The delta optimisation moved nothing measurable
+
+It was correct arithmetic — required spot move 1.92 → ~1.80 points, cost Rs65.09 →
+Rs62.56/trade — and it is invisible in the outcome. An 11% improvement in a
+break-even threshold does not show up in 15 trades when the gap to break-even is
+this wide. Worth keeping (it costs nothing), worth not celebrating.
+
+### The exit ladder finally ran — once
+
+At **15:00:47** the first trade under `EXIT_ONLY_SL_TP_TRAILING` opened.
+
+```
+hold 570.4s (9.5 minutes)     <- every previous trade: 2-135 seconds
+🛑 HARD SL HIT | -7.0 pts | gross -Rs455 -> net -Rs515.68
+```
+
+No early cut, no soft loss, no RSI reversal. It ran to the declared stop.
+**Across 28 live trades in two days, that is the first time the ladder the strategy
+is documented around has governed a single exit.** MFE never reached 12, so the
+stop never moved to entry.
+
+**n = 1.** It tells us the machinery works. It tells us nothing about whether the
+ladder is better, and I am not going to pretend otherwise. That needs a full session.
+
+### What blocked the bot mid-afternoon, and what it exposed
+
+From **13:41 entries silently stopped** while the bot looked perfectly healthy —
+ticks flowing, strikes searching, no error. The cause was in `states.log`:
+
+```
+ENTRY_READY -> COOLDOWN | Reason: Risk: Weekly loss limit Rs2507 (max: Rs2400)
+```
+
+The weekly ceiling was **hardcoded** `int(TOTAL_CAPITAL * 0.08)` = Rs2,400, with no
+env override — the exact shape of the drawdown-gate defect fixed last night, in a
+different gate. And note the sizing: **the weekly ceiling was 2.4x smaller than the
+daily one it sits above**, so a single fully-permitted losing day exhausts the
+entire week. Nobody chose that either; it is two independent percentages of capital
+that happen to cross.
+
+Now `MAX_WEEKLY_LOSS_AMOUNT`, env-configurable. This is the third hardcoded limit in
+two days that stopped the bot without announcing itself. **`utils.preflight` should
+grow a check for every ceiling, not just the drawdown one.**
+
+### Two mistakes I made today
+
+1. **A `pgrep` pattern that matched too much.** Restarting the bot, my kill matched
+   several PIDs including my own background tasks, and killed the end-of-session
+   digest watcher along with the bot. The bot was then down from ~13:28 until I
+   noticed. Recovered; the watcher was re-armed.
+2. **Four restarts hit the broker's historical-API rate limit**
+   (`Access denied because of exceeding access rate`). Warm-up fell back to the
+   on-disk candle cache, which worked — but each config change costing a restart is
+   a real constraint on how many experiments a single session can hold.
+
+### Open, and deliberately left open
+
+- **`MAX_DAILY_LOSS=8000`, `KILL_SWITCH_LOSS=8000`, `MAX_WEEKLY_LOSS_AMOUNT=12000`
+  are still raised.** They were raised so the ladder test could produce a sample,
+  and the test produced exactly one trade. I am leaving them raised so it can
+  continue tomorrow — but they are a genuinely loosened risk posture and the `.env`
+  says to restore them (3000 / 3000 / 2400) when the test is done. **Decide this
+  before any real money is involved.**
+- `EXIT_ONLY_SL_TP_TRAILING=true` and the `12:0, 16:11, ...` ladder are live.
+- `tests/test_visual_records.py` has 3 failures **caused by the live session**, not
+  by any code change: it rebuilds from the session record while the session is
+  still writing to it, so two rebuilds hash differently and a one-observation window
+  fails `start < end`. They passed at 08:24 before the bot started. The test needs a
+  frozen snapshot; the other 714 pass.

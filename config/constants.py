@@ -69,6 +69,14 @@ DRAWDOWN_PEAK_LOOKBACK_SESSIONS = env_int('DRAWDOWN_PEAK_LOOKBACK_SESSIONS', 0)
 COST_ACCOUNTING_ENABLED = env_bool('COST_ACCOUNTING_ENABLED', True)
 COST_BROKERAGE_PER_ORDER = env_float('COST_BROKERAGE_PER_ORDER', 20.0)
 
+# The weekly ceiling was hardcoded int(TOTAL_CAPITAL * 0.08) = Rs2,400 — the same
+# shape of defect as the lifetime drawdown gate: a hard limit with no env override,
+# invisible until it fires. It fired at 13:41 on 2026-09-08 and silently stopped
+# every entry ("Weekly loss limit Rs2507 (max: Rs2400)") while the bot looked
+# perfectly healthy. Note it is also 2.4x SMALLER than the daily ceiling it sits
+# above, so a single permitted losing day can exhaust the whole week.
+MAX_WEEKLY_LOSS_AMOUNT = env_int('MAX_WEEKLY_LOSS_AMOUNT', int(TOTAL_CAPITAL * 0.08))
+
 # =========================================================
 # 📊 TRADING INSTRUMENT
 # =========================================================
@@ -695,7 +703,7 @@ CONFIG = {
         'max_drawdown_amount': MAX_DRAWDOWN_AMOUNT,
         'max_drawdown_pct': MAX_DRAWDOWN_PCT,
         'drawdown_peak_lookback_sessions': DRAWDOWN_PEAK_LOOKBACK_SESSIONS,
-        'max_weekly_loss_amount': int(TOTAL_CAPITAL * 0.08),  # 8% of capital
+        'max_weekly_loss_amount': MAX_WEEKLY_LOSS_AMOUNT,
         'profit_lock_threshold': PROFIT_LOCK_THRESHOLD,
         'profit_lock_reduce_pct': 50,  # Reduce size by 50% after profit lock
     },
