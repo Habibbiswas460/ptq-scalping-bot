@@ -147,3 +147,63 @@ malfunction — it is the clearest possible demonstration of the whole problem.
 
 I am leaving the caps as they are. The daily ceiling now measures truthfully, and
 letting it do its job is more informative than pre-empting it.
+
+### ⚠ CORRECTION — my pre-open delta table above is WRONG
+
+A research agent working in parallel refuted it, and re-deriving it myself confirms
+the refutation. **I had assumed transaction cost is fixed in rupees. It is not.**
+
+```
+cost(P) = Rs47.20 + 0.1541 x P
+```
+
+Only **Rs47.20** (brokerage + its GST) is flat. STT, exchange transaction charges and
+the GST on them all scale **with premium** — and so does the bid/ask spread, measured
+on this project's own book at **0.239% of premium**, which the live path pays on every
+round trip (ask in, bid out) and which my table omitted entirely.
+
+Once both are included, the spot move needed to break even is a **U-curve**, not a
+decreasing one:
+
+| premium | delta | statutory pts | spread pts | total pts | **spot move needed** |
+|---|---|---|---|---|---|
+| 60 (ATM) | 0.50 | 0.868 | 0.143 | 1.012 | **2.02** |
+| 90 | 0.62 | 0.940 | 0.215 | 1.155 | 1.86 |
+| **110** | **0.70** | 0.987 | 0.263 | 1.250 | **1.79** ← optimum |
+| **150** | **0.80** | 1.082 | 0.359 | 1.440 | **1.80** ← optimum |
+| 180 | 0.86 | 1.153 | 0.430 | 1.583 | 1.84 |
+| 210 | 0.90 | 1.224 | 0.502 | 1.726 | **1.92** ← the old default |
+| 250 | 0.93 | 1.319 | 0.598 | 1.916 | 2.06 — **worse than ATM** |
+| 300 | 0.95 | 1.437 | 0.717 | 2.154 | 2.27 |
+
+So:
+
+- The real gain from higher delta is **~11%, not 31%.** I overstated it by 3x.
+- **Deep ITM stops paying at delta ≈ 0.91.** Beyond that it is worse than ATM.
+- The old Rs70–350 band aimed at Rs210 — **delta 0.90, sitting on the break-even edge
+  with no margin.** Any spread wider than 0.239% and it is worse than doing nothing.
+- At a **Rs5** broker the flat component collapses and the optimum moves all the way
+  back to **ATM** — the ITM advantage disappears entirely. So this lever and the
+  brokerage lever are not additive; the cheap broker makes this one irrelevant.
+
+**And one more thing that changes how today must be read:** friction expressed in
+*option points* **rises** with delta — 1.00 pts at ATM, 1.63 at delta 0.9. Comparing
+today's option-point results against the project's "+0.884 points" bar without
+adjusting for the contract actually traded would be wrong by up to **85%**.
+
+#### The one change I made on this
+
+`STRIKE_PREMIUM_MAX`: **350 → 210**, so the search midpoint moves from Rs210 to
+**Rs140 (delta ~0.78)** — the flat middle of the optimum instead of its edge. The
+entry filter stays permissive at Rs70–350 so a contract that drifts is not rejected.
+This is arithmetic, not a fitted parameter, and the optimum is broad (anything from
+Rs110–180 is within 3% of best), so it is robust rather than tuned.
+
+Also changed: **`MAX_TRADES_PER_HOUR` 10 → 4** (reasoning recorded above).
+Backups: `.env.bak-pre-ratecap-20260908`.
+
+**Nothing else was changed. No gate, no threshold, no signal, no exit.**
+
+I am recording this correction prominently rather than quietly editing the table,
+because a 3x overstatement that I would have carried into today's analysis is exactly
+the kind of error this project keeps having to retract.
