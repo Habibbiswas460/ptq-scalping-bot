@@ -207,3 +207,78 @@ Backups: `.env.bak-pre-ratecap-20260908`.
 I am recording this correction prominently rather than quietly editing the table,
 because a 3x overstatement that I would have carried into today's analysis is exactly
 the kind of error this project keeps having to retract.
+
+---
+
+## 08:52 — the third independent negative, and it closes the question
+
+I sent the strongest remaining hypothesis to a controlled test on the historical
+data: **the holding horizon, not the signal, is what loses.** Live holds are 2–125
+seconds, friction is ~1.0–1.7 option points per round trip, and the 60-second mean
+favourable excursion is ~1.06 points — so at the horizon the bot trades, the
+movement available *equals* the cost. Hold longer and movement grows while cost
+stays fixed. It is the most reasonable idea anyone has had about this bot.
+
+**The first half is true, and understated.** Mean MFE clears friction from **two
+minutes onward** (2.13 vs 1.49 points) and reaches 14.5 points at sixty. Friction
+falls from **111% of MFE to 9%**. Required hit rate falls from **105.6% to 54.4%**.
+
+**The second half kills it.**
+
+> Mean MFE is the *height of the path*, not what a ladder *collects*.
+
+Measured as **first touch** on the same data — symmetric barriers set to each
+horizon's own mean MFE, non-overlapping windows, friction at each sample's own
+premium — the delivered hit rate is **42.9% at 1 minute and 49.6% at 60 minutes.**
+It converges on 50% and never reaches the bar. Net expectancy is flat at **−1.5 to
+−1.9 points at every horizon**, with the 95% interval below zero at all eight. An
+80-cell horizon × barrier sweep is negative everywhere except one lottery cell whose
+entire result comes from two of thirteen sessions.
+
+That is what a zero-drift instrument looks like from a third direction:
+**you can always find the height, you just cannot be standing there when it arrives.**
+
+Two things the agent caught that I would have got wrong:
+
+- The "MFE/|MAE| decays with horizon" result reproduces **only in the CE book**
+  (0.993→0.880). PE mirrors it (0.949→1.228). Direction-balanced it is flat at
+  0.97–1.03. **It was the index falling, not the option decaying.**
+- Disabling the 45-second early cut makes the replay **worse**, not better. The one
+  positive configuration (60-minute hold, all stops off) nets +Rs751 — but its mirror
+  over the same minutes in the opposite type loses **Rs9,948**, direction-balanced it
+  is **−Rs190/trade**, one session supplies Rs3,990 of the Rs751, and the interval is
+  [−Rs443, +Rs486]. It does not survive.
+
+### Where that leaves the question
+
+Three independent studies, three different datasets, three different methods:
+
+| study | method | result |
+|---|---|---|
+| tick sweep | 2,968 arbitrary entries, 54 (TP,SL) cells, own tick record | best cell **−0.0235 gross pts** |
+| candle replay | real engines over Angel 1-min bars, 56 trades | net **−Rs8,745**, needs 75% win rate |
+| horizon sweep | MFE term structure + 80-cell first-touch sweep | negative at **every** horizon |
+
+**Buying long NIFTY options at Rs30,000 has no positive expectancy at any exit
+geometry, any holding horizon, any delta, or any cost structure tested.** That is
+not a tuning problem and there is no parameter left to turn. I have now tested the
+three best ideas available and all three are closed.
+
+### What is genuinely still open
+
+1. **Cost.** Rs20 → Rs5 per order cuts the required edge from 1.071 to 0.527 points.
+   It does not create an edge; it halves the bleed. No code, no risk. **Still the
+   single best action available.**
+2. **Data volume.** Every interval above is a 13-session cluster bootstrap — wide,
+   and honestly labelled wide. The GitHub survey found that **Upstox exposes an
+   `expired-instruments` API** with 1-minute expired NIFTY chains (~6 months, 2 years
+   announced) — which contradicts the earlier "expired weeklies are unreachable"
+   finding in the backtest report. That one unlock would turn every result here from
+   13 sessions into hundreds.
+3. **Option selling.** Best evidence of anything surveyed — and **verified blocked**
+   by capital: 2% ELM on expiry day is Rs30,888 for a single leg against a Rs30,000
+   account.
+
+Today's session still runs, and is still worth running — not for profit, but because
+it is the first day this bot reports net numbers, and because the spread
+instrumentation I added answers the delta question on live data.
