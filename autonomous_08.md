@@ -96,3 +96,54 @@ guess, and because a change made at 08:20 could not have been tested.
    code and published backtests.
 
 ---
+
+### Why 295 of 297 signals yesterday were identical — the actual mechanism
+
+I read `strategies/smart_scalp_v3.py:1111-1150`. The PE score is built like this:
+
+| condition | points |
+|---|---|
+| `EMA9 < EMA21` (trend down — **required**) | **+2** |
+| `EMA9_Rejection`: `high` within 0.5% of EMA9, **or** `close <= ema9 <= high` | **+2** |
+| `Red_Candle` (+1), `Close<EMA9` (+1) | +2 |
+| `RSI < 45` (+1), `RSI < 35` (+1) | +2 |
+| VWAP / OI / volume | +1 each |
+
+`min_score = 4`. So **the first two conditions alone are a signal.** Everything below
+them is decoration — it changes the reported score and confidence, but the entry
+decision was already made two lines up.
+
+And what are those two conditions? *"EMA9 is below EMA21, and price is near EMA9."*
+In any downtrend that is true on most bars. **It is not a signal, it is a description
+of a downtrend** — which is why it fired 297 times in one session and why 295 of
+those carried the identical factor list.
+
+This is what "the scoring stack cannot rank" means in concrete terms, and it lines
+up exactly with the overnight research finding: the condition is
+momentum/breakout-shaped, and buying strength measured as the **worst-priced entry
+available** on this book (−0.359 gross points, worst of 27 cells tested).
+
+### What actually blocked yesterday's 284 non-trades
+
+```
+  165  Risk: Max drawdown Rs3028 hit (limit: Rs3000)   <- the P0 latch
+   97  Allocator: allocator_zero_quantity              <- the sizing halt
+    6  Cooldown 900s
+    4  Cooldown 30s
+    3  Cooldown 120s
+    3  Exec guard: execution drift too high
+```
+
+**262 of 284 blocks were two bugs, both now fixed.** So today's session is not
+comparable to yesterday's: the same signal stream that produced 13 trades could
+produce many more. The caps that remain are real ones — `MAX_TRADES_PER_HOUR=10`,
+`MAX_TRADES_PER_DAY=30`, and the cooldowns.
+
+That has a consequence worth stating before it happens: **30 trades x ~Rs78 = ~Rs2,340
+of cost against a Rs3,000 daily ceiling.** With costs now counted against that
+ceiling, a full-frequency day can hit the daily limit on transaction costs alone,
+before the market has done anything. If the session halts early today, that is not a
+malfunction — it is the clearest possible demonstration of the whole problem.
+
+I am leaving the caps as they are. The daily ceiling now measures truthfully, and
+letting it do its job is more informative than pre-empting it.
