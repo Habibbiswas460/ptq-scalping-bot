@@ -200,6 +200,22 @@ EXIT_MFE_ROOM_POINTS = env_float('EXIT_MFE_ROOM_POINTS', 4.0)
 # real realised range from the tick buffer and puts it on the tick. It CHANGES
 # LIVE BEHAVIOUR, so it is opt-in and measured separately from the above.
 EXIT_REALISED_ATR_ENABLED = env_bool('EXIT_REALISED_ATR_ENABLED', False)
+
+# When on, the exit engine runs ONLY the SL / TP / trailing / breakeven ladder and
+# the mandatory market-close force-exit. Every discretionary exit is skipped: the
+# early momentum loss cut, the soft-loss timeout, the greek kills, the profit
+# floor, the smart-RSI exit, the RSI reversal exit, and the max-hold time exit.
+#
+# The reason this exists: across 27 live trades on 2026-09-07 and 2026-09-08 the
+# declared SL7/TP14 ladder fired EXACTLY ZERO times. Every single exit came from a
+# discretionary cut — RSI reversal, early loss cut, soft loss — which means the
+# ladder the strategy is documented around has never once governed a trade. There
+# is no way to evaluate it while three faster exits keep firing in front of it.
+# This flag is how the ladder gets to run.
+#
+# The market-close exit is deliberately NOT disabled: on an expiry day an open
+# position that is never closed expires, and that is not a strategy question.
+EXIT_ONLY_SL_TP_TRAILING = env_bool('EXIT_ONLY_SL_TP_TRAILING', False)
 EXIT_REALISED_ATR_WINDOW_SEC = env_int('EXIT_REALISED_ATR_WINDOW_SEC', 60)
 
 # ═══════════════════════════════════════════════════════════════════════════

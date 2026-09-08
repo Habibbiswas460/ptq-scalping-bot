@@ -16,6 +16,7 @@ from config.constants import (
     THETA_SEC_KILL_LIMIT, DELTA_KILL_MIN,
     GAMMA_NORMAL_MAX, GAMMA_EXPIRY_MAX,
     TRAILING_ENABLED,
+    EXIT_ONLY_SL_TP_TRAILING,
     TSL_STEP_LEVELS,
     EXIT_HARD_SL_POINTS,
     EXIT_BREAKEVEN_TRIGGER_POINTS,
@@ -438,7 +439,10 @@ def time_exit_15min(trade: Dict) -> Tuple[bool, str]:
     # Max hold time (.env-configurable, separate winning/losing thresholds)
     is_winning = price_diff >= 0
     max_hold_sec = MAX_HOLD_TIME_WINNING if is_winning else MAX_HOLD_TIME_LOSING
-    if hold_time > max_hold_sec:
+    # The max-hold timeout is a discretionary exit and is suppressed with the rest of
+    # them; the market-close branch below is not, because an unclosed position on an
+    # expiry day expires and that is not a strategy question.
+    if not EXIT_ONLY_SL_TP_TRAILING and hold_time > max_hold_sec:
         status = "winning" if is_winning else "losing"
         return True, f"⏰ TIME EXIT ({status}) | Held: {hold_time/60:.1f}min | TSL: {tsl_status} | P&L: ₹{current_pnl:.0f}"
     
@@ -554,6 +558,17 @@ def check_exit_conditions(trade: Dict, tick: Dict, greeks: Dict,
         _cap_negative_pnl(trade)
         return True, sl_reason
     
+    # Everything below this point is a discretionary exit that fires in FRONT of the
+    # declared SL/TP ladder. Across 27 live trades the ladder fired zero times because
+    # of them. With EXIT_ONLY_SL_TP_TRAILING on, they are skipped so the ladder can
+    # actually be evaluated; only the mandatory market-close exit still runs.
+    if EXIT_ONLY_SL_TP_TRAILING:
+        close_hit, close_reason = time_exit_15min(trade)
+        if close_hit:
+            _cap_negative_pnl(trade)
+            return True, close_reason
+        return False, ""
+
     # Priority 2: Early momentum loss cut (v3.3 - fast adverse move)
     early_hit, early_reason = early_momentum_loss_cut(trade, tick)
     if early_hit:
