@@ -10,6 +10,43 @@ The PTQ Scalping Bot uses Angel One SmartAPI as its exclusive data and order exe
 
 ---
 
+## Internal Structure
+
+`AngelOneClient` (`brokers/angel_one/client.py`) is a thin facade — every method below is
+implemented in one of these files, mixed together onto that one class so `self` stays
+shared exactly as if it were still one file:
+
+| File | Owns |
+|------|------|
+| `auth.py` | login, refresh_tokens, logout, get_profile, get_funds (TOTP) |
+| `orders.py` | place/modify/cancel order, order/trade book, positions, holdings, convert_position |
+| `market_data_rest.py` | LTP, quote, batch LTP, option Greeks, candle data, symbol search/token cache, rate limiting |
+| `websocket_client.py` | connect, protocol-level ping/pong keepalive, subscribe/unsubscribe, ACK bookkeeping, failover |
+| `message_parser.py` | binary tick parsing, best-5 depth extraction |
+| `normalizer.py` | maps a parsed tick onto the broker-agnostic canonical shape (`brokers/base/tick_schema.py`) — not on the live path yet |
+| `exceptions.py` | `AngelOneError` and subclasses (unchanged) |
+
+`AngelOneClient` implements `brokers.base.BrokerClient`, an abstract contract any future
+broker adapter would also implement — `brokers/factory.py`'s `create_broker_client()` is
+what `core/trading/broker.py` actually calls, keyed off `config.constants.BROKER_NAME`,
+so the trading layer doesn't hardcode this class directly. Angel One is the only broker
+implemented today; the contract exists so a second one wouldn't require touching
+`core/trading/broker.py` or the market-data pipeline below.
+
+Downstream of the WebSocket callback, `core/market_data/` (`tick_validator.py`,
+`tick_cache.py`, `tick_enricher.py`, `tick_router.py`, `ohlcv_aggregator.py`,
+`tick_store.py`) is a separate, broker-agnostic package that works off the tick shape
+above rather than on `AngelOneClient` directly — see that package's own docstrings for
+what's wired into the live path versus built-and-available.
+
+Strike selection, order/exit business logic, the ScripMaster instrument-master loader,
+and WebSocket reconnect/heartbeat orchestration all stay in `core/trading/broker.py`'s
+`BrokerInterface` — they turned out to be PTQ-specific trading/session logic (one of
+them is pinned there by `tests/test_instrument_master.py`), not generic broker plumbing,
+so they were deliberately not moved into this package.
+
+---
+
 ## Authentication
 
 ### Required Credentials

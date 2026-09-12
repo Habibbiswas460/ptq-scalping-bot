@@ -17,3 +17,7 @@ class AngelOneApiError(AngelOneError):
 class AngelOneOrderError(AngelOneApiError):
     """Raised for order placement or modification errors."""
     pass
+
+class AngelOneRateLimitError(AngelOneError):
+    """Raised when a rate limit is exceeded."""
+    pass

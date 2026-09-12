@@ -89,11 +89,15 @@ def test_oi_direction_earns_the_oi_component():
 
 
 def test_broker_carries_open_interest_only_when_enabled():
-    """The websocket parser decodes open_interest; the tick dict used to drop it."""
+    """The websocket parser decodes open_interest; the tick dict used to drop it.
+
+    _on_ws_tick lives in core/trading/tick_feed.py (BrokerInterface composes it in via
+    TickFeedMixin) since the 2026-09 broker.py layer split — not in broker.py itself.
+    """
     import os
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src = open(os.path.join(here, "core", "trading", "broker.py")).read()
-    assert "tick_data.get('open_interest'" in src, "broker no longer reads open_interest"
+    src = open(os.path.join(here, "core", "trading", "tick_feed.py")).read()
+    assert "tick_data.get('open_interest'" in src, "tick_feed no longer reads open_interest"
     assert "if TICK_OI_ENABLED:" in src, "the oi repair must stay flag-gated"
 
 
